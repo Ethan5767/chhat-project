@@ -1,0 +1,39 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Env / secrets
+.env
+.env.*
+
+# Backend runtime
+brand_detector/backend/uploads/
+brand_detector/backend/faiss_index/
+
+# Large / generated ML artifacts (keep structure locally)
+brand_detector/runs/yolo/**/*.pt
+brand_detector/runs/yolo/**/weights/
+*.pt
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Streamlit
+.streamlit/secrets.toml
