@@ -1,6 +1,6 @@
 # RF-DETR Cigarette Brand Detection
 
-Cigarette brand detection pipeline using RF-DETR for object detection, FAISS for reference image similarity search, and EasyOCR for text extraction.
+Cigarette brand detection pipeline using RF-DETR for object detection, FAISS for reference image similarity search, and EasyOCR for text extraction. Uses a two-stage classification: bottom-half of each pack is analyzed first (brand name/logo area), falling back to full-image analysis only when confidence is below threshold.
 
 ## Setup
 

@@ -1,7 +1,0 @@
-path: C:/Users/kimto/OneDrive/Desktop/RE-AI/cigarette-brand-detection/brand_detector/datasets/yolo_cigarette_packs
-train: train/images
-val: valid/images
-test: test/images
-
-nc: 1
-names: ['cigarette_pack']

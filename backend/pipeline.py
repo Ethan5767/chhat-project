@@ -6,11 +6,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Optional
 
-import faiss
 import numpy as np
 import pandas as pd
 import requests
 import torch
+import torch.nn as nn
 from PIL import Image
 from rapidfuzz import fuzz
 from transformers import AutoImageProcessor, AutoModel
@@ -19,35 +19,37 @@ BATCH_MODE: Optional[int] = None
 SAVE_INTERVAL = 50
 _BACKEND_ROOT = Path(__file__).resolve().parent
 REFERENCES_DIR = _BACKEND_ROOT / "references"
-INDEX_DIR = _BACKEND_ROOT / "faiss_index"
-INDEX_BIN = INDEX_DIR / "index.bin"
-LABELS_JSON = INDEX_DIR / "labels.json"
+CLASSIFIER_DIR = _BACKEND_ROOT / "classifier_model"
+CLASSIFIER_WEIGHTS = CLASSIFIER_DIR / "best_classifier.pth"
+CLASS_MAPPING_JSON = CLASSIFIER_DIR / "class_mapping.json"
 DINO_MODEL_ID = "facebook/dinov2-base"
 _PROJECT_ROOT = _BACKEND_ROOT.parent
 _RFDETR_CHECKPOINT_DIR = _PROJECT_ROOT / "runs"
 
 DOWNLOAD_TIMEOUT = 15
-RFDETR_CONF_THRESHOLD = 0.25
-URL_COLUMN_PREFIXES = ("Q", )  # matches any Q-column; actual filtering is done by URL content
+RFDETR_CONF_THRESHOLD = 0.15  # low threshold to catch packs in small shelf images
 OCR_ENABLED = True
 OCR_MIN_TOKEN_LEN = 3
-MIN_OUTPUT_CONFIDENCE = 0.70
-FAISS_TOP_K = 5
-OCR_FULLIMG_ENABLED = True             # run OCR on full image as fallback
+MIN_OUTPUT_CONFIDENCE = 0.40  # classifier softmax over 43 classes produces lower per-class probabilities
+CLASSIFIER_TOP_K = 5
+OCR_FULLIMG_ENABLED = True
 
-# Brand-consensus fusion: both OCR and DINO must agree on the brand family
-DINO_PRODUCT_WEIGHT = 0.60            # DINO weight for product ranking when brand is confirmed
-OCR_BRAND_WEIGHT = 0.40               # OCR weight when both agree on brand
-NO_CONSENSUS_PENALTY = 0.70           # multiplier when DINO finds brand but OCR doesn't confirm
-OCR_BRAND_CONFIRM_THRESHOLD = 0.30    # min OCR brand-family score to count as "brand confirmed"
-OCR_INDEPENDENT_WEIGHT = 0.55         # weight for OCR-only detections (strong text match can reach ~0.75)
-OCR_INDEPENDENT_MIN_SCORE = 0.65      # OCR brand score must be >= this to introduce a brand
-MULTI_REF_BOOST_PER_HIT = 0.015      # confidence boost per additional matching reference photo
+# Simplified 3-tier OCR fusion:
+# Tier 1: Classifier confident (>= 0.85) -> trust classifier
+# Tier 2: Classifier moderate (>= 0.50) -> check OCR for confirmation
+# Tier 3: Classifier lost (< 0.50) -> OCR can override
+CLASSIFIER_HIGH_CONF = 0.85
+CLASSIFIER_LOW_CONF = 0.50
+OCR_STRONG_THRESHOLD = 0.60
+OCR_BOOST = 0.10              # confidence boost when OCR agrees with classifier
+OCR_INDEPENDENT_MIN_SCORE = 0.65
 
 _dino_processor = None
 _dino_model = None
 _rfdetr_model = None
 _ocr_reader = None
+_brand_classifier = None
+_class_mapping = None
 
 
 def label_to_product(label: str) -> str:
@@ -62,6 +64,25 @@ def label_to_product(label: str) -> str:
     if len(parts) == 2 and parts[1].isdigit():
         return parts[0]
     return label
+
+
+class BrandClassifier(nn.Module):
+    """Linear classifier head on DINOv2 embeddings. Must match brand_classifier.py."""
+
+    def __init__(self, embed_dim: int, num_classes: int, hidden_dim: int = 512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(embed_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim // 2, num_classes),
+        )
+
+    def forward(self, x):
+        return self.net(x)
 
 
 def _aggregate_to_products(label_scores: dict[str, float]) -> dict[str, float]:
@@ -83,7 +104,7 @@ def _aggregate_to_products(label_scores: dict[str, float]) -> dict[str, float]:
     for product in product_best:
         hits = product_hits[product]
         if hits >= 2:
-            boost = min(1.15, 1.0 + MULTI_REF_BOOST_PER_HIT * (hits - 1))
+            boost = min(1.15, 1.0 + 0.015 * (hits - 1))
             product_best[product] = min(1.0, product_best[product] * boost)
 
     return product_best
@@ -145,22 +166,38 @@ def load_rfdetr():
 
 
 def load_ocr():
+    """Load EasyOCR reader (English). Cached after first call."""
     global _ocr_reader
     if _ocr_reader is None:
         import easyocr
-
         _ocr_reader = easyocr.Reader(["en"], gpu=torch.cuda.is_available())
     return _ocr_reader
 
 
+EMBED_DIM = 1536  # CLS (768) + mean-pooled patches (768)
+
+
+def _pad_to_square(img: Image.Image) -> Image.Image:
+    """Pad image to square with gray fill to avoid aspect-ratio distortion."""
+    w, h = img.size
+    if w == h:
+        return img
+    max_side = max(w, h)
+    padded = Image.new("RGB", (max_side, max_side), (128, 128, 128))
+    padded.paste(img, ((max_side - w) // 2, (max_side - h) // 2))
+    return padded
+
+
 def embed_image(pil_img: Image.Image, processor, model, device: str) -> np.ndarray:
-    img = pil_img.convert("RGB")
+    img = _pad_to_square(pil_img.convert("RGB"))
     with torch.no_grad():
         inputs = processor(images=img, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in inputs.items()}
         outputs = model(**inputs)
-        cls_embedding = outputs.last_hidden_state[:, 0, :]
-        vec = cls_embedding.squeeze(0).detach().cpu().numpy().astype(np.float32)
+        cls_token = outputs.last_hidden_state[:, 0, :]       # (1, 768)
+        patch_mean = outputs.last_hidden_state[:, 1:, :].mean(dim=1)  # (1, 768)
+        combined = torch.cat([cls_token, patch_mean], dim=1)  # (1, 1536)
+        vec = combined.squeeze(0).detach().cpu().numpy().astype(np.float32)
     norm = np.linalg.norm(vec)
     if norm > 0:
         vec = vec / norm
@@ -170,14 +207,16 @@ def embed_image(pil_img: Image.Image, processor, model, device: str) -> np.ndarr
 def embed_images_batch(pil_imgs: list[Image.Image], processor, model, device: str) -> np.ndarray:
     """Embed multiple images in a single forward pass. Returns (N, dim) L2-normalised."""
     if not pil_imgs:
-        return np.empty((0, 768), dtype=np.float32)
-    imgs = [img.convert("RGB") for img in pil_imgs]
+        return np.empty((0, EMBED_DIM), dtype=np.float32)
+    imgs = [_pad_to_square(img.convert("RGB")) for img in pil_imgs]
     with torch.no_grad():
         inputs = processor(images=imgs, return_tensors="pt")
         inputs = {k: v.to(device) for k, v in inputs.items()}
         outputs = model(**inputs)
-        cls_embeddings = outputs.last_hidden_state[:, 0, :]
-        vecs = cls_embeddings.detach().cpu().numpy().astype(np.float32)
+        cls_tokens = outputs.last_hidden_state[:, 0, :]       # (N, 768)
+        patch_means = outputs.last_hidden_state[:, 1:, :].mean(dim=1)  # (N, 768)
+        combined = torch.cat([cls_tokens, patch_means], dim=1)  # (N, 1536)
+        vecs = combined.detach().cpu().numpy().astype(np.float32)
     norms = np.linalg.norm(vecs, axis=1, keepdims=True)
     norms = np.where(norms == 0, 1.0, norms)
     vecs = vecs / norms
@@ -185,58 +224,108 @@ def embed_images_batch(pil_imgs: list[Image.Image], processor, model, device: st
 
 
 def build_index(device: str, progress_cb: Optional[Callable[[int, int, str], None]] = None) -> None:
-    INDEX_DIR.mkdir(parents=True, exist_ok=True)
+    """Train the brand classifier from reference images."""
+    import subprocess
+    import sys
 
-    image_paths = []
-    for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.bmp"):
-        image_paths.extend(REFERENCES_DIR.glob(ext))
-        image_paths.extend(REFERENCES_DIR.glob(ext.upper()))
-    image_paths = sorted(set(image_paths))
+    train_script = _PROJECT_ROOT / "brand_classifier.py"
+    if not train_script.exists():
+        raise FileNotFoundError(f"Training script not found: {train_script}")
 
-    if not image_paths:
+    if progress_cb:
+        progress_cb(0, 100, "Training brand classifier...")
+
+    result = subprocess.run(
+        [sys.executable, str(train_script), "--epochs", "100", "--embed-batch-size", "8"],
+        cwd=str(_PROJECT_ROOT),
+        capture_output=True,
+        text=True,
+    )
+
+    if result.returncode != 0:
+        raise RuntimeError(f"Classifier training failed:\n{result.stderr}")
+
+    if progress_cb:
+        progress_cb(100, 100, "Classifier trained successfully")
+
+    # Reload the classifier
+    global _brand_classifier, _class_mapping
+    _brand_classifier = None
+    _class_mapping = None
+    load_classifier(device)
+
+
+def load_classifier(device: str = None):
+    """Load the trained brand classifier and class mapping."""
+    global _brand_classifier, _class_mapping
+
+    if _brand_classifier is not None and _class_mapping is not None:
+        return _brand_classifier, _class_mapping
+
+    if not CLASSIFIER_WEIGHTS.exists() or not CLASS_MAPPING_JSON.exists():
         raise FileNotFoundError(
-            f"No reference images found in {REFERENCES_DIR.resolve()}. "
-            "Add files like Marlboro.jpg, Camel.png first."
+            f"Missing classifier model. Expected {CLASSIFIER_WEIGHTS} and {CLASS_MAPPING_JSON}. "
+            "Run 'python brand_classifier.py' or /build-index first."
         )
 
-    processor, model = load_dino(device)
-    embeddings = []
-    labels = []
-    total = len(image_paths)
+    with CLASS_MAPPING_JSON.open("r", encoding="utf-8") as f:
+        _class_mapping = json.load(f)
 
-    for idx, image_path in enumerate(image_paths, start=1):
-        with Image.open(image_path) as img:
-            vec = embed_image(img, processor, model, device)
-        embeddings.append(vec)
-        labels.append(image_path.stem)
+    num_classes = _class_mapping["num_classes"]
+    embed_dim = _class_mapping["embed_dim"]
+    hidden_dim = _class_mapping.get("hidden_dim", 512)
 
-        if progress_cb:
-            progress_cb(idx, total, image_path.name)
+    _brand_classifier = BrandClassifier(embed_dim, num_classes, hidden_dim)
 
-    matrix = np.vstack(embeddings).astype(np.float32)
-    index = faiss.IndexFlatIP(matrix.shape[1])
-    index.add(matrix)
+    if device is None:
+        device = get_device()
+    state = torch.load(CLASSIFIER_WEIGHTS, map_location=device, weights_only=True)
+    _brand_classifier.load_state_dict(state)
+    _brand_classifier.to(device)
+    _brand_classifier.eval()
 
-    faiss.write_index(index, str(INDEX_BIN))
-    with LABELS_JSON.open("w", encoding="utf-8") as f:
-        json.dump(labels, f, ensure_ascii=False, indent=2)
+    logger.info("Loaded brand classifier: %d classes", num_classes)
+    return _brand_classifier, _class_mapping
 
 
+def classify_embeddings(embeddings: np.ndarray, device: str, top_k: int = CLASSIFIER_TOP_K) -> list[list[tuple[str, float]]]:
+    """Run the brand classifier on pre-computed DINOv2 embeddings.
+
+    Args:
+        embeddings: (N, embed_dim) numpy array of L2-normalized embeddings
+        device: torch device
+        top_k: number of top predictions to return per sample
+
+    Returns:
+        List of N lists, each containing top_k (label, confidence) tuples.
+    """
+    classifier, mapping = load_classifier(device)
+    idx_to_label = mapping["idx_to_label"]
+
+    with torch.no_grad():
+        x = torch.tensor(embeddings, dtype=torch.float32).to(device)
+        logits = classifier(x)
+        probs = torch.softmax(logits, dim=1)
+
+    results = []
+    for i in range(len(embeddings)):
+        topk_vals, topk_idxs = torch.topk(probs[i], min(top_k, probs.shape[1]))
+        sample_results = []
+        for val, idx in zip(topk_vals, topk_idxs):
+            label = idx_to_label[str(idx.item())]
+            sample_results.append((label, float(val.item())))
+        results.append(sample_results)
+
+    return results
+
+
+# Keep for backward compatibility with main.py imports
 def load_index():
-    if not INDEX_BIN.exists() or not LABELS_JSON.exists():
-        raise FileNotFoundError(
-            f"Missing index files. Expected {INDEX_BIN.resolve()} and {LABELS_JSON.resolve()}. "
-            "Run /build-index first."
-        )
-    index = faiss.read_index(str(INDEX_BIN))
-    with LABELS_JSON.open("r", encoding="utf-8") as f:
-        labels = json.load(f)
-    return index, labels
-
-
-def distance_to_confidence(dist: float) -> float:
-    """With IndexFlatIP on L2-normalised vectors, 'dist' is cosine similarity [0,1]."""
-    return float(max(0.0, min(1.0, dist)))
+    """Load classifier and return (classifier, labels) for backward compatibility."""
+    device = get_device()
+    classifier, mapping = load_classifier(device)
+    labels = list(mapping["label_to_idx"].keys())
+    return classifier, labels
 
 
 def download_image(url: str) -> Optional[Image.Image]:
@@ -308,52 +397,98 @@ def _build_label_profiles(labels: list[str]) -> list[dict]:
 
 
 def _run_ocr_on_image(image: Image.Image) -> list:
-    """Run EasyOCR once on an image and return the raw result items."""
+    """Run EasyOCR on an image. Returns [(bbox, text, confidence), ...]."""
     try:
         reader = load_ocr()
     except Exception as exc:
         logger.warning("OCR disabled because EasyOCR failed to load: %s", exc)
         return []
     try:
-        np_img = np.array(image.convert("RGB"))
-        return reader.readtext(np_img, detail=1, paragraph=False)
+        img_np = np.array(image.convert("RGB"))
+        results = reader.readtext(img_np)
+        return results  # already [(bbox, text, conf)]
     except Exception as exc:
         logger.warning("OCR read failed: %s", exc)
         return []
 
 
 def _ocr_brand_scores_from_items(ocr_items: list, label_profiles: list[dict]) -> dict[str, float]:
+    """Match OCR text to brand labels using fuzzy matching.
+
+    Uses token-level matching with fuzzy per-token comparison so that
+    "La pn" matches "lapin", "MEVWS" matches "mevius", etc.
+    Requires the OCR text to be at least 60% similar to the brand token
+    to count as a match, preventing false positives like "image" -> "esse".
+    """
     brand_scores: dict[str, float] = {}
+
+    # Filter out common non-brand text (error pages, generic words)
+    noise_words = {"this", "image", "cannot", "displayed", "found", "error",
+                   "the", "and", "for", "are", "not", "with", "that", "from",
+                   "have", "has", "was", "were", "been", "being", "page"}
+
     for item in ocr_items:
         if len(item) < 3:
             continue
         text = str(item[1]).strip()
         text_conf = float(item[2])
         norm_text = _normalize_text(text)
-        if not norm_text:
+        if not norm_text or len(norm_text) < 2:
             continue
 
-        text_tokens = [t for t in norm_text.split() if len(t) >= OCR_MIN_TOKEN_LEN]
-        if not text_tokens:
+        text_tokens = [t for t in norm_text.split() if len(t) >= 2]
+        # Skip if all tokens are noise
+        meaningful_tokens = [t for t in text_tokens if t not in noise_words]
+        if not meaningful_tokens:
             continue
 
         for prof in label_profiles:
-            score = 0.0
+            brand_name = prof["brand"]  # e.g. "mevius", "esse", "555"
+            brand_tokens = prof["tokens"]  # e.g. {"mevius", "original"}
 
-            token_overlap = 0
-            for tok in text_tokens:
-                if tok in prof["tokens"]:
-                    token_overlap += 1
-            if token_overlap > 0:
-                score = max(score, min(1.0, text_conf * (0.55 + 0.15 * token_overlap)))
+            # Strategy 1: Exact token match (highest confidence)
+            exact_matches = 0
+            for tok in meaningful_tokens:
+                if tok in brand_tokens:
+                    exact_matches += 1
+            if exact_matches > 0:
+                score = min(1.0, text_conf * (0.70 + 0.10 * exact_matches))
+                if score > brand_scores.get(prof["label"], 0.0):
+                    brand_scores[prof["label"]] = float(score)
+                continue
 
-            fuzzy_base = fuzz.partial_ratio(norm_text, prof["base"]) / 100.0 if prof["base"] else 0.0
-            fuzzy_full = fuzz.partial_ratio(norm_text, prof["norm"]) / 100.0 if prof["norm"] else 0.0
-            fuzzy = max(fuzzy_base, fuzzy_full)
-            score = max(score, text_conf * fuzzy)
+            # Strategy 2: Fuzzy token match (for OCR errors like "La pn" -> "lapin")
+            # Compare each OCR token against each brand token individually
+            # Also try joining the full OCR text as one string for split-word matches
+            best_token_fuzzy = 0.0
 
-            if score > brand_scores.get(prof["label"], 0.0):
-                brand_scores[prof["label"]] = float(score)
+            # Try the full normalized text against brand name (catches "la pn" -> "lapin")
+            joined = norm_text.replace(" ", "")
+            if len(joined) >= 3:
+                brand_ratio = fuzz.ratio(joined, brand_name) / 100.0
+                if brand_ratio >= 0.60:
+                    best_token_fuzzy = max(best_token_fuzzy, brand_ratio)
+
+            for ocr_tok in meaningful_tokens:
+                if len(ocr_tok) < 3:
+                    continue
+                # Compare against brand name
+                brand_ratio = fuzz.ratio(ocr_tok, brand_name) / 100.0
+                if brand_ratio >= 0.60:
+                    best_token_fuzzy = max(best_token_fuzzy, brand_ratio)
+
+                # Compare against each brand token
+                for bt in brand_tokens:
+                    if len(bt) < 3:
+                        continue
+                    tok_ratio = fuzz.ratio(ocr_tok, bt) / 100.0
+                    if tok_ratio >= 0.60:
+                        best_token_fuzzy = max(best_token_fuzzy, tok_ratio)
+
+            if best_token_fuzzy >= 0.60:
+                score = text_conf * best_token_fuzzy * 0.85
+                if score > brand_scores.get(prof["label"], 0.0):
+                    brand_scores[prof["label"]] = float(score)
 
     return brand_scores
 
@@ -368,6 +503,13 @@ def _detect_brands_from_image(
     index,
     labels: list[str],
 ) -> dict[str, float]:
+    """Detect and classify cigarette brands in an image.
+
+    Pipeline (OCR-first):
+      1. RF-DETR detects pack bounding boxes
+      2. EasyOCR reads text on crops + full image -> identifies brand families
+      3. DINOv2 classifier picks the specific product, prioritizing OCR-identified brands
+    """
     label_profiles = _build_label_profiles(labels)
     label_profile_map = {p["label"]: p for p in label_profiles}
     detections = rfdetr_model.predict(image, threshold=RFDETR_CONF_THRESHOLD)
@@ -380,164 +522,85 @@ def _detect_brands_from_image(
         xyxy = detections.xyxy
         for box in xyxy:
             x1, y1, x2, y2 = [int(v) for v in box]
-            x1 = max(0, min(x1, width - 1))
-            y1 = max(0, min(y1, height - 1))
-            x2 = max(1, min(x2, width))
-            y2 = max(1, min(y2, height))
+            bw, bh = x2 - x1, y2 - y1
+            pad_x, pad_y = int(bw * 0.10), int(bh * 0.10)
+            x1 = max(0, x1 - pad_x)
+            y1 = max(0, y1 - pad_y)
+            x2 = min(width, x2 + pad_x)
+            y2 = min(height, y2 + pad_y)
             if x2 <= x1 or y2 <= y1:
                 continue
             crops.append(image.crop((x1, y1, x2, y2)))
     else:
         crops.append(image)
 
-    num_boxes = len(detections) if has_detections else 0
-
-    # OCR: run ONCE per crop, reuse items for both hints and brand scores
-    crop_ocr_items: list[list] = []
-    if OCR_ENABLED:
-        for crop in crops:
-            crop_ocr_items.append(_run_ocr_on_image(crop))
-    else:
-        crop_ocr_items = [[] for _ in crops]
-
-    # Full-image OCR: run on the entire image to catch text the detector missed
-    fullimg_ocr_items: list = []
-    if OCR_ENABLED and OCR_FULLIMG_ENABLED and has_detections:
-        fullimg_ocr_items = _run_ocr_on_image(image)
-    elif OCR_ENABLED and not has_detections:
-        fullimg_ocr_items = crop_ocr_items[0] if crop_ocr_items else []
-
-    # DINO: batch-embed all crops in a single GPU forward pass
-    all_vecs = embed_images_batch(crops, processor, model, device)
-
-    # FAISS search per crop -- collect raw DINO scores with multi-crop aggregation
-    dino_best: dict[str, float] = {}
-    k = max(1, min(FAISS_TOP_K, len(labels)))
-
-    # Track how many crops vote for each brand family (top-1 match per crop)
-    brand_family_votes: dict[str, int] = {}
-
-    for crop_idx in range(len(crops)):
-        vec = all_vecs[crop_idx].reshape(1, -1)
-        distances, indices = index.search(vec, k=k)
-
-        # Count vote for top-1 brand family of this crop
-        top_idx = int(indices[0][0])
-        if 0 <= top_idx < len(labels):
-            top_label = labels[top_idx]
-            top_prof = label_profile_map.get(top_label, {})
-            top_family = top_prof.get("brand", "")
-            if top_family:
-                brand_family_votes[top_family] = brand_family_votes.get(top_family, 0) + 1
-
-        for rank in range(k):
-            idx = int(indices[0][rank])
-            if idx < 0 or idx >= len(labels):
-                continue
-            label = labels[idx]
-            dist = float(distances[0][rank])
-            conf = distance_to_confidence(dist)
-            if conf > dino_best.get(label, 0.0):
-                dino_best[label] = conf
-
-    # Multi-crop boost: if multiple crops agree on a brand family, boost scores
-    # This reflects that seeing a brand across multiple shelf positions is strong evidence
-    if has_detections and num_boxes >= 3:
-        for label in list(dino_best.keys()):
-            prof = label_profile_map.get(label, {})
-            family = prof.get("brand", "")
-            votes = brand_family_votes.get(family, 0)
-            if votes >= 2:
-                boost = min(1.15, 1.0 + 0.05 * (votes - 1))
-                dino_best[label] = min(1.0, dino_best[label] * boost)
-
-    if not OCR_ENABLED:
-        return _aggregate_to_products(dino_best)
-
-    # OCR brand scores from crop-level OCR items
+    # ── Step 1: OCR reads text (primary brand identification) ──
     ocr_best: dict[str, float] = {}
-    for ocr_items in crop_ocr_items:
+    for crop in crops:
+        ocr_items = _run_ocr_on_image(crop)
         crop_ocr_scores = _ocr_brand_scores_from_items(ocr_items, label_profiles)
         for brand, conf in crop_ocr_scores.items():
             if conf > ocr_best.get(brand, 0.0):
                 ocr_best[brand] = conf
 
-    # Full-image OCR brand scores (catches text the detector missed)
-    if fullimg_ocr_items:
-        fullimg_ocr_scores = _ocr_brand_scores_from_items(fullimg_ocr_items, label_profiles)
-        for brand, conf in fullimg_ocr_scores.items():
+    if OCR_FULLIMG_ENABLED and has_detections:
+        fullimg_ocr = _run_ocr_on_image(image)
+        fullimg_scores = _ocr_brand_scores_from_items(fullimg_ocr, label_profiles)
+        for brand, conf in fullimg_scores.items():
             if conf > ocr_best.get(brand, 0.0):
                 ocr_best[brand] = conf
 
-    # -- Brand-consensus fusion --
-    # Both OCR and DINO must agree on the brand family for full confidence.
-    # DINO gets higher weight for product-level (variant) ranking within
-    # a confirmed brand; OCR gets meaningful weight for brand confirmation.
-    fused: dict[str, float] = {}
-
-    # Build a map: brand_family -> best OCR score across all labels in that family
-    ocr_family_best: dict[str, float] = {}
+    # Build set of OCR-identified brand families
+    ocr_families: dict[str, float] = {}
     for label, ocr_conf in ocr_best.items():
         prof = label_profile_map.get(label, {})
         family = prof.get("brand", "")
         if family:
-            ocr_family_best[family] = max(ocr_family_best.get(family, 0.0), ocr_conf)
+            ocr_families[family] = max(ocr_families.get(family, 0.0), ocr_conf)
 
-    for label, dino_conf in dino_best.items():
+    # ── Step 2: DINOv2 classifier picks specific product ──
+    all_vecs = embed_images_batch(crops, processor, model, device)
+    all_cls_results = classify_embeddings(all_vecs, device, top_k=CLASSIFIER_TOP_K)
+
+    classifier_best: dict[str, float] = {}
+    for crop_results in all_cls_results:
+        for label, conf in crop_results:
+            if conf > classifier_best.get(label, 0.0):
+                classifier_best[label] = conf
+
+    # ── Step 3: OCR-first fusion ──
+    # OCR identifies which brands are present, DINOv2 picks the specific product.
+    # If OCR found a brand, boost any classifier prediction in that family.
+    # If OCR found nothing, trust classifier alone but at reduced confidence.
+    fused: dict[str, float] = {}
+
+    for label, cls_conf in classifier_best.items():
         prof = label_profile_map.get(label, {})
         brand_family = prof.get("brand", "")
+        ocr_family_conf = ocr_families.get(brand_family, 0.0) if brand_family else 0.0
 
-        # Check if OCR confirms this brand family
-        ocr_family_score = ocr_family_best.get(brand_family, 0.0) if brand_family else 0.0
-        ocr_label_score = ocr_best.get(label, 0.0)
-
-        if ocr_family_score >= OCR_BRAND_CONFIRM_THRESHOLD:
-            # Brand confirmed by both OCR and DINO -- weighted fusion
-            # DINO gets higher weight for product specificity (which variant)
-            # OCR confirms the brand family is correct
-            fused_conf = DINO_PRODUCT_WEIGHT * dino_conf + OCR_BRAND_WEIGHT * ocr_label_score
-            # If OCR matched the family but not this exact label, still give partial credit
-            if ocr_label_score < OCR_BRAND_CONFIRM_THRESHOLD and ocr_family_score >= OCR_BRAND_CONFIRM_THRESHOLD:
-                fused_conf = DINO_PRODUCT_WEIGHT * dino_conf + OCR_BRAND_WEIGHT * ocr_family_score * 0.5
-            fused[label] = float(min(1.0, fused_conf))
+        if ocr_family_conf >= OCR_STRONG_THRESHOLD:
+            # OCR confirms this brand family -- boost classifier confidence
+            fused[label] = min(1.0, cls_conf + ocr_family_conf * 0.3)
+        elif ocr_family_conf > 0:
+            # OCR has weak signal for this family -- slight boost
+            fused[label] = min(1.0, cls_conf + ocr_family_conf * 0.15)
         else:
-            # DINO found brand but OCR didn't confirm -- penalize
-            fused[label] = float(min(1.0, dino_conf * NO_CONSENSUS_PENALTY))
+            # OCR didn't see this brand -- trust classifier but reduce confidence
+            # unless classifier is very confident on its own
+            if cls_conf >= CLASSIFIER_HIGH_CONF:
+                fused[label] = cls_conf
+            else:
+                fused[label] = cls_conf * 0.7
 
-    # OCR independent detections: introduce brands DINO did NOT find
-    if num_boxes == 0:
-        independent_scale = 1.5
-    elif num_boxes <= 2:
-        independent_scale = 1.2
-    else:
-        independent_scale = 1.0
+    # OCR-only brands: OCR found brands the classifier missed entirely
+    # Use OCR score directly (the brand is there, classifier just didn't see it)
     for label, ocr_conf in ocr_best.items():
         if label in fused:
             continue
-        prof = label_profile_map.get(label, {})
-        brand_family = prof.get("brand", "")
-        # Check if DINO found any label in this brand family
-        dino_has_family = any(
-            label_profile_map.get(d_label, {}).get("brand", "") == brand_family
-            for d_label in dino_best
-        ) if brand_family else False
+        if ocr_conf >= OCR_INDEPENDENT_MIN_SCORE:
+            fused[label] = min(1.0, ocr_conf * 0.85)
 
-        if dino_has_family:
-            # DINO found same family but different product -- OCR variant with DINO family boost
-            dino_family_conf = max(
-                (d_conf for d_label, d_conf in dino_best.items()
-                 if label_profile_map.get(d_label, {}).get("brand", "") == brand_family),
-                default=0.0,
-            )
-            fused_conf = OCR_BRAND_WEIGHT * ocr_conf + DINO_PRODUCT_WEIGHT * dino_family_conf * 0.4
-            fused[label] = float(min(1.0, fused_conf))
-        elif ocr_conf >= OCR_INDEPENDENT_MIN_SCORE:
-            # Pure OCR detection, no DINO support at all
-            indep_conf = min(1.0, ocr_conf * OCR_INDEPENDENT_WEIGHT * independent_scale)
-            fused[label] = float(indep_conf)
-
-    # Aggregate to product level: esse_change_1 + esse_change_2 -> esse_change
-    # Multiple matching reference photos boost confidence
     return _aggregate_to_products(fused)
 
 
@@ -609,10 +672,17 @@ def _download_row_images(
 
 
 def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]] = None) -> Path:
+    """Process a CSV of image URLs and output brand/product detection in Q12A/Q12B format."""
+    try:
+        from .output_format import build_q12_row, get_output_columns
+    except ImportError:
+        from output_format import build_q12_row, get_output_columns
+
     device = get_device()
-    index, labels = load_index()
+    classifier, labels = load_index()
     processor, model = load_dino(device)
     rfdetr_model = load_rfdetr()
+    index = classifier
 
     csv_path = Path(csv_path)
     df = pd.read_csv(csv_path)
@@ -628,7 +698,7 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
     out_path = csv_path.parent / f"{csv_path.stem}_results.csv"
     id_col = df.columns[0]
 
-    # Resume: load existing partial results and skip already-processed rows
+    # Resume support
     start_row = 0
     completed_rows: list[dict] = []
     if out_path.exists():
@@ -641,30 +711,6 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
             start_row = 0
             completed_rows = []
 
-    def _build_result_row(row_data, col_brand_maps, per_col_results):
-        final_brand, overall_conf = _compute_row_union_brands(col_brand_maps)
-        result = {id_col: row_data[id_col], "final_brand": final_brand, "overall_confidence": overall_conf}
-        for col in url_columns:
-            cn = str(col)
-            result[cn] = row_data[col]
-            det, scr = per_col_results.get(cn, (["NO_DETECTION"], [0.0]))
-            result[f"{cn}_detected_brands"] = json.dumps(det, ensure_ascii=False)
-            result[f"{cn}_confidence"] = json.dumps(scr, ensure_ascii=False)
-        return result
-
-    def _error_result_row(row_data):
-        result = {
-            id_col: row_data[id_col],
-            "final_brand": json.dumps(["ERROR"], ensure_ascii=False),
-            "overall_confidence": json.dumps([0.0], ensure_ascii=False),
-        }
-        for col in url_columns:
-            cn = str(col)
-            result[cn] = row_data[col]
-            result[f"{cn}_detected_brands"] = json.dumps(["ERROR"], ensure_ascii=False)
-            result[f"{cn}_confidence"] = json.dumps([0.0], ensure_ascii=False)
-        return result
-
     def _flush(rows):
         pd.DataFrame(rows).to_csv(out_path, index=False)
 
@@ -672,59 +718,55 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
         row = df.iloc[row_idx]
         try:
             images = _download_row_images(row, url_columns)
-            col_brand_maps: list[dict[str, float]] = []
-            per_col_results: dict[str, tuple[list[str], list[float]]] = {}
 
+            # Collect all detected products across all images for this row
+            all_products: dict[str, float] = {}
             for col in url_columns:
                 col_name = str(col)
                 image = images.get(col_name)
                 if image is None:
-                    per_col_results[col_name] = (["NO_DETECTION"], [0.0])
                     continue
-
                 col_best = _detect_brands_from_image(
-                    image=image,
-                    rfdetr_model=rfdetr_model,
-                    processor=processor,
-                    model=model,
-                    device=device,
-                    index=index,
-                    labels=labels,
+                    image=image, rfdetr_model=rfdetr_model,
+                    processor=processor, model=model,
+                    device=device, index=index, labels=labels,
                 )
-                col_detected, col_scores = _format_brand_scores(col_best, min_confidence=MIN_OUTPUT_CONFIDENCE)
-                per_col_results[col_name] = (col_detected, col_scores)
-                col_brand_maps.append(col_best)
+                for product, conf in col_best.items():
+                    if conf >= MIN_OUTPUT_CONFIDENCE:
+                        if conf > all_products.get(product, 0.0):
+                            all_products[product] = conf
 
-            result_row = _build_result_row(row, col_brand_maps, per_col_results)
+            # Sort by confidence and get product names
+            detected = [p for p, _ in sorted(all_products.items(), key=lambda x: -x[1])]
+
+            # Build Q12A/Q12B formatted row
+            q12_row = build_q12_row(detected)
+            result_row = {"Respondent.Serial": row[id_col], "Q6": ""}
+            result_row.update(q12_row)
+
+            # Preserve photo URL columns
+            for col in url_columns:
+                col_name = str(col)
+                result_row[col_name] = row[col] if not pd.isna(row[col]) else ""
+
         except Exception as exc:
             logger.error("Row %d failed: %s", row_idx, exc, exc_info=True)
-            result_row = _error_result_row(row)
+            result_row = {"Respondent.Serial": row[id_col], "Q6": ""}
 
         completed_rows.append(result_row)
 
-        # Incremental save every SAVE_INTERVAL rows or on the last row
         if (row_idx + 1) % SAVE_INTERVAL == 0 or row_idx + 1 == process_len:
             _flush(completed_rows)
 
         if progress_cb:
             progress_cb(row_idx + 1, process_len, f"Processed row {row_idx + 1}/{process_len}")
 
-    # Append NOT_PROCESSED markers for rows beyond process_len (BATCH_MODE)
-    remaining = original_len - process_len
-    if remaining > 0:
+    # NOT_PROCESSED markers for remaining rows
+    if BATCH_MODE is not None:
         for ri in range(process_len, original_len):
             row = df.iloc[ri]
-            result = {
-                id_col: row[id_col],
-                "final_brand": json.dumps(["NOT_PROCESSED"], ensure_ascii=False),
-                "overall_confidence": json.dumps([], ensure_ascii=False),
-            }
-            for col in url_columns:
-                cn = str(col)
-                result[cn] = row[col]
-                result[f"{cn}_detected_brands"] = json.dumps(["NOT_PROCESSED"], ensure_ascii=False)
-                result[f"{cn}_confidence"] = json.dumps([], ensure_ascii=False)
-            completed_rows.append(result)
+            result_row = {"Respondent.Serial": row[id_col], "Q6": "NOT_PROCESSED"}
+            completed_rows.append(result_row)
         _flush(completed_rows)
 
     return out_path

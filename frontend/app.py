@@ -139,7 +139,7 @@ def _show_result_preview(result_df: pd.DataFrame):
             and c not in base_cols
         ]
         display_cols = [c for c in base_cols + extra_cols if c in result_df.columns]
-        st.dataframe(result_df[display_cols].head(20), use_container_width=True)
+        st.dataframe(result_df[display_cols].head(20), width="stretch")
 
         rows_total = len(result_df)
         rows_detected = int(result_df["final_brand"].map(_final_brand_row_has_detection).sum())
@@ -149,7 +149,7 @@ def _show_result_preview(result_df: pd.DataFrame):
         m2.metric("Brands detected", rows_detected)
         m3.metric("Errors", rows_errors)
     else:
-        st.dataframe(result_df.head(20), use_container_width=True)
+        st.dataframe(result_df.head(20), width="stretch")
 
 
 # -- Page config --
@@ -426,7 +426,7 @@ st.markdown(
     <div class="pipeline-info">
         <span class="pipe-tag">RF-DETR</span>
         <span class="pipe-tag">DINOv2-base</span>
-        <span class="pipe-tag">FAISS cosine</span>
+        <span class="pipe-tag">Brand Classifier</span>
         <span class="pipe-tag">EasyOCR</span>
     </div>
     """,
@@ -454,7 +454,10 @@ except Exception:
     pass
 
 # -- Tabs --
-tab_batch, tab_single, tab_index = st.tabs(["Batch CSV Detection", "Single Image Test", "Reference Index"])
+tab_batch, tab_single, tab_index, tab_coco, tab_label = st.tabs([
+    "Batch CSV Detection", "Single Image Test", "Reference Index",
+    "Upload COCO Annotations", "Label Training Crops",
+])
 
 # ════════════════════════════════════════════════════════
 # TAB 1: Batch CSV Detection
@@ -465,7 +468,7 @@ with tab_batch:
     st.caption("Upload a CSV with image URL columns from field surveys.")
 
     if not index_exists:
-        st.warning("No FAISS index found. Go to the **Reference Index** tab to build one first.")
+        st.warning("No brand classifier found. Run `python brand_classifier.py` first or use the **Reference Index** tab to train one.")
 
     uploaded = st.file_uploader("Upload CSV", type=["csv"], label_visibility="collapsed", key="csv_upload")
 
@@ -474,14 +477,14 @@ with tab_batch:
         try:
             preview_df = pd.read_csv(uploaded)
             with st.expander(f"Preview ({len(preview_df)} rows)", expanded=True):
-                st.dataframe(preview_df.head(10), use_container_width=True)
+                st.dataframe(preview_df.head(10), width="stretch")
             st.caption(f"Batch mode: **{BATCH_MODE_LABEL}**")
             uploaded.seek(0)
         except Exception as exc:
             st.error(f"Could not preview CSV: {exc}")
 
     run_disabled = uploaded is None or not index_exists
-    if st.button("Run Detection", disabled=run_disabled, type="primary", use_container_width=True, key="run_batch"):
+    if st.button("Run Detection", disabled=run_disabled, type="primary", width="stretch", key="run_batch"):
         job_id = None
         try:
             files = {"csv_file": (uploaded.name, uploaded.getvalue(), "text/csv")}
@@ -517,7 +520,7 @@ with tab_batch:
                 data=csv_bytes,
                 file_name="results.csv",
                 mime="text/csv",
-                use_container_width=True,
+                width="stretch",
             )
 
             result_df = pd.read_csv(BytesIO(csv_bytes))
@@ -535,7 +538,7 @@ with tab_batch:
                             data=csv_bytes,
                             file_name="partial_results.csv",
                             mime="text/csv",
-                            use_container_width=True,
+                            width="stretch",
                         )
                         result_df = pd.read_csv(BytesIO(csv_bytes))
                         _show_result_preview(result_df)
@@ -552,7 +555,7 @@ with tab_single:
     st.caption("Upload a shelf photo to see RF-DETR bounding boxes. Hover over each box to see the detected brand and confidence.")
 
     if not index_exists:
-        st.warning("No FAISS index found. Go to the **Reference Index** tab to build one first.")
+        st.warning("No brand classifier found. Run `python brand_classifier.py` first or use the **Reference Index** tab to train one.")
 
     img_file = st.file_uploader(
         "Upload an image",
@@ -591,13 +594,13 @@ with tab_single:
     preview_placeholder = st.empty()
     if img_bytes is not None and not st.session_state.single_detect_done:
         st.caption('After you click "Detect Brands", this preview will be replaced by the interactive detection view.')
-        preview_placeholder.image(img_bytes, caption="Uploaded image", use_container_width=True)
+        preview_placeholder.image(img_bytes, caption="Uploaded image", width="stretch")
 
     run_single_clicked = st.button(
         "Detect Brands",
         disabled=detect_disabled,
         type="primary",
-        use_container_width=True,
+        width="stretch",
         key="run_single",
     )
 
@@ -880,7 +883,7 @@ body {{ background:transparent; font-family: -apple-system, BlinkMacSystemFont, 
                     brand_df = pd.DataFrame(rows)
                     st.dataframe(
                         brand_df,
-                        use_container_width=True,
+                        width="stretch",
                         column_config={
                             "Score": st.column_config.ProgressColumn(
                                 "Score", min_value=0, max_value=100, format="%d%%",
@@ -914,7 +917,7 @@ body {{ background:transparent; font-family: -apple-system, BlinkMacSystemFont, 
                             round(b.get("ocr_brand_scores", [{}])[0].get("confidence", 0.0), 3) if b.get("ocr_brand_scores") else 0.0
                         ),
                         })
-                    st.dataframe(pd.DataFrame(box_rows), use_container_width=True, hide_index=True)
+                    st.dataframe(pd.DataFrame(box_rows), width="stretch", hide_index=True)
                 else:
                     st.info("RF-DETR found no cigarette packs. The full image was used for detection.")
 
@@ -950,7 +953,7 @@ with tab_index:
         st.caption("Build an index from reference images to start detecting.")
 
     st.write("")
-    if st.button("Rebuild Index", use_container_width=True, key="rebuild_idx"):
+    if st.button("Rebuild Index", width="stretch", key="rebuild_idx"):
         try:
             res = requests.post(f"{BACKEND_URL}/build-index", timeout=15)
             res.raise_for_status()
@@ -959,7 +962,7 @@ with tab_index:
             progress_bar = st.progress(0)
             status_box = st.empty()
             anim_box = st.empty()
-            render_working_animation(anim_box, "Rebuilding FAISS index...", 30)
+            render_working_animation(anim_box, "Retraining brand classifier...", 30)
 
             with st.spinner("Building..."):
                 started = False
@@ -967,7 +970,7 @@ with tab_index:
                     started = True
                     progress_bar.progress(pct)
                     status_box.info(message)
-                    render_working_animation(anim_box, "Rebuilding FAISS index...", pct)
+                    render_working_animation(anim_box, "Retraining brand classifier...", pct)
                 if not started:
                     status_box.info("Finishing...")
             anim_box.empty()
@@ -983,4 +986,152 @@ with tab_index:
             if brands_list:
                 st.caption(f"{len(brands_list)} total references")
                 st.json(brands_list)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ════════════════════════════════════════════════════════
+# TAB 4: Upload COCO Annotations
+# ════════════════════════════════════════════════════════
+with tab_coco:
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.markdown("#### Upload COCO Annotations")
+    st.caption("Upload COCO JSON annotation files to add RF-DETR detection training data.")
+
+    coco_file = st.file_uploader(
+        "COCO JSON annotation file",
+        type=["json"],
+        key="coco_upload",
+    )
+
+    if coco_file is not None:
+        if st.button("Upload Annotation File", key="btn_coco_upload"):
+            try:
+                resp = requests.post(
+                    f"{BACKEND_URL}/upload-coco",
+                    files={"coco_file": (coco_file.name, coco_file.getvalue(), "application/json")},
+                    timeout=30,
+                )
+                resp.raise_for_status()
+                result = resp.json()
+                st.success(
+                    f"Uploaded **{result['filename']}**: "
+                    f"{result['images']} images, {result['annotations']} annotations"
+                )
+            except Exception as exc:
+                st.error(f"Upload failed: {exc}")
+
+    st.markdown("---")
+    st.markdown("##### How to use")
+    st.markdown("""
+1. Annotate shelf images in [Roboflow](https://app.roboflow.com) with bounding boxes around cigarette packs
+2. Use a single class: `cigarette_pack`
+3. Export as **COCO JSON** format
+4. Upload the JSON file here
+5. Then run `python train.py` on the GPU server to fine-tune RF-DETR
+    """)
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ════════════════════════════════════════════════════════
+# TAB 5: Label Training Crops
+# ════════════════════════════════════════════════════════
+with tab_label:
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.markdown("#### Label Training Crops")
+    st.caption("Upload a shelf image, review detected crops, confirm brand and product, and add to training data.")
+
+    # Load brand registry hierarchy
+    brand_hierarchy = {}
+    try:
+        reg_resp = requests.get(f"{BACKEND_URL}/brand-registry", timeout=10)
+        reg_resp.raise_for_status()
+        reg_data = reg_resp.json()
+        brand_hierarchy = reg_data.get("brands", {})
+        st.caption(
+            f"{reg_data.get('total_brands', 0)} brands, "
+            f"{reg_data.get('total_products', 0)} products "
+            f"({reg_data.get('products_with_refs', 0)} with references, "
+            f"{reg_data.get('products_missing', 0)} missing)"
+        )
+    except Exception:
+        st.warning("Could not load brand registry from backend.")
+
+    # Step 1: Upload image
+    label_image = st.file_uploader(
+        "Upload a shelf image to crop packs from",
+        type=["jpg", "jpeg", "png", "webp"],
+        key="label_upload",
+    )
+
+    if label_image is not None and st.button("Detect and Crop Packs", key="btn_generate_crops"):
+        with st.spinner("Running RF-DETR detection..."):
+            try:
+                resp = requests.post(
+                    f"{BACKEND_URL}/generate-crops",
+                    files={"image_file": (label_image.name, label_image.getvalue(), "image/jpeg")},
+                    timeout=60,
+                )
+                resp.raise_for_status()
+                crop_data = resp.json()
+                st.session_state["label_crops"] = crop_data.get("crops", [])
+                st.session_state["label_results"] = {}
+                st.success(f"Detected {crop_data['num_crops']} packs")
+            except Exception as exc:
+                st.error(f"Detection failed: {exc}")
+
+    # Step 2: Review and label each crop
+    crops = st.session_state.get("label_crops", [])
+    if crops:
+        st.markdown("---")
+        st.markdown(f"##### Review {len(crops)} detected crops")
+        st.caption("For each crop, select the brand and product, then click Add to confirm.")
+
+        # Build brand -> products dropdown
+        brand_names = sorted(brand_hierarchy.keys())
+
+        for crop in crops:
+            col_img, col_form = st.columns([1, 2])
+
+            with col_img:
+                import base64 as b64lib
+                crop_bytes = b64lib.b64decode(crop["image_b64"])
+                st.image(crop_bytes, caption=f"Crop #{crop['index']+1} ({crop['width']}x{crop['height']}, conf={crop['det_conf']})", width=200)
+
+            with col_form:
+                crop_key = f"crop_{crop['index']}"
+
+                selected_brand = st.selectbox(
+                    "Brand",
+                    options=["-- skip --"] + brand_names,
+                    key=f"{crop_key}_brand",
+                )
+
+                if selected_brand and selected_brand != "-- skip --":
+                    products_for_brand = brand_hierarchy.get(selected_brand, [])
+                    product_options = [p["display_name"] for p in products_for_brand]
+                    product_internals = {p["display_name"]: p["internal_name"] for p in products_for_brand}
+
+                    selected_product = st.selectbox(
+                        "Product",
+                        options=product_options,
+                        key=f"{crop_key}_product",
+                    )
+
+                    if st.button("Add to references", key=f"{crop_key}_add"):
+                        internal_name = product_internals.get(selected_product, "")
+                        if internal_name:
+                            try:
+                                crop_bytes_data = b64lib.b64decode(crop["image_b64"])
+                                resp = requests.post(
+                                    f"{BACKEND_URL}/add-reference",
+                                    files={"image_file": ("crop.jpg", crop_bytes_data, "image/jpeg")},
+                                    data={"product_name": internal_name},
+                                    timeout=15,
+                                )
+                                resp.raise_for_status()
+                                result = resp.json()
+                                st.success(f"Added as {result['filename']} ({result['total_for_product']} total for {selected_product})")
+                            except Exception as exc:
+                                st.error(f"Failed: {exc}")
+
+            st.markdown("---")
+
     st.markdown("</div>", unsafe_allow_html=True)

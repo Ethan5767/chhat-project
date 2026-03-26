@@ -11,14 +11,16 @@ from fastapi.responses import FileResponse, StreamingResponse
 
 try:
     from .pipeline import (
-        INDEX_BIN,
-        LABELS_JSON,
+        CLASSIFIER_WEIGHTS,
+        CLASS_MAPPING_JSON,
         build_index,
         get_device,
         load_dino,
         load_index,
+        load_classifier,
         load_rfdetr,
         run_pipeline,
+        classify_embeddings,
         _detect_brands_from_image,
         _format_brand_scores,
         label_to_product,
@@ -28,14 +30,16 @@ try:
     )
 except ImportError:
     from pipeline import (
-        INDEX_BIN,
-        LABELS_JSON,
+        CLASSIFIER_WEIGHTS,
+        CLASS_MAPPING_JSON,
         build_index,
         get_device,
         load_dino,
         load_index,
+        load_classifier,
         load_rfdetr,
         run_pipeline,
+        classify_embeddings,
         _detect_brands_from_image,
         _format_brand_scores,
         label_to_product,
@@ -147,10 +151,14 @@ def run_pipeline_job(job_id: str, csv_path: Path):
 def startup_event():
     device = get_device()
     print(f"[startup] device={device}")
-    if not INDEX_BIN.exists() or not LABELS_JSON.exists():
-        print("[startup] index not found, building now...")
-        build_index(device)
-        print("[startup] index built")
+    if not CLASSIFIER_WEIGHTS.exists() or not CLASS_MAPPING_JSON.exists():
+        print("[startup] classifier not found -- run 'python brand_classifier.py' first")
+        return
+    try:
+        load_classifier(device)
+        print("[startup] classifier loaded")
+    except Exception as exc:
+        print(f"[startup] classifier load failed: {exc}")
 
 
 @app.post("/build-index")
@@ -223,10 +231,11 @@ def download_endpoint(job_id: str):
 
 @app.get("/index-status")
 def index_status():
-    if not LABELS_JSON.exists():
+    if not CLASS_MAPPING_JSON.exists():
         return {"exists": False, "brand_count": 0, "brands": [], "products": []}
-    with LABELS_JSON.open("r", encoding="utf-8") as f:
-        brands = json.load(f)
+    with CLASS_MAPPING_JSON.open("r", encoding="utf-8") as f:
+        mapping = json.load(f)
+    brands = list(mapping.get("label_to_idx", {}).keys())
     products = sorted(set(label_to_product(b) for b in brands))
     return {"exists": True, "brand_count": len(brands), "brands": brands, "products": products}
 
@@ -239,41 +248,15 @@ async def detect_single(image_file: UploadFile = File(...)):
     import base64
     try:
         from .pipeline import (
-            embed_images_batch,
-            distance_to_confidence,
-            _build_label_profiles,
-            _run_ocr_on_image,
-            _ocr_brand_scores_from_items,
-            label_to_product,
-            _aggregate_to_products,
-            FAISS_TOP_K,
-            OCR_ENABLED,
-            OCR_FULLIMG_ENABLED,
-            DINO_PRODUCT_WEIGHT,
-            OCR_BRAND_WEIGHT,
-            NO_CONSENSUS_PENALTY,
-            OCR_BRAND_CONFIRM_THRESHOLD,
-            OCR_INDEPENDENT_WEIGHT,
-            OCR_INDEPENDENT_MIN_SCORE,
+            _detect_brands_from_image,
+            _format_brand_scores,
+            MIN_OUTPUT_CONFIDENCE,
         )
     except ImportError:
         from pipeline import (
-            embed_images_batch,
-            distance_to_confidence,
-            _build_label_profiles,
-            _run_ocr_on_image,
-            _ocr_brand_scores_from_items,
-            label_to_product,
-            _aggregate_to_products,
-            FAISS_TOP_K,
-            OCR_ENABLED,
-            OCR_FULLIMG_ENABLED,
-            DINO_PRODUCT_WEIGHT,
-            OCR_BRAND_WEIGHT,
-            NO_CONSENSUS_PENALTY,
-            OCR_BRAND_CONFIRM_THRESHOLD,
-            OCR_INDEPENDENT_WEIGHT,
-            OCR_INDEPENDENT_MIN_SCORE,
+            _detect_brands_from_image,
+            _format_brand_scores,
+            MIN_OUTPUT_CONFIDENCE,
         )
 
     data = await image_file.read()
@@ -288,190 +271,22 @@ async def detect_single(image_file: UploadFile = File(...)):
     rfdetr_model = load_rfdetr()
     img_w, img_h = pil_img.size
 
-    # ── RF-DETR detection ──
-    detections = rfdetr_model.predict(pil_img, threshold=RFDETR_CONF_THRESHOLD)
+    # Use the same pipeline as run_pipeline
+    brand_scores = _detect_brands_from_image(
+        pil_img, rfdetr_model, processor, model, device, index, labels,
+    )
 
-    crops: list[Image.Image] = []
-    boxes_data: list[dict] = []
-    has_detections = detections is not None and len(detections) > 0
+    all_sorted = sorted(brand_scores.items(), key=lambda x: x[1], reverse=True)
 
-    if has_detections:
-        xyxy = detections.xyxy  # already numpy
-        confs = detections.confidence  # already numpy
-        for i, box in enumerate(xyxy):
-            x1, y1, x2, y2 = int(box[0]), int(box[1]), int(box[2]), int(box[3])
-            x1 = max(0, min(x1, img_w - 1))
-            y1 = max(0, min(y1, img_h - 1))
-            x2 = max(1, min(x2, img_w))
-            y2 = max(1, min(y2, img_h))
-            if x2 <= x1 or y2 <= y1:
-                continue
-            crops.append(pil_img.crop((x1, y1, x2, y2)))
-            boxes_data.append({
-                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                "det_conf": round(float(confs[i]), 3),
-                "brands": [],   # filled below
-            })
-    else:
-        crops.append(pil_img)
-        boxes_data.append({
-            "x1": 0, "y1": 0, "x2": img_w, "y2": img_h,
-            "det_conf": 0.0,
-            "is_full_image": True,
-            "brands": [],
-        })
+    # Build simple box data (full image if no detections)
+    boxes_data = [{"x1": 0, "y1": 0, "x2": img_w, "y2": img_h,
+                   "det_conf": 0.0, "is_full_image": True,
+                   "brands": [{"brand": b, "confidence": round(c, 3)} for b, c in all_sorted[:5]]}]
 
-    # ── Per-crop OCR ──
-    label_profiles = _build_label_profiles(labels)
-    label_profile_map = {p["label"]: p for p in label_profiles}
-
-    crop_ocr_items = []
-    if OCR_ENABLED:
-        for crop in crops:
-            crop_ocr_items.append(_run_ocr_on_image(crop))
-    else:
-        crop_ocr_items = [[] for _ in crops]
-
-    # Pre-compute OCR brand scores per crop so we can both (a) fuse and (b) show OCR debug.
-    # easyocr detail=1 returns items shaped like: (bbox, text, confidence)
-    crop_ocr_scores_list: list[dict[str, float]] = []
-    if OCR_ENABLED:
-        for ocr_items in crop_ocr_items:
-            crop_ocr_scores_list.append(_ocr_brand_scores_from_items(ocr_items, label_profiles))
-    else:
-        crop_ocr_scores_list = [{} for _ in crops]
-
-    # ── Full-image OCR ──
-    fullimg_ocr_items = []
-    if OCR_ENABLED and OCR_FULLIMG_ENABLED and has_detections:
-        fullimg_ocr_items = _run_ocr_on_image(pil_img)
-    elif OCR_ENABLED and not has_detections:
-        fullimg_ocr_items = crop_ocr_items[0] if crop_ocr_items else []
-
-    # ── DINO batch embed ──
-    all_vecs = embed_images_batch(crops, processor, model, device)
-
-    # ── Collect raw DINO scores and per-crop OCR scores ──
-    k = max(1, min(FAISS_TOP_K, len(labels)))
-    dino_best: dict[str, float] = {}
-    crop_dino_results: list[list[tuple[str, float]]] = []
-
-    for crop_idx in range(len(crops)):
-        vec = all_vecs[crop_idx].reshape(1, -1)
-        distances, indices = index.search(vec, k=k)
-        crop_results = []
-        for rank in range(k):
-            idx = int(indices[0][rank])
-            if idx < 0 or idx >= len(labels):
-                continue
-            label = labels[idx]
-            dist = float(distances[0][rank])
-            conf = distance_to_confidence(dist)
-            crop_results.append((label, conf))
-            if conf > dino_best.get(label, 0.0):
-                dino_best[label] = conf
-        crop_dino_results.append(crop_results)
-
-    # Collect OCR scores across all crops (global max, used by the existing fusion logic).
-    ocr_best: dict[str, float] = {}
-    if OCR_ENABLED:
-        for crop_ocr_scores in crop_ocr_scores_list:
-            for brand, conf in crop_ocr_scores.items():
-                if conf > ocr_best.get(brand, 0.0):
-                    ocr_best[brand] = conf
-    fullimg_scores = {}
-    if fullimg_ocr_items:
-        fullimg_scores = _ocr_brand_scores_from_items(fullimg_ocr_items, label_profiles)
-        for brand, conf in fullimg_scores.items():
-            if conf > ocr_best.get(brand, 0.0):
-                ocr_best[brand] = conf
-
-    # Build OCR family-level lookup
-    ocr_family_best: dict[str, float] = {}
-    for label, ocr_conf in ocr_best.items():
-        prof = label_profile_map.get(label, {})
-        family = prof.get("brand", "")
-        if family:
-            ocr_family_best[family] = max(ocr_family_best.get(family, 0.0), ocr_conf)
-
-    # ── Brand-consensus fusion per crop (for box tooltips) ──
-    all_brand_scores: dict[str, float] = {}
-
-    for crop_idx in range(len(crops)):
-        # ── OCR debug per crop ──
-        ocr_items_for_box = crop_ocr_items[crop_idx] if OCR_ENABLED else []
-        ocr_texts = []
-        for item in ocr_items_for_box:
-            try:
-                text = str(item[1]).strip()
-                conf = float(item[2])
-            except Exception:
-                continue
-            if not text or text.lower() in ("nan",):
-                continue
-            if len(text) < 2:
-                continue
-            ocr_texts.append({"text": text, "confidence": round(conf, 3)})
-        # Sort by OCR confidence and keep short preview.
-        ocr_texts.sort(key=lambda x: x["confidence"], reverse=True)
-        boxes_data[crop_idx]["ocr_texts"] = ocr_texts[:8]
-
-        ocr_brand_scores_map = crop_ocr_scores_list[crop_idx] if OCR_ENABLED else {}
-        ocr_product_scores = _aggregate_to_products(ocr_brand_scores_map)
-        ocr_brand_scores_sorted = sorted(ocr_product_scores.items(), key=lambda x: x[1], reverse=True)[:5]
-        boxes_data[crop_idx]["ocr_brand_scores"] = [
-            {"brand": brand, "confidence": round(score, 3)} for brand, score in ocr_brand_scores_sorted
-        ]
-
-        crop_brands_raw = {}
-        for label, dino_conf in crop_dino_results[crop_idx]:
-            prof = label_profile_map.get(label, {})
-            brand_family = prof.get("brand", "")
-            ocr_family_score = ocr_family_best.get(brand_family, 0.0) if brand_family else 0.0
-            ocr_label_score = ocr_best.get(label, 0.0)
-
-            if ocr_family_score >= OCR_BRAND_CONFIRM_THRESHOLD:
-                if ocr_label_score >= OCR_BRAND_CONFIRM_THRESHOLD:
-                    final_conf = DINO_PRODUCT_WEIGHT * dino_conf + OCR_BRAND_WEIGHT * ocr_label_score
-                else:
-                    final_conf = DINO_PRODUCT_WEIGHT * dino_conf + OCR_BRAND_WEIGHT * ocr_family_score * 0.5
-            else:
-                final_conf = dino_conf * NO_CONSENSUS_PENALTY
-
-            final_conf = min(1.0, final_conf)
-            crop_brands_raw[label] = max(crop_brands_raw.get(label, 0.0), final_conf)
-            if final_conf > all_brand_scores.get(label, 0.0):
-                all_brand_scores[label] = final_conf
-
-        # Aggregate to product level for this box
-        crop_products = _aggregate_to_products(crop_brands_raw)
-        crop_brands = [{"brand": p, "confidence": round(c, 3)} for p, c in crop_products.items()]
-        crop_brands.sort(key=lambda x: x["confidence"], reverse=True)
-        boxes_data[crop_idx]["brands"] = crop_brands[:3]
-
-    # ── OCR independent brands (not found by DINO) ──
-    ocr_independent: list[dict] = []
-    for label, ocr_conf in ocr_best.items():
-        if label in all_brand_scores:
-            continue
-        if ocr_conf >= OCR_INDEPENDENT_MIN_SCORE:
-            indep_conf = min(1.0, ocr_conf * OCR_INDEPENDENT_WEIGHT)
-            product = label_to_product(label)
-            ocr_independent.append({"brand": product, "confidence": round(indep_conf, 3), "source": "ocr"})
-            if indep_conf > all_brand_scores.get(label, 0.0):
-                all_brand_scores[label] = indep_conf
-
-    # ── Encode original (clean) image as base64 ──
+    # Encode image
     buf = io.BytesIO()
     pil_img.save(buf, format="JPEG", quality=90)
-    import base64
     img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-
-    # ── Aggregate all brands to product level, sorted ──
-    all_product_scores = _aggregate_to_products(all_brand_scores)
-    all_sorted = sorted(all_product_scores.items(), key=lambda x: x[1], reverse=True)
-    all_brands = [b for b, _ in all_sorted]
-    all_confs = [round(c, 3) for _, c in all_sorted]
 
     return {
         "image_b64": img_b64,
@@ -479,9 +294,165 @@ async def detect_single(image_file: UploadFile = File(...)):
         "image_height": img_h,
         "boxes": boxes_data,
         "ocr_independent": ocr_independent,
-        "brands": all_brands,
-        "confidence": all_confs,
+        "brands": [b for b, _ in all_sorted],
+        "confidence": [round(c, 3) for _, c in all_sorted],
         "num_boxes": sum(1 for b in boxes_data if not b.get("is_full_image")),
+    }
+
+
+@app.post("/upload-coco")
+async def upload_coco(coco_file: UploadFile = File(...)):
+    """Upload a COCO JSON annotation file for RF-DETR training data."""
+    if not coco_file.filename.lower().endswith(".json"):
+        raise HTTPException(status_code=400, detail="Only .json COCO annotation files accepted.")
+
+    DATASETS_DIR = _BACKEND_ROOT.parent / "datasets" / "cigarette_packs"
+    DATASETS_DIR.mkdir(parents=True, exist_ok=True)
+
+    data = await coco_file.read()
+    try:
+        coco_data = json.loads(data)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON file.")
+
+    n_images = len(coco_data.get("images", []))
+    n_annotations = len(coco_data.get("annotations", []))
+
+    save_path = DATASETS_DIR / coco_file.filename
+    save_path.write_bytes(data)
+
+    return {
+        "status": "uploaded",
+        "filename": coco_file.filename,
+        "images": n_images,
+        "annotations": n_annotations,
+        "saved_to": str(save_path),
+    }
+
+
+@app.post("/generate-crops")
+async def generate_crops(image_file: UploadFile = File(...)):
+    """Run RF-DETR on an image and return all detected crops for labeling."""
+    from PIL import Image
+    import base64
+
+    data = await image_file.read()
+    try:
+        pil_img = Image.open(io.BytesIO(data)).convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not open image.")
+
+    rfdetr_model = load_rfdetr()
+    detections = rfdetr_model.predict(pil_img, threshold=RFDETR_CONF_THRESHOLD)
+
+    crops = []
+    if detections is not None and len(detections) > 0:
+        width, height = pil_img.size
+        for i, (box, conf) in enumerate(zip(detections.xyxy, detections.confidence)):
+            x1, y1, x2, y2 = [int(v) for v in box]
+            bw, bh = x2 - x1, y2 - y1
+            pad_x, pad_y = int(bw * 0.05), int(bh * 0.05)
+            x1, y1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
+            x2, y2 = min(width, x2 + pad_x), min(height, y2 + pad_y)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            crop = pil_img.crop((x1, y1, x2, y2))
+            buf = io.BytesIO()
+            crop.save(buf, format="JPEG", quality=90)
+            crop_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+            crops.append({
+                "index": i,
+                "image_b64": crop_b64,
+                "width": x2 - x1,
+                "height": y2 - y1,
+                "det_conf": round(float(conf), 3),
+            })
+
+    return {"num_crops": len(crops), "crops": crops}
+
+
+@app.post("/add-reference")
+async def add_reference(image_file: UploadFile = File(...), product_name: str = ""):
+    """Add a confirmed crop as a reference image for a specific product."""
+    if not product_name:
+        raise HTTPException(status_code=400, detail="product_name is required.")
+
+    try:
+        from .brand_registry import BRAND_REGISTRY
+    except ImportError:
+        from brand_registry import BRAND_REGISTRY
+
+    # Validate product_name exists in registry
+    valid_internals = set()
+    for brand, products in BRAND_REGISTRY.items():
+        for _, internal in products:
+            valid_internals.add(internal)
+
+    if product_name not in valid_internals:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown product '{product_name}'. Valid products: {sorted(valid_internals)}",
+        )
+
+    data = await image_file.read()
+    from PIL import Image
+    try:
+        Image.open(io.BytesIO(data)).convert("RGB")
+    except Exception:
+        raise HTTPException(status_code=400, detail="Could not open image.")
+
+    REFERENCES_DIR = _BACKEND_ROOT / "references"
+    REFERENCES_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Find next index
+    import re
+    existing = list(REFERENCES_DIR.glob(f"{product_name}_*.*"))
+    max_idx = 0
+    for p in existing:
+        match = re.search(r"_(\d+)$", p.stem)
+        if match:
+            max_idx = max(max_idx, int(match.group(1)))
+    next_idx = max_idx + 1
+
+    save_path = REFERENCES_DIR / f"{product_name}_{next_idx}.jpg"
+    save_path.write_bytes(data)
+
+    return {
+        "status": "added",
+        "product": product_name,
+        "filename": save_path.name,
+        "total_for_product": next_idx,
+    }
+
+
+@app.get("/brand-registry")
+def get_brand_registry():
+    """Return the full brand->products hierarchy."""
+    try:
+        from .brand_registry import BRAND_REGISTRY, audit_references
+    except ImportError:
+        from brand_registry import BRAND_REGISTRY, audit_references
+
+    audit = audit_references()
+
+    hierarchy = {}
+    for brand, products in BRAND_REGISTRY.items():
+        hierarchy[brand] = []
+        for display_name, internal_name in products:
+            count = audit["found"].get(internal_name, 0)
+            hierarchy[brand].append({
+                "display_name": display_name,
+                "internal_name": internal_name,
+                "reference_count": count,
+            })
+
+    return {
+        "brands": hierarchy,
+        "total_brands": len(BRAND_REGISTRY),
+        "total_products": sum(len(p) for p in BRAND_REGISTRY.values()),
+        "products_with_refs": audit["total_products_found"],
+        "products_missing": audit["total_products_missing"],
+        "total_images": audit["total_images"],
     }
 
 
