@@ -14,15 +14,6 @@ build/
 .env
 .env.*
 
-# Backend runtime
-brand_detector/backend/uploads/
-brand_detector/backend/faiss_index/
-
-# Large / generated ML artifacts (keep structure locally)
-brand_detector/runs/yolo/**/*.pt
-brand_detector/runs/yolo/**/weights/
-*.pt
-
 # IDE
 .idea/
 .vscode/
@@ -37,3 +28,18 @@ Thumbs.db
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Project: rf-detr-cigarette (exclude data/models/artifacts; push source only)
+runs/
+datasets/
+backend/faiss_index/
+backend/uploads/
+backend/references/
+backend/references_old/
+backend/references_removed/
+backend/test_crop_*.jpg
+test_images/
+test_results/
+Full angle view/
+rf-detr-medium.pth
+.claude/
