@@ -10,9 +10,12 @@ __pycache__/
 dist/
 build/
 
-# Env / secrets
+# Env / secrets / keys
 .env
 .env.*
+access-key*
+*.key
+*.pem
 
 # IDE
 .idea/
