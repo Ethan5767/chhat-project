@@ -29,17 +29,20 @@ Thumbs.db
 # Streamlit
 .streamlit/secrets.toml
 
-# Project: rf-detr-cigarette (exclude data/models/artifacts; push source only)
-runs/
-datasets/
-backend/faiss_index/
-backend/uploads/
-backend/references/
-backend/references_old/
-backend/references_removed/
-backend/test_crop_*.jpg
-test_images/
-test_results/
-Full angle view/
+# Large model weights (download separately)
 rf-detr-medium.pth
+runs/
+backend/classifier_model/
+
+# Training data (managed separately)
+datasets/
+backend/references/
+
+# Source materials (too large for git)
+source_materials/
+
+# Runtime artifacts
+backend/uploads/
+
+# Claude Code config
 .claude/

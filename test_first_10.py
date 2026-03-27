@@ -26,7 +26,7 @@ from pipeline import (
 )
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-EXCEL_PATH = PROJECT_ROOT / "CHHAT_TC_Sample output Q12AB.xlsx"
+EXCEL_PATH = PROJECT_ROOT / "source_materials" / "CHHAT_TC_Sample output Q12AB.xlsx"
 
 
 def extract_ground_truth(row_values: list) -> dict:

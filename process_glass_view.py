@@ -18,7 +18,7 @@ from rfdetr import RFDETRMedium
 from transformers import AutoImageProcessor, AutoModel
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-GLASS_VIEW_DIR = PROJECT_ROOT / "GLASS VIEW"
+GLASS_VIEW_DIR = PROJECT_ROOT / "source_materials" / "glass_view"
 REFERENCES_DIR = PROJECT_ROOT / "backend" / "references"
 DINO_MODEL_ID = "facebook/dinov2-base"
 
