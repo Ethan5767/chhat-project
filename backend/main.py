@@ -1,9 +1,13 @@
 import io
+import hashlib
 import json
 import queue
 import threading
 import traceback
 import uuid
+import zipfile
+from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -256,8 +260,9 @@ async def detect_single(image_file: UploadFile = File(...)):
             CLASSIFIER_TOP_K,
             OCR_ENABLED,
             OCR_FULLIMG_ENABLED,
+            OCR_FALLBACK_THRESHOLD,
+            OCR_FALLBACK_MARGIN,
             OCR_STRONG_THRESHOLD,
-            CLASSIFIER_HIGH_CONF,
         )
     except ImportError:
         from pipeline import (
@@ -270,8 +275,9 @@ async def detect_single(image_file: UploadFile = File(...)):
             CLASSIFIER_TOP_K,
             OCR_ENABLED,
             OCR_FULLIMG_ENABLED,
+            OCR_FALLBACK_THRESHOLD,
+            OCR_FALLBACK_MARGIN,
             OCR_STRONG_THRESHOLD,
-            CLASSIFIER_HIGH_CONF,
         )
 
     data = await image_file.read()
@@ -330,8 +336,15 @@ async def detect_single(image_file: UploadFile = File(...)):
     all_brand_scores = {}
 
     for crop_idx in range(len(crops)):
-        # OCR per crop
-        ocr_items = _run_ocr_on_image(crops[crop_idx]) if OCR_ENABLED else []
+        crop_cls_ranked = all_cls_results[crop_idx]
+        crop_cls = dict(crop_cls_ranked)
+        top1 = float(crop_cls_ranked[0][1]) if crop_cls_ranked else 0.0
+        top2 = float(crop_cls_ranked[1][1]) if len(crop_cls_ranked) > 1 else 0.0
+        margin = top1 - top2
+        should_run_ocr = OCR_ENABLED and (top1 < OCR_FALLBACK_THRESHOLD or margin < OCR_FALLBACK_MARGIN)
+
+        # OCR fallback per crop
+        ocr_items = _run_ocr_on_image(crops[crop_idx]) if should_run_ocr else []
         ocr_texts = []
         for item in ocr_items:
             try:
@@ -353,8 +366,7 @@ async def detect_single(image_file: UploadFile = File(...)):
             for b, s in sorted(ocr_product_scores.items(), key=lambda x: -x[1])[:5]
         ]
 
-        # Classifier + OCR fusion for this crop
-        crop_cls = dict(all_cls_results[crop_idx])
+        # Classifier + OCR fallback fusion for this crop
         label_profile_map = {p["label"]: p for p in label_profiles}
         ocr_families = {}
         for label, ocr_conf in ocr_scores.items():
@@ -365,17 +377,16 @@ async def detect_single(image_file: UploadFile = File(...)):
 
         fused = {}
         for label, cls_conf in crop_cls.items():
-            prof = label_profile_map.get(label, {})
-            brand_family = prof.get("brand", "")
-            ocr_fam = ocr_families.get(brand_family, 0.0) if brand_family else 0.0
-            if ocr_fam >= OCR_STRONG_THRESHOLD:
-                fused[label] = min(1.0, cls_conf + ocr_fam * 0.3)
-            elif ocr_fam > 0:
-                fused[label] = min(1.0, cls_conf + ocr_fam * 0.15)
-            elif cls_conf >= CLASSIFIER_HIGH_CONF:
-                fused[label] = cls_conf
-            else:
-                fused[label] = cls_conf * 0.7
+            out_conf = float(cls_conf)
+            if should_run_ocr:
+                prof = label_profile_map.get(label, {})
+                brand_family = prof.get("brand", "")
+                ocr_fam = ocr_families.get(brand_family, 0.0) if brand_family else 0.0
+                if ocr_fam >= OCR_STRONG_THRESHOLD:
+                    out_conf = min(1.0, out_conf + ocr_fam * 0.25)
+                elif ocr_fam > 0:
+                    out_conf = min(1.0, out_conf + ocr_fam * 0.10)
+            fused[label] = out_conf
 
         crop_products = _aggregate_to_products(fused)
         crop_brands = [{"brand": p, "confidence": round(c, 3)} for p, c in crop_products.items()]
@@ -408,39 +419,127 @@ async def detect_single(image_file: UploadFile = File(...)):
 
 @app.post("/upload-coco")
 async def upload_coco(coco_file: UploadFile = File(...)):
-    """Upload a COCO JSON annotation file for RF-DETR training data."""
-    if not coco_file.filename.lower().endswith(".json"):
-        raise HTTPException(status_code=400, detail="Only .json COCO annotation files accepted.")
+    """Upload a COCO JSON annotation file or ZIP export for RF-DETR training data."""
+    filename = (coco_file.filename or "").strip()
+    lower = filename.lower()
+    if not (lower.endswith(".json") or lower.endswith(".zip")):
+        raise HTTPException(status_code=400, detail="Only .json or .zip COCO files accepted.")
 
     DATASETS_DIR = _BACKEND_ROOT.parent / "datasets" / "cigarette_packs"
     DATASETS_DIR.mkdir(parents=True, exist_ok=True)
 
     data = await coco_file.read()
+    if lower.endswith(".json"):
+        try:
+            coco_data = json.loads(data)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid JSON file.")
+
+        n_images = len(coco_data.get("images", []))
+        n_annotations = len(coco_data.get("annotations", []))
+        save_path = DATASETS_DIR / filename
+        save_path.write_bytes(data)
+        return {
+            "status": "uploaded",
+            "file_type": "json",
+            "filename": filename,
+            "images": n_images,
+            "annotations": n_annotations,
+            "saved_to": str(save_path),
+        }
+
     try:
-        coco_data = json.loads(data)
+        zf = zipfile.ZipFile(BytesIO(data))
     except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON file.")
+        raise HTTPException(status_code=400, detail="Invalid ZIP file.")
 
-    n_images = len(coco_data.get("images", []))
-    n_annotations = len(coco_data.get("annotations", []))
+    members = [m for m in zf.namelist() if not m.endswith("/")]
+    ann_candidates = [m for m in members if m.lower().endswith("_annotations.coco.json")]
+    if not ann_candidates:
+        raise HTTPException(status_code=400, detail="ZIP must include _annotations.coco.json.")
 
-    save_path = DATASETS_DIR / coco_file.filename
-    save_path.write_bytes(data)
+    def _safe_parts(member_name: str) -> list[str]:
+        return [p for p in member_name.replace("\\", "/").split("/") if p not in ("", ".", "..")]
+
+    def _extract_member(member_name: str, out_path: Path) -> None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(member_name) as src, out_path.open("wb") as dst:
+            dst.write(src.read())
+
+    target_splits = ("train", "valid", "test")
+    split_ann_map: dict[str, str] = {}
+    for ann in ann_candidates:
+        parts = [p.lower() for p in _safe_parts(ann)]
+        for split in target_splits:
+            if split in parts:
+                split_ann_map[split] = ann
+    if not split_ann_map:
+        split_ann_map["train"] = ann_candidates[0]
+
+    extracted_images = 0
+    extracted_annotations = 0
+    extracted_files = 0
+    saved_dirs: list[str] = []
+
+    for split, ann_member in split_ann_map.items():
+        split_dir = DATASETS_DIR / split
+        saved_dirs.append(str(split_dir))
+        ann_out = split_dir / "_annotations.coco.json"
+        _extract_member(ann_member, ann_out)
+        extracted_files += 1
+
+        try:
+            coco_data = json.loads(ann_out.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        extracted_images += len(coco_data.get("images", []))
+        extracted_annotations += len(coco_data.get("annotations", []))
+
+        ann_parts = _safe_parts(ann_member)
+        ann_prefix = "/".join(ann_parts[:-1])
+        for img in coco_data.get("images", []):
+            img_name = img.get("file_name", "")
+            if not img_name:
+                continue
+            safe_img_name = "/".join(_safe_parts(img_name))
+            if not safe_img_name:
+                continue
+            prefixed_candidate = f"{ann_prefix}/{safe_img_name}" if ann_prefix else safe_img_name
+            if prefixed_candidate in members:
+                _extract_member(prefixed_candidate, split_dir / safe_img_name)
+                extracted_files += 1
+            elif safe_img_name in members:
+                _extract_member(safe_img_name, split_dir / safe_img_name)
+                extracted_files += 1
 
     return {
         "status": "uploaded",
-        "filename": coco_file.filename,
-        "images": n_images,
-        "annotations": n_annotations,
-        "saved_to": str(save_path),
+        "file_type": "zip",
+        "filename": filename,
+        "images": extracted_images,
+        "annotations": extracted_annotations,
+        "extracted_files": extracted_files,
+        "splits": sorted(split_ann_map.keys()),
+        "saved_to": saved_dirs,
     }
 
 
 @app.post("/generate-crops")
 async def generate_crops(image_file: UploadFile = File(...)):
-    """Run RF-DETR on an image and return all detected crops for labeling."""
+    """Run RF-DETR on an image, classify each crop, and return for labeling."""
     from PIL import Image
     import base64
+    try:
+        from .pipeline import (
+            embed_images_batch, classify_embeddings,
+        )
+        from .brand_registry import get_brand, resolve_internal_name
+    except ImportError:
+        from pipeline import (
+            embed_images_batch, classify_embeddings,
+        )
+        from brand_registry import get_brand, resolve_internal_name
 
     data = await image_file.read()
     try:
@@ -448,10 +547,12 @@ async def generate_crops(image_file: UploadFile = File(...)):
     except Exception:
         raise HTTPException(status_code=400, detail="Could not open image.")
 
+    device = get_device()
     rfdetr_model = load_rfdetr()
     detections = rfdetr_model.predict(pil_img, threshold=RFDETR_CONF_THRESHOLD)
 
-    crops = []
+    crop_images = []
+    crop_meta = []
     if detections is not None and len(detections) > 0:
         width, height = pil_img.size
         for i, (box, conf) in enumerate(zip(detections.xyxy, detections.confidence)):
@@ -463,16 +564,50 @@ async def generate_crops(image_file: UploadFile = File(...)):
             if x2 <= x1 or y2 <= y1:
                 continue
             crop = pil_img.crop((x1, y1, x2, y2))
-            buf = io.BytesIO()
-            crop.save(buf, format="JPEG", quality=90)
-            crop_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
-            crops.append({
-                "index": i,
-                "image_b64": crop_b64,
-                "width": x2 - x1,
-                "height": y2 - y1,
-                "det_conf": round(float(conf), 3),
-            })
+            crop_images.append(crop)
+            crop_meta.append({"index": i, "w": x2 - x1, "h": y2 - y1, "conf": float(conf)})
+
+    # Classify all crops at once
+    suggested_labels = []
+    if crop_images:
+        try:
+            processor, model = load_dino(device)
+            _, labels = load_index()
+
+            vecs = embed_images_batch(crop_images, processor, model, device)
+            cls_results = classify_embeddings(vecs, device, top_k=3)
+
+            for crop_idx, crop in enumerate(crop_images):
+                top_pred = cls_results[crop_idx][0] if cls_results[crop_idx] else ("unknown", 0.0)
+                internal_name = resolve_internal_name(top_pred[0])
+                cls_conf = top_pred[1]
+
+                brand = get_brand(internal_name)
+                suggested_labels.append({
+                    "internal_name": internal_name,
+                    "brand": brand,
+                    "confidence": round(cls_conf, 3),
+                })
+        except Exception:
+            suggested_labels = [{"internal_name": "", "brand": "", "confidence": 0.0}] * len(crop_images)
+
+    # Build response
+    crops = []
+    for idx, (crop, meta) in enumerate(zip(crop_images, crop_meta)):
+        buf = io.BytesIO()
+        crop.save(buf, format="JPEG", quality=90)
+        crop_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+        suggestion = suggested_labels[idx] if idx < len(suggested_labels) else {}
+        crops.append({
+            "index": meta["index"],
+            "image_b64": crop_b64,
+            "width": meta["w"],
+            "height": meta["h"],
+            "det_conf": round(meta["conf"], 3),
+            "suggested_brand": suggestion.get("brand", ""),
+            "suggested_product": suggestion.get("internal_name", ""),
+            "suggested_confidence": suggestion.get("confidence", 0.0),
+        })
 
     return {"num_crops": len(crops), "crops": crops}
 
@@ -562,8 +697,218 @@ def get_brand_registry():
     }
 
 
+@app.get("/reference-image/{filename}")
+def get_reference_image(filename: str):
+    """Serve a reference image by filename."""
+    REFERENCES_DIR = _BACKEND_ROOT / "references"
+    path = REFERENCES_DIR / filename
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Image not found")
+    return FileResponse(str(path), media_type="image/jpeg")
+
+
+@app.get("/reference-images/{product_name}")
+def list_reference_images(product_name: str):
+    """List all reference image filenames for a product."""
+    import re as re_mod
+    REFERENCES_DIR = _BACKEND_ROOT / "references"
+    files = sorted(REFERENCES_DIR.glob(f"{product_name}_*.*"))
+    return {
+        "product": product_name,
+        "count": len(files),
+        "filenames": [f.name for f in files],
+    }
+
+
 _TRAINING_PROGRESS_DIR = _BACKEND_ROOT.parent
 _training_jobs: dict[str, dict] = {}
+_training_lock = threading.Lock()
+_TRAINING_HISTORY_PATH = _BACKEND_ROOT / "training_history.json"
+_MODEL_REGISTRY_PATH = _BACKEND_ROOT / "model_registry.json"
+_VERSION_STATE_PATH = _BACKEND_ROOT / "training_version_state.json"
+DEFAULT_TRAINING_VERSION = "v1"
+
+
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _load_training_history() -> list[dict]:
+    if not _TRAINING_HISTORY_PATH.exists():
+        return []
+    try:
+        payload = json.loads(_TRAINING_HISTORY_PATH.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, list) else []
+    except Exception:
+        return []
+
+
+def _save_training_history(items: list[dict]) -> None:
+    _TRAINING_HISTORY_PATH.write_text(
+        json.dumps(items, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _append_training_history(entry: dict) -> None:
+    with _training_lock:
+        history = _load_training_history()
+        history.append(entry)
+        _save_training_history(history)
+
+
+def _update_training_history(job_id: str, patch: dict) -> None:
+    with _training_lock:
+        history = _load_training_history()
+        for i in range(len(history) - 1, -1, -1):
+            if history[i].get("job_id") == job_id:
+                history[i].update(patch)
+                _save_training_history(history)
+                return
+
+
+def _load_model_registry() -> list[dict]:
+    if not _MODEL_REGISTRY_PATH.exists():
+        return []
+    try:
+        payload = json.loads(_MODEL_REGISTRY_PATH.read_text(encoding="utf-8"))
+        return payload if isinstance(payload, list) else []
+    except Exception:
+        return []
+
+
+def _save_model_registry(items: list[dict]) -> None:
+    _MODEL_REGISTRY_PATH.write_text(
+        json.dumps(items, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _append_model_registry(entry: dict) -> None:
+    with _training_lock:
+        rows = _load_model_registry()
+        rows.append(entry)
+        _save_model_registry(rows)
+
+
+def _update_model_registry(job_id: str, patch: dict) -> None:
+    with _training_lock:
+        rows = _load_model_registry()
+        for i in range(len(rows) - 1, -1, -1):
+            if rows[i].get("job_id") == job_id:
+                rows[i].update(patch)
+                _save_model_registry(rows)
+                return
+
+
+def _parse_version_num(version: str) -> int:
+    if isinstance(version, str) and version.startswith("v") and version[1:].isdigit():
+        return int(version[1:])
+    return 1
+
+
+def _next_version(version: str) -> str:
+    return f"v{_parse_version_num(version) + 1}"
+
+
+def _load_version_state() -> dict:
+    if not _VERSION_STATE_PATH.exists():
+        return {"current_version": DEFAULT_TRAINING_VERSION, "last_trained_version": None}
+    try:
+        payload = json.loads(_VERSION_STATE_PATH.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict):
+            return {"current_version": DEFAULT_TRAINING_VERSION, "last_trained_version": None}
+        payload.setdefault("current_version", DEFAULT_TRAINING_VERSION)
+        payload.setdefault("last_trained_version", None)
+        return payload
+    except Exception:
+        return {"current_version": DEFAULT_TRAINING_VERSION, "last_trained_version": None}
+
+
+def _save_version_state(state: dict) -> None:
+    _VERSION_STATE_PATH.write_text(
+        json.dumps(state, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+
+def _get_current_training_version() -> str:
+    return _load_version_state().get("current_version", DEFAULT_TRAINING_VERSION)
+
+
+def _mark_training_completed(version: str) -> str:
+    with _training_lock:
+        state = _load_version_state()
+        state["last_trained_version"] = version
+        if state.get("current_version") == version:
+            state["current_version"] = _next_version(version)
+        _save_version_state(state)
+        return state.get("current_version", DEFAULT_TRAINING_VERSION)
+
+
+def _hash_dataset_dir(path: Path) -> str:
+    if not path.exists():
+        return "missing"
+    h = hashlib.sha256()
+    files = sorted([p for p in path.rglob("*") if p.is_file()])
+    for p in files:
+        rel = str(p.relative_to(path)).replace("\\", "/")
+        stat = p.stat()
+        h.update(rel.encode("utf-8"))
+        h.update(str(stat.st_size).encode("utf-8"))
+        h.update(str(stat.st_mtime_ns).encode("utf-8"))
+    return h.hexdigest()
+
+
+def _dataset_hash_for_type(model_type: str) -> str:
+    if model_type in ("classifier", "dinov2_finetune"):
+        return _hash_dataset_dir(_BACKEND_ROOT / "references")
+    if model_type == "rfdetr":
+        return _hash_dataset_dir(_BACKEND_ROOT.parent / "datasets" / "cigarette_packs")
+    return "unknown"
+
+
+def _hparam_signature(model_type: str, version: str, params: dict) -> str:
+    payload = {
+        "model_type": model_type,
+        "version": version,
+        "params": params,
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _find_duplicate_completed_run(model_type: str, version: str, dataset_hash: str, hparam_signature: str) -> dict | None:
+    rows = _load_model_registry()
+    for row in reversed(rows):
+        if (
+            row.get("model_type") == model_type
+            and row.get("version") == version
+            and row.get("dataset_hash") == dataset_hash
+            and row.get("hparam_signature") == hparam_signature
+            and row.get("status") == "done"
+        ):
+            return row
+    return None
+
+
+def _metrics_from_progress(progress: dict) -> dict:
+    if not isinstance(progress, dict):
+        return {}
+    out = {}
+    if "val_acc" in progress:
+        out["val_acc"] = progress.get("val_acc")
+    if "best_val_acc" in progress:
+        out["best_val_acc"] = progress.get("best_val_acc")
+    if "train_acc" in progress:
+        out["train_acc"] = progress.get("train_acc")
+    if "train_loss" in progress:
+        out["train_loss"] = progress.get("train_loss")
+    if "epoch" in progress:
+        out["epoch"] = progress.get("epoch")
+    if "total_epochs" in progress:
+        out["total_epochs"] = progress.get("total_epochs")
+    return out
 
 
 def _run_training_job(job_id: str, script: str, args: list[str]):
@@ -577,7 +922,14 @@ def _run_training_job(job_id: str, script: str, args: list[str]):
                  "--progress-file", str(progress_file)] + args
 
     try:
-        _training_jobs[job_id] = {"status": "running", "progress": {}, "error": None}
+        with _training_lock:
+            _training_jobs[job_id].update({
+                "status": "running",
+                "progress": {},
+                "error": None,
+                "last_update": _now_iso(),
+            })
+        _update_model_registry(job_id, {"status": "running", "last_update": _now_iso()})
 
         process = subprocess.Popen(
             full_args, cwd=str(_TRAINING_PROGRESS_DIR),
@@ -590,7 +942,9 @@ def _run_training_job(job_id: str, script: str, args: list[str]):
             if progress_file.exists():
                 try:
                     progress = json.loads(progress_file.read_text())
-                    _training_jobs[job_id]["progress"] = progress
+                    with _training_lock:
+                        _training_jobs[job_id]["progress"] = progress
+                        _training_jobs[job_id]["last_update"] = _now_iso()
                     # Push to SSE queue if job has one
                     with jobs_lock:
                         job = jobs.get(job_id)
@@ -600,13 +954,36 @@ def _run_training_job(job_id: str, script: str, args: list[str]):
                         val_acc = progress.get("val_acc", 0)
                         pct = int((epoch / total) * 100) if total > 0 else 0
                         job["queue"].put((pct, f"Epoch {epoch}/{total} | Val acc: {val_acc:.3f}"))
+                    _update_training_history(job_id, {
+                        "status": "running",
+                        "progress": progress,
+                        "last_update": _now_iso(),
+                    })
+                    _update_model_registry(job_id, {
+                        "status": "running",
+                        "progress": progress,
+                        "last_update": _now_iso(),
+                        **_metrics_from_progress(progress),
+                    })
                 except Exception:
                     pass
 
         # Final read
         if progress_file.exists():
             try:
-                _training_jobs[job_id]["progress"] = json.loads(progress_file.read_text())
+                final_progress = json.loads(progress_file.read_text())
+                with _training_lock:
+                    _training_jobs[job_id]["progress"] = final_progress
+                    _training_jobs[job_id]["last_update"] = _now_iso()
+                _update_training_history(job_id, {
+                    "progress": final_progress,
+                    "last_update": _now_iso(),
+                })
+                _update_model_registry(job_id, {
+                    "progress": final_progress,
+                    "last_update": _now_iso(),
+                    **_metrics_from_progress(final_progress),
+                })
             except Exception:
                 pass
             progress_file.unlink(missing_ok=True)
@@ -614,29 +991,70 @@ def _run_training_job(job_id: str, script: str, args: list[str]):
         stdout = process.stdout.read() if process.stdout else ""
 
         if process.returncode == 0:
-            _training_jobs[job_id]["status"] = "done"
+            with _training_lock:
+                _training_jobs[job_id]["status"] = "done"
+                _training_jobs[job_id]["end_time"] = _now_iso()
+                completed_version = _training_jobs[job_id].get("version", DEFAULT_TRAINING_VERSION)
             with jobs_lock:
                 job = jobs.get(job_id)
             if job:
                 job["queue"].put((100, "Training complete"))
                 jobs[job_id]["status"] = "done"
                 jobs[job_id]["result"] = "TRAINING_COMPLETE"
+            next_version = _mark_training_completed(str(completed_version))
+            _update_training_history(job_id, {
+                "status": "done",
+                "end_time": _now_iso(),
+                "next_version": next_version,
+            })
+            with _training_lock:
+                progress = _training_jobs.get(job_id, {}).get("progress", {})
+            _update_model_registry(job_id, {
+                "status": "done",
+                "end_time": _now_iso(),
+                "next_version": next_version,
+                **_metrics_from_progress(progress),
+            })
         else:
-            _training_jobs[job_id]["status"] = "error"
-            _training_jobs[job_id]["error"] = stdout[-2000:]
+            with _training_lock:
+                _training_jobs[job_id]["status"] = "error"
+                _training_jobs[job_id]["error"] = stdout[-2000:]
+                _training_jobs[job_id]["end_time"] = _now_iso()
             with jobs_lock:
                 if job_id in jobs:
                     jobs[job_id]["status"] = "error"
                     jobs[job_id]["error"] = stdout[-2000:]
+            _update_training_history(job_id, {
+                "status": "error",
+                "error": stdout[-2000:],
+                "end_time": _now_iso(),
+            })
+            _update_model_registry(job_id, {
+                "status": "error",
+                "error": stdout[-2000:],
+                "end_time": _now_iso(),
+            })
 
     except Exception:
         err = traceback.format_exc()
-        _training_jobs[job_id]["status"] = "error"
-        _training_jobs[job_id]["error"] = err
+        with _training_lock:
+            _training_jobs[job_id]["status"] = "error"
+            _training_jobs[job_id]["error"] = err
+            _training_jobs[job_id]["end_time"] = _now_iso()
         with jobs_lock:
             if job_id in jobs:
                 jobs[job_id]["status"] = "error"
                 jobs[job_id]["error"] = err
+        _update_training_history(job_id, {
+            "status": "error",
+            "error": err,
+            "end_time": _now_iso(),
+        })
+        _update_model_registry(job_id, {
+            "status": "error",
+            "error": err,
+            "end_time": _now_iso(),
+        })
 
 
 @app.post("/train-classifier")
@@ -645,21 +1063,63 @@ def train_classifier_endpoint(
     batch_size: int = 64,
     embed_batch_size: int = 8,
     lr: float = 0.001,
+    version: str = "",
+    force: bool = False,
 ):
     """Train the brand classifier (frozen DINOv2 + MLP head). Works on CPU."""
+    version = (version or _get_current_training_version()).strip() or DEFAULT_TRAINING_VERSION
+    params = {
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "embed_batch_size": embed_batch_size,
+        "lr": lr,
+    }
+    dataset_hash = _dataset_hash_for_type("classifier")
+    hp_sig = _hparam_signature("classifier", version, params)
+    if not force:
+        dup = _find_duplicate_completed_run("classifier", version, dataset_hash, hp_sig)
+        if dup:
+            return {
+                "skipped": True,
+                "reason": "Matching completed run found for same dataset+settings",
+                "existing_job_id": dup.get("job_id"),
+                "version": version,
+                "best_val_acc": dup.get("best_val_acc"),
+            }
+
     job_id = create_job()
+    start_time = _now_iso()
     args = [
         "--epochs", str(epochs),
         "--batch-size", str(batch_size),
         "--embed-batch-size", str(embed_batch_size),
         "--lr", str(lr),
     ]
+    with _training_lock:
+        _training_jobs[job_id] = {
+            "job_id": job_id,
+            "type": "classifier",
+            "version": version,
+            "model_type": "classifier",
+            "dataset_hash": dataset_hash,
+            "hparam_signature": hp_sig,
+            "status": "queued",
+            "params": params,
+            "progress": {},
+            "error": None,
+            "start_time": start_time,
+            "last_update": start_time,
+            "end_time": None,
+        }
+        snapshot = dict(_training_jobs[job_id])
+    _append_training_history(snapshot)
+    _append_model_registry(snapshot)
     threading.Thread(
         target=_run_training_job,
         args=(job_id, "brand_classifier.py", args),
         daemon=True,
     ).start()
-    return {"job_id": job_id, "type": "classifier", "epochs": epochs}
+    return {"job_id": job_id, "type": "classifier", "epochs": epochs, "version": version, "skipped": False}
 
 
 @app.post("/train-rfdetr")
@@ -667,20 +1127,56 @@ def train_rfdetr_endpoint(
     epochs: int = 50,
     batch_size: int = 4,
     lr: float = 0.0001,
+    version: str = "",
+    force: bool = False,
 ):
     """Train RF-DETR detection model. Requires GPU for reasonable speed."""
+    version = (version or _get_current_training_version()).strip() or DEFAULT_TRAINING_VERSION
+    params = {"epochs": epochs, "batch_size": batch_size, "lr": lr}
+    dataset_hash = _dataset_hash_for_type("rfdetr")
+    hp_sig = _hparam_signature("rfdetr", version, params)
+    if not force:
+        dup = _find_duplicate_completed_run("rfdetr", version, dataset_hash, hp_sig)
+        if dup:
+            return {
+                "skipped": True,
+                "reason": "Matching completed run found for same dataset+settings",
+                "existing_job_id": dup.get("job_id"),
+                "version": version,
+            }
+
     job_id = create_job()
+    start_time = _now_iso()
     args = [
         "--epochs", str(epochs),
         "--batch-size", str(batch_size),
         "--lr", str(lr),
     ]
+    with _training_lock:
+        _training_jobs[job_id] = {
+            "job_id": job_id,
+            "type": "rfdetr",
+            "version": version,
+            "model_type": "rfdetr",
+            "dataset_hash": dataset_hash,
+            "hparam_signature": hp_sig,
+            "status": "queued",
+            "params": params,
+            "progress": {},
+            "error": None,
+            "start_time": start_time,
+            "last_update": start_time,
+            "end_time": None,
+        }
+        snapshot = dict(_training_jobs[job_id])
+    _append_training_history(snapshot)
+    _append_model_registry(snapshot)
     threading.Thread(
         target=_run_training_job,
         args=(job_id, "train.py", args),
         daemon=True,
     ).start()
-    return {"job_id": job_id, "type": "rfdetr", "epochs": epochs}
+    return {"job_id": job_id, "type": "rfdetr", "epochs": epochs, "version": version, "skipped": False}
 
 
 @app.post("/finetune-dinov2")
@@ -689,29 +1185,117 @@ def finetune_dinov2_endpoint(
     batch_size: int = 8,
     lr: float = 0.00001,
     unfreeze_layers: int = 4,
+    version: str = "",
+    force: bool = False,
 ):
     """Fine-tune DINOv2 backbone. Requires 16GB+ VRAM (RunPod recommended)."""
+    version = (version or _get_current_training_version()).strip() or DEFAULT_TRAINING_VERSION
+    params = {
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "lr": lr,
+        "unfreeze_layers": unfreeze_layers,
+    }
+    dataset_hash = _dataset_hash_for_type("dinov2_finetune")
+    hp_sig = _hparam_signature("dinov2_finetune", version, params)
+    if not force:
+        dup = _find_duplicate_completed_run("dinov2_finetune", version, dataset_hash, hp_sig)
+        if dup:
+            return {
+                "skipped": True,
+                "reason": "Matching completed run found for same dataset+settings",
+                "existing_job_id": dup.get("job_id"),
+                "version": version,
+                "best_val_acc": dup.get("best_val_acc"),
+            }
+
     job_id = create_job()
+    start_time = _now_iso()
     args = [
         "--epochs", str(epochs),
         "--batch-size", str(batch_size),
         "--lr", str(lr),
         "--unfreeze-layers", str(unfreeze_layers),
     ]
+    with _training_lock:
+        _training_jobs[job_id] = {
+            "job_id": job_id,
+            "type": "dinov2_finetune",
+            "version": version,
+            "model_type": "dinov2_finetune",
+            "dataset_hash": dataset_hash,
+            "hparam_signature": hp_sig,
+            "status": "queued",
+            "params": params,
+            "progress": {},
+            "error": None,
+            "start_time": start_time,
+            "last_update": start_time,
+            "end_time": None,
+        }
+        snapshot = dict(_training_jobs[job_id])
+    _append_training_history(snapshot)
+    _append_model_registry(snapshot)
     threading.Thread(
         target=_run_training_job,
         args=(job_id, "finetune_dinov2.py", args),
         daemon=True,
     ).start()
-    return {"job_id": job_id, "type": "dinov2_finetune", "epochs": epochs}
+    return {"job_id": job_id, "type": "dinov2_finetune", "epochs": epochs, "version": version, "skipped": False}
 
 
 @app.get("/training-status/{job_id}")
 def training_status(job_id: str):
     """Get training progress for a running job."""
-    if job_id in _training_jobs:
-        return _training_jobs[job_id]
+    with _training_lock:
+        if job_id in _training_jobs:
+            return _training_jobs[job_id]
     raise HTTPException(status_code=404, detail="Training job not found")
+
+
+@app.get("/training-progress/{job_id}")
+def training_progress_stream(job_id: str):
+    """SSE stream for live training progress updates."""
+    import time
+
+    def event_stream():
+        last_payload = None
+        while True:
+            with _training_lock:
+                state = _training_jobs.get(job_id)
+                payload = json.dumps(state or {"status": "not_found"}, ensure_ascii=False)
+
+            if payload != last_payload:
+                yield f"data: {payload}\n\n"
+                last_payload = payload
+
+            if not state or state.get("status") in ("done", "error"):
+                break
+
+            time.sleep(1)
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
+
+@app.get("/training-history")
+def training_history(limit: int = 30):
+    """Return recent training jobs (latest first)."""
+    history = _load_training_history()
+    history = list(reversed(history))
+    return {"count": len(history), "items": history[: max(1, min(limit, 200))]}
+
+
+@app.get("/model-registry")
+def model_registry(limit: int = 100):
+    rows = _load_model_registry()
+    rows = list(reversed(rows))
+    version_state = _load_version_state()
+    return {
+        "count": len(rows),
+        "items": rows[: max(1, min(limit, 500))],
+        "current_version": version_state.get("current_version", DEFAULT_TRAINING_VERSION),
+        "last_trained_version": version_state.get("last_trained_version"),
+    }
 
 
 @app.get("/health")

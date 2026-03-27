@@ -1,5 +1,7 @@
 import base64
 import json
+import os
+import time
 from io import BytesIO
 from typing import Generator
 
@@ -8,7 +10,7 @@ import requests
 import streamlit as st
 import streamlit.components.v1 as components
 
-BACKEND_URL = "http://localhost:8000"
+BACKEND_URL = os.getenv("BACKEND_URL", "http://127.0.0.1:8000").rstrip("/")
 BATCH_MODE_LABEL = "ALL ROWS"
 
 # Match wide layout (~.block-container max-width 1360px minus padding). The old 650px estimate
@@ -150,6 +152,16 @@ def _show_result_preview(result_df: pd.DataFrame):
         m3.metric("Errors", rows_errors)
     else:
         st.dataframe(result_df.head(20), width="stretch")
+
+
+def _fetch_reference_image_bytes(filename: str):
+    """Fetch reference image from backend on server side for public deployments."""
+    try:
+        resp = requests.get(f"{BACKEND_URL}/reference-image/{filename}", timeout=10)
+        resp.raise_for_status()
+        return resp.content
+    except Exception:
+        return None
 
 
 # -- Page config --
@@ -996,6 +1008,52 @@ with tab_index:
             f"{reg_data.get('products_missing', 0)} missing"
         )
 
+        # Quick product picker with image preview gallery
+        st.markdown("###### Product Reference Viewer")
+        picker_col1, picker_col2 = st.columns(2)
+        with picker_col1:
+            picked_brand = st.selectbox(
+                "Select brand",
+                options=["-- Select brand --"] + sorted(brand_hierarchy.keys()),
+                key="ref_picker_brand",
+            )
+        with picker_col2:
+            picked_products = []
+            if picked_brand != "-- Select brand --":
+                picked_products = brand_hierarchy.get(picked_brand, [])
+            picked_product_display = st.selectbox(
+                "Select product",
+                options=["-- Select product --"] + [p["display_name"] for p in picked_products],
+                key="ref_picker_product",
+            )
+
+        if picked_brand != "-- Select brand --" and picked_product_display != "-- Select product --":
+            picked_internal = ""
+            for p in picked_products:
+                if p["display_name"] == picked_product_display:
+                    picked_internal = p["internal_name"]
+                    break
+            if picked_internal:
+                with st.expander(f"Show references for {picked_product_display}", expanded=True):
+                    try:
+                        ref_resp = requests.get(f"{BACKEND_URL}/reference-images/{picked_internal}", timeout=5)
+                        ref_resp.raise_for_status()
+                        ref_data = ref_resp.json()
+                        filenames = ref_data.get("filenames", [])
+                        if filenames:
+                            cols = st.columns(min(5, len(filenames)))
+                            for img_idx, fname in enumerate(filenames):
+                                with cols[img_idx % len(cols)]:
+                                    img_bytes = _fetch_reference_image_bytes(fname)
+                                    if img_bytes:
+                                        st.image(img_bytes, caption=fname, width=110)
+                        else:
+                            st.caption("No reference images yet for this product.")
+                    except Exception as exc:
+                        st.caption(f"Could not load references: {exc}")
+
+        st.markdown("---")
+
         for brand_idx, (brand_name, products) in enumerate(sorted(brand_hierarchy.items()), 1):
             total_refs = sum(p["reference_count"] for p in products)
             has_refs = total_refs > 0
@@ -1007,7 +1065,22 @@ with tab_index:
                     name = prod["display_name"]
                     internal = prod["internal_name"]
                     if count > 0:
-                        st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{brand_idx}.{prod_idx} **{name}** -- {count} reference images `({internal})`")
+                        st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{brand_idx}.{prod_idx} **{name}** -- {count} reference images")
+                        with st.expander(f"View {name} references", expanded=False):
+                            try:
+                                ref_resp = requests.get(f"{BACKEND_URL}/reference-images/{internal}", timeout=5)
+                                if ref_resp.status_code == 200:
+                                    ref_data = ref_resp.json()
+                                    cols = st.columns(min(5, len(ref_data["filenames"])))
+                                    for img_idx, fname in enumerate(ref_data["filenames"][:20]):
+                                        with cols[img_idx % len(cols)]:
+                                            img_bytes = _fetch_reference_image_bytes(fname)
+                                            if img_bytes:
+                                                st.image(img_bytes, caption=fname, width=120)
+                                    if len(ref_data["filenames"]) > 20:
+                                        st.caption(f"... and {len(ref_data['filenames']) - 20} more")
+                            except Exception:
+                                st.caption("Could not load images")
                     else:
                         st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{brand_idx}.{prod_idx} ~~{name}~~ -- missing `(need: {internal}_1.jpg)`")
 
@@ -1022,11 +1095,11 @@ with tab_index:
 with tab_coco:
     st.markdown('<div class="panel">', unsafe_allow_html=True)
     st.markdown("#### Upload COCO Annotations")
-    st.caption("Upload COCO JSON annotation files to add RF-DETR detection training data.")
+    st.caption("Upload COCO JSON or ZIP export files to add RF-DETR detection training data.")
 
     coco_file = st.file_uploader(
-        "COCO JSON annotation file",
-        type=["json"],
+        "COCO JSON or ZIP file",
+        type=["json", "zip"],
         key="coco_upload",
     )
 
@@ -1035,15 +1108,24 @@ with tab_coco:
             try:
                 resp = requests.post(
                     f"{BACKEND_URL}/upload-coco",
-                    files={"coco_file": (coco_file.name, coco_file.getvalue(), "application/json")},
+                    files={
+                        "coco_file": (
+                            coco_file.name,
+                            coco_file.getvalue(),
+                            "application/zip" if coco_file.name.lower().endswith(".zip") else "application/json",
+                        )
+                    },
                     timeout=30,
                 )
                 resp.raise_for_status()
                 result = resp.json()
                 st.success(
                     f"Uploaded **{result['filename']}**: "
-                    f"{result['images']} images, {result['annotations']} annotations"
+                    f"{result.get('images', 0)} images, {result.get('annotations', 0)} annotations"
                 )
+                if result.get("file_type") == "zip":
+                    st.caption(f"Splits: {', '.join(result.get('splits', [])) or 'train'}")
+                    st.caption(f"Extracted files: {result.get('extracted_files', 0)}")
             except Exception as exc:
                 st.error(f"Upload failed: {exc}")
 
@@ -1052,8 +1134,8 @@ with tab_coco:
     st.markdown("""
 1. Annotate shelf images in [Roboflow](https://app.roboflow.com) with bounding boxes around cigarette packs
 2. Use a single class: `cigarette_pack`
-3. Export as **COCO JSON** format
-4. Upload the JSON file here
+3. Export as **COCO JSON** or **COCO ZIP** format
+4. Upload the JSON/ZIP file here
 5. Then run `python train.py` on the GPU server to fine-tune RF-DETR
     """)
     st.markdown("</div>", unsafe_allow_html=True)
@@ -1110,25 +1192,36 @@ with tab_label:
     if crops:
         st.markdown("---")
         st.markdown(f"##### Review {len(crops)} detected crops")
-        st.caption("For each crop, select the brand and product, then click Add to confirm.")
+        st.caption("AI auto-suggests brand/product. Verify and click Add to confirm.")
 
-        # Build brand -> products dropdown
         brand_names = sorted(brand_hierarchy.keys())
+        import base64 as b64lib
 
         for crop in crops:
             col_img, col_form = st.columns([1, 2])
 
             with col_img:
-                import base64 as b64lib
                 crop_bytes = b64lib.b64decode(crop["image_b64"])
-                st.image(crop_bytes, caption=f"Crop #{crop['index']+1} ({crop['width']}x{crop['height']}, conf={crop['det_conf']})", width=200)
+                st.image(crop_bytes, caption=f"Crop #{crop['index']+1} ({crop['width']}x{crop['height']})", width=200)
+                if crop.get("suggested_confidence", 0) > 0:
+                    st.caption(f"AI suggests: **{crop.get('suggested_brand', '?')}** / {crop.get('suggested_product', '?').replace('_', ' ')} ({crop['suggested_confidence']:.0%})")
 
             with col_form:
                 crop_key = f"crop_{crop['index']}"
+                products_for_brand = []
+                product_internals = {}
+                selected_product = ""
+
+                # Pre-select brand from AI suggestion
+                suggested_brand = crop.get("suggested_brand", "")
+                default_brand_idx = 0
+                if suggested_brand in brand_names:
+                    default_brand_idx = brand_names.index(suggested_brand) + 1
 
                 selected_brand = st.selectbox(
                     "Brand",
                     options=["-- skip --"] + brand_names,
+                    index=default_brand_idx,
                     key=f"{crop_key}_brand",
                 )
 
@@ -1137,9 +1230,18 @@ with tab_label:
                     product_options = [p["display_name"] for p in products_for_brand]
                     product_internals = {p["display_name"]: p["internal_name"] for p in products_for_brand}
 
+                    # Pre-select product from AI suggestion
+                    suggested_product = crop.get("suggested_product", "")
+                    default_prod_idx = 0
+                    for pidx, p in enumerate(products_for_brand):
+                        if p["internal_name"] == suggested_product:
+                            default_prod_idx = pidx
+                            break
+
                     selected_product = st.selectbox(
                         "Product",
                         options=product_options,
+                        index=default_prod_idx,
                         key=f"{crop_key}_product",
                     )
 
@@ -1160,6 +1262,28 @@ with tab_label:
                             except Exception as exc:
                                 st.error(f"Failed: {exc}")
 
+                    # Show one reference image directly under Add button
+                    internal_name = product_internals.get(selected_product, "")
+                    if internal_name:
+                        try:
+                            ref_resp = requests.get(f"{BACKEND_URL}/reference-images/{internal_name}", timeout=5)
+                            if ref_resp.status_code == 200:
+                                ref_data = ref_resp.json()
+                                if ref_data["filenames"]:
+                                    first_ref = ref_data["filenames"][0]
+                                    img_bytes = _fetch_reference_image_bytes(first_ref)
+                                    if img_bytes:
+                                        st.image(
+                                            img_bytes,
+                                            caption=f"Reference preview: {selected_product}",
+                                            width=170,
+                                        )
+                                    st.caption(f"{ref_data['count']} refs total")
+                                else:
+                                    st.caption("No reference images yet")
+                        except Exception:
+                            st.caption("Reference preview unavailable")
+
             st.markdown("---")
 
     st.markdown("</div>", unsafe_allow_html=True)
@@ -1178,6 +1302,31 @@ with tab_train:
     except Exception:
         pass
     st.caption(f"Server device: **{device_info}**")
+    training_version = "v1"
+    last_trained_version = None
+    try:
+        reg = requests.get(f"{BACKEND_URL}/model-registry", params={"limit": 1}, timeout=5).json()
+        training_version = reg.get("current_version", "v1")
+        last_trained_version = reg.get("last_trained_version")
+    except Exception:
+        pass
+    st.caption(f"Training version: **{training_version}**")
+    if last_trained_version:
+        st.caption(f"Latest trained version: **{last_trained_version}**")
+
+    if st.button("Load Recommended Settings", key="btn_load_recommended_training"):
+        st.session_state["cls_epochs"] = 100
+        st.session_state["cls_lr"] = 0.001
+        st.session_state["cls_batch"] = 64
+        st.session_state["cls_embed_batch"] = 8
+        st.session_state["rfdetr_epochs"] = 50
+        st.session_state["rfdetr_lr"] = 0.0001
+        st.session_state["rfdetr_batch"] = 4
+        st.session_state["dino_epochs"] = 30
+        st.session_state["dino_lr"] = 0.00001
+        st.session_state["dino_layers"] = 4
+        st.session_state["dino_batch"] = 8
+        st.rerun()
 
     train_col1, train_col2, train_col3 = st.columns(3)
 
@@ -1185,21 +1334,35 @@ with tab_train:
     with train_col1:
         st.markdown("##### Brand Classifier")
         st.caption("Frozen DINOv2 + MLP head. Fast, works on CPU.")
+        st.caption("Recommended: epochs=100, lr=0.001, batch=64, embed_batch=8")
         cls_epochs = st.number_input("Epochs", value=100, min_value=10, max_value=500, key="cls_epochs")
         cls_lr = st.number_input("Learning rate", value=0.001, format="%.4f", key="cls_lr")
         cls_batch = st.number_input("Batch size", value=64, min_value=8, max_value=256, key="cls_batch")
+        cls_embed_batch = st.number_input("Embed batch size", value=8, min_value=1, max_value=64, key="cls_embed_batch")
 
         if st.button("Train Classifier", type="primary", key="btn_train_cls"):
             try:
                 resp = requests.post(
                     f"{BACKEND_URL}/train-classifier",
-                    params={"epochs": cls_epochs, "lr": cls_lr, "batch_size": cls_batch},
+                    params={
+                        "epochs": cls_epochs,
+                        "lr": cls_lr,
+                        "batch_size": cls_batch,
+                        "embed_batch_size": cls_embed_batch,
+                        "version": training_version,
+                    },
                     timeout=15,
                 )
                 resp.raise_for_status()
                 result = resp.json()
-                st.session_state["train_cls_job"] = result["job_id"]
-                st.success(f"Training started (job: {result['job_id'][:8]}...)")
+                if result.get("skipped"):
+                    st.warning(
+                        f"Skipped: same dataset/settings already trained for {training_version} "
+                        f"(job: {str(result.get('existing_job_id', ''))[:8]}...)."
+                    )
+                else:
+                    st.session_state["train_cls_job"] = result["job_id"]
+                    st.success(f"Training started (job: {result['job_id'][:8]}...)")
             except Exception as exc:
                 st.error(f"Failed to start: {exc}")
 
@@ -1207,6 +1370,7 @@ with tab_train:
     with train_col2:
         st.markdown("##### RF-DETR Detection")
         st.caption("Fine-tune pack detector. GPU recommended.")
+        st.caption("Recommended: epochs=50, lr=0.0001, batch=4")
         rfdetr_epochs = st.number_input("Epochs", value=50, min_value=5, max_value=200, key="rfdetr_epochs")
         rfdetr_lr = st.number_input("Learning rate", value=0.0001, format="%.5f", key="rfdetr_lr")
         rfdetr_batch = st.number_input("Batch size", value=4, min_value=1, max_value=16, key="rfdetr_batch")
@@ -1215,13 +1379,24 @@ with tab_train:
             try:
                 resp = requests.post(
                     f"{BACKEND_URL}/train-rfdetr",
-                    params={"epochs": rfdetr_epochs, "lr": rfdetr_lr, "batch_size": rfdetr_batch},
+                    params={
+                        "epochs": rfdetr_epochs,
+                        "lr": rfdetr_lr,
+                        "batch_size": rfdetr_batch,
+                        "version": training_version,
+                    },
                     timeout=15,
                 )
                 resp.raise_for_status()
                 result = resp.json()
-                st.session_state["train_rfdetr_job"] = result["job_id"]
-                st.success(f"Training started (job: {result['job_id'][:8]}...)")
+                if result.get("skipped"):
+                    st.warning(
+                        f"Skipped: same dataset/settings already trained for {training_version} "
+                        f"(job: {str(result.get('existing_job_id', ''))[:8]}...)."
+                    )
+                else:
+                    st.session_state["train_rfdetr_job"] = result["job_id"]
+                    st.success(f"Training started (job: {result['job_id'][:8]}...)")
             except Exception as exc:
                 st.error(f"Failed to start: {exc}")
 
@@ -1229,6 +1404,7 @@ with tab_train:
     with train_col3:
         st.markdown("##### DINOv2 Fine-tune")
         st.caption("Unfreeze DINOv2 layers. Needs 16GB+ VRAM.")
+        st.caption("Recommended: epochs=30, lr=1e-5, unfreeze_layers=4, batch=8")
         dino_epochs = st.number_input("Epochs", value=30, min_value=5, max_value=100, key="dino_epochs")
         dino_lr = st.number_input("Learning rate", value=0.00001, format="%.6f", key="dino_lr")
         dino_layers = st.number_input("Unfreeze layers", value=4, min_value=1, max_value=12, key="dino_layers")
@@ -1241,13 +1417,20 @@ with tab_train:
                     params={
                         "epochs": dino_epochs, "lr": dino_lr,
                         "batch_size": dino_batch, "unfreeze_layers": dino_layers,
+                        "version": training_version,
                     },
                     timeout=15,
                 )
                 resp.raise_for_status()
                 result = resp.json()
-                st.session_state["train_dino_job"] = result["job_id"]
-                st.success(f"Training started (job: {result['job_id'][:8]}...)")
+                if result.get("skipped"):
+                    st.warning(
+                        f"Skipped: same dataset/settings already trained for {training_version} "
+                        f"(job: {str(result.get('existing_job_id', ''))[:8]}...)."
+                    )
+                else:
+                    st.session_state["train_dino_job"] = result["job_id"]
+                    st.success(f"Training started (job: {result['job_id'][:8]}...)")
             except Exception as exc:
                 st.error(f"Failed to start: {exc}")
 
@@ -1263,6 +1446,7 @@ with tab_train:
             active_jobs.append((label, job_id))
 
     if active_jobs:
+        auto_refresh = st.checkbox("Auto-refresh live progress (2s)", value=True, key="train_auto_refresh")
         for label, job_id in active_jobs:
             try:
                 resp = requests.get(f"{BACKEND_URL}/training-status/{job_id}", timeout=5)
@@ -1275,6 +1459,7 @@ with tab_train:
                     val_acc = progress.get("val_acc", 0)
                     best_acc = progress.get("best_val_acc", 0)
                     job_status = status.get("status", "unknown")
+                    last_update = status.get("last_update", "")
 
                     pct = epoch / total if total > 0 else 0
                     st.markdown(f"**{label}** -- {job_status}")
@@ -1284,6 +1469,8 @@ with tab_train:
                         f"Train acc: {train_acc:.3f} | Val acc: {val_acc:.3f} | "
                         f"Best: {best_acc:.3f}"
                     )
+                    if last_update:
+                        st.caption(f"Last update: {last_update}")
 
                     if status.get("error"):
                         with st.expander("Error details"):
@@ -1293,7 +1480,64 @@ with tab_train:
 
         if st.button("Refresh", key="btn_refresh_training"):
             st.rerun()
+        if auto_refresh:
+            time.sleep(2)
+            st.rerun()
     else:
         st.caption("No active training jobs. Start one above.")
+
+    st.markdown("---")
+    st.markdown("##### Training History")
+    try:
+        history_resp = requests.get(f"{BACKEND_URL}/training-history", params={"limit": 50}, timeout=8)
+        history_resp.raise_for_status()
+        history_items = history_resp.json().get("items", [])
+        if history_items:
+            rows = []
+            for item in history_items:
+                progress = item.get("progress", {}) or {}
+                rows.append({
+                    "job_id": item.get("job_id", "")[:8],
+                    "type": item.get("type", ""),
+                    "version": item.get("version", "v1"),
+                    "status": item.get("status", ""),
+                    "epoch": f"{progress.get('epoch', 0)}/{progress.get('total_epochs', 0)}",
+                    "val_acc": progress.get("val_acc", 0),
+                    "best_val_acc": progress.get("best_val_acc", 0),
+                    "start_time": item.get("start_time", ""),
+                    "end_time": item.get("end_time", ""),
+                })
+            st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        else:
+            st.caption("No training history yet.")
+    except Exception as exc:
+        st.caption(f"Could not load training history: {exc}")
+
+    st.markdown("##### Accuracy Trend")
+    try:
+        reg_resp = requests.get(f"{BACKEND_URL}/model-registry", params={"limit": 200}, timeout=8)
+        reg_resp.raise_for_status()
+        reg_items = reg_resp.json().get("items", [])
+        trend_rows = []
+        for item in reversed(reg_items):
+            best = item.get("best_val_acc")
+            val = item.get("val_acc")
+            metric = best if best is not None else val
+            if metric is None:
+                continue
+            trend_rows.append({
+                "run": f"{item.get('model_type', '')}:{str(item.get('job_id', ''))[:8]}",
+                "model_type": item.get("model_type", ""),
+                "version": item.get("version", "v1"),
+                "accuracy": float(metric),
+            })
+        if trend_rows:
+            trend_df = pd.DataFrame(trend_rows)
+            st.line_chart(trend_df.set_index("run")["accuracy"], use_container_width=True)
+            st.caption("Shows validation accuracy (best_val_acc when available) across runs.")
+        else:
+            st.caption("No accuracy points yet (run classifier or DINOv2 fine-tune first).")
+    except Exception as exc:
+        st.caption(f"Could not load accuracy trend: {exc}")
 
     st.markdown("</div>", unsafe_allow_html=True)

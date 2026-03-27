@@ -40,6 +40,8 @@ OCR_FULLIMG_ENABLED = True
 # Tier 3: Classifier lost (< 0.50) -> OCR can override
 CLASSIFIER_HIGH_CONF = 0.85
 CLASSIFIER_LOW_CONF = 0.50
+OCR_FALLBACK_THRESHOLD = 0.72
+OCR_FALLBACK_MARGIN = 0.08
 OCR_STRONG_THRESHOLD = 0.60
 OCR_BOOST = 0.10              # confidence boost when OCR agrees with classifier
 OCR_INDEPENDENT_MIN_SCORE = 0.65
@@ -505,10 +507,11 @@ def _detect_brands_from_image(
 ) -> dict[str, float]:
     """Detect and classify cigarette brands in an image.
 
-    Pipeline (OCR-first):
+    Pipeline (classifier-first with OCR fallback):
       1. RF-DETR detects pack bounding boxes
-      2. EasyOCR reads text on crops + full image -> identifies brand families
-      3. DINOv2 classifier picks the specific product, prioritizing OCR-identified brands
+      2. DINOv2 classifier predicts products for each crop
+      3. EasyOCR runs only on uncertain crops (low confidence / low margin)
+      4. OCR signals boost matching classifier families for uncertain crops
     """
     label_profiles = _build_label_profiles(labels)
     label_profile_map = {p["label"]: p for p in label_profiles}
@@ -534,64 +537,72 @@ def _detect_brands_from_image(
     else:
         crops.append(image)
 
-    # ── Step 1: OCR reads text (primary brand identification) ──
-    ocr_best: dict[str, float] = {}
-    for crop in crops:
-        ocr_items = _run_ocr_on_image(crop)
-        crop_ocr_scores = _ocr_brand_scores_from_items(ocr_items, label_profiles)
-        for brand, conf in crop_ocr_scores.items():
-            if conf > ocr_best.get(brand, 0.0):
-                ocr_best[brand] = conf
-
-    if OCR_FULLIMG_ENABLED and has_detections:
-        fullimg_ocr = _run_ocr_on_image(image)
-        fullimg_scores = _ocr_brand_scores_from_items(fullimg_ocr, label_profiles)
-        for brand, conf in fullimg_scores.items():
-            if conf > ocr_best.get(brand, 0.0):
-                ocr_best[brand] = conf
-
-    # Build set of OCR-identified brand families
-    ocr_families: dict[str, float] = {}
-    for label, ocr_conf in ocr_best.items():
-        prof = label_profile_map.get(label, {})
-        family = prof.get("brand", "")
-        if family:
-            ocr_families[family] = max(ocr_families.get(family, 0.0), ocr_conf)
-
-    # ── Step 2: DINOv2 classifier picks specific product ──
+    # ── Step 1: DINOv2 classifier picks specific product ──
     all_vecs = embed_images_batch(crops, processor, model, device)
     all_cls_results = classify_embeddings(all_vecs, device, top_k=CLASSIFIER_TOP_K)
 
-    classifier_best: dict[str, float] = {}
-    for crop_results in all_cls_results:
-        for label, conf in crop_results:
-            if conf > classifier_best.get(label, 0.0):
-                classifier_best[label] = conf
+    def _needs_ocr_fallback(crop_results: list[tuple[str, float]]) -> bool:
+        if not OCR_ENABLED:
+            return False
+        if not crop_results:
+            return True
+        top1 = float(crop_results[0][1])
+        top2 = float(crop_results[1][1]) if len(crop_results) > 1 else 0.0
+        margin = top1 - top2
+        return top1 < OCR_FALLBACK_THRESHOLD or margin < OCR_FALLBACK_MARGIN
 
-    # ── Step 3: OCR-first fusion ──
-    # OCR identifies which brands are present, DINOv2 picks the specific product.
-    # If OCR found a brand, boost any classifier prediction in that family.
-    # If OCR found nothing, trust classifier alone but at reduced confidence.
+    ocr_needed = [_needs_ocr_fallback(r) for r in all_cls_results]
+
+    # ── Step 2: OCR fallback only for uncertain crops ──
+    per_crop_ocr_scores: list[dict[str, float]] = [{} for _ in crops]
+    ocr_best: dict[str, float] = {}
+    for idx, crop in enumerate(crops):
+        if not ocr_needed[idx]:
+            continue
+        ocr_items = _run_ocr_on_image(crop)
+        crop_ocr_scores = _ocr_brand_scores_from_items(ocr_items, label_profiles)
+        per_crop_ocr_scores[idx] = crop_ocr_scores
+        for label, conf in crop_ocr_scores.items():
+            if conf > ocr_best.get(label, 0.0):
+                ocr_best[label] = conf
+
+    # Optional full-image OCR context only when at least one crop was uncertain.
+    fullimg_ocr_families: dict[str, float] = {}
+    if OCR_FULLIMG_ENABLED and has_detections and any(ocr_needed):
+        fullimg_scores = _ocr_brand_scores_from_items(_run_ocr_on_image(image), label_profiles)
+        for label, conf in fullimg_scores.items():
+            if conf > ocr_best.get(label, 0.0):
+                ocr_best[label] = conf
+            family = label_profile_map.get(label, {}).get("brand", "")
+            if family:
+                fullimg_ocr_families[family] = max(fullimg_ocr_families.get(family, 0.0), conf)
+
+    # ── Step 3: Fuse classifier with OCR fallback on uncertain crops ──
     fused: dict[str, float] = {}
+    for crop_idx, crop_results in enumerate(all_cls_results):
+        crop_ocr_scores = per_crop_ocr_scores[crop_idx]
+        crop_ocr_families: dict[str, float] = {}
+        for label, ocr_conf in crop_ocr_scores.items():
+            family = label_profile_map.get(label, {}).get("brand", "")
+            if family:
+                crop_ocr_families[family] = max(crop_ocr_families.get(family, 0.0), ocr_conf)
 
-    for label, cls_conf in classifier_best.items():
-        prof = label_profile_map.get(label, {})
-        brand_family = prof.get("brand", "")
-        ocr_family_conf = ocr_families.get(brand_family, 0.0) if brand_family else 0.0
-
-        if ocr_family_conf >= OCR_STRONG_THRESHOLD:
-            # OCR confirms this brand family -- boost classifier confidence
-            fused[label] = min(1.0, cls_conf + ocr_family_conf * 0.3)
-        elif ocr_family_conf > 0:
-            # OCR has weak signal for this family -- slight boost
-            fused[label] = min(1.0, cls_conf + ocr_family_conf * 0.15)
-        else:
-            # OCR didn't see this brand -- trust classifier but reduce confidence
-            # unless classifier is very confident on its own
-            if cls_conf >= CLASSIFIER_HIGH_CONF:
-                fused[label] = cls_conf
-            else:
-                fused[label] = cls_conf * 0.7
+        for label, cls_conf in crop_results:
+            out_conf = float(cls_conf)
+            if ocr_needed[crop_idx]:
+                brand_family = label_profile_map.get(label, {}).get("brand", "")
+                fam_conf = 0.0
+                if brand_family:
+                    fam_conf = max(
+                        crop_ocr_families.get(brand_family, 0.0),
+                        fullimg_ocr_families.get(brand_family, 0.0),
+                    )
+                if fam_conf >= OCR_STRONG_THRESHOLD:
+                    out_conf = min(1.0, out_conf + fam_conf * 0.25)
+                elif fam_conf > 0:
+                    out_conf = min(1.0, out_conf + fam_conf * 0.10)
+            if out_conf > fused.get(label, 0.0):
+                fused[label] = out_conf
 
     # OCR-only brands: OCR found brands the classifier missed entirely
     # Use OCR score directly (the brand is there, classifier just didn't see it)
