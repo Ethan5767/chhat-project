@@ -491,9 +491,9 @@ except Exception:
     pass
 
 # -- Tabs --
-tab_batch, tab_single, tab_index, tab_coco, tab_label, tab_train = st.tabs([
+tab_batch, tab_single, tab_index, tab_label, tab_train = st.tabs([
     "Batch CSV Detection", "Single Image Test", "Reference Index",
-    "Upload COCO Annotations", "Label Training Crops", "Training",
+    "Label Training Crops", "Training",
 ])
 
 # ════════════════════════════════════════════════════════
@@ -1113,88 +1113,7 @@ with tab_index:
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════════════
-# TAB 4: Upload COCO Annotations
-# ════════════════════════════════════════════════════════
-with tab_coco:
-    st.markdown('<div class="panel">', unsafe_allow_html=True)
-    st.markdown("#### Upload COCO Annotations")
-    st.caption("Upload COCO JSON or ZIP export files to add RF-DETR detection training data.")
-    st.caption("You can also paste a raw Roboflow dataset URL and download it directly.")
-
-    coco_file = st.file_uploader(
-        "COCO JSON or ZIP file",
-        type=["json", "zip"],
-        key="coco_upload",
-    )
-
-    if coco_file is not None:
-        if st.button("Upload Annotation File", key="btn_coco_upload"):
-            try:
-                resp = requests.post(
-                    f"{BACKEND_URL}/upload-coco",
-                    files={
-                        "coco_file": (
-                            coco_file.name,
-                            coco_file.getvalue(),
-                            "application/zip" if coco_file.name.lower().endswith(".zip") else "application/json",
-                        )
-                    },
-                    timeout=30,
-                )
-                resp.raise_for_status()
-                result = resp.json()
-                st.success(
-                    f"Uploaded **{result['filename']}**: "
-                    f"{result.get('images', 0)} images, {result.get('annotations', 0)} annotations"
-                )
-                if result.get("file_type") == "zip":
-                    st.caption(f"Splits: {', '.join(result.get('splits', [])) or 'train'}")
-                    st.caption(f"Extracted files: {result.get('extracted_files', 0)}")
-            except Exception as exc:
-                st.error(f"Upload failed: {exc}")
-
-    st.markdown("##### Download From Roboflow URL")
-    rf_url = st.text_input(
-        "Roboflow raw dataset URL",
-        value="",
-        placeholder="https://app.roboflow.com/ds/xxxxx?key=yyyyy",
-        key="rf_raw_url",
-    )
-    rf_clean = st.checkbox("Clean existing dataset folder before download", value=False, key="rf_raw_clean")
-    if st.button("Download Dataset From URL", key="btn_rf_download"):
-        if not rf_url.strip():
-            st.error("Please paste a Roboflow URL first.")
-        else:
-            try:
-                resp = requests.post(
-                    f"{BACKEND_URL}/download-roboflow-coco",
-                    data={"url": rf_url.strip(), "clean": str(rf_clean).lower()},
-                    timeout=180,
-                )
-                resp.raise_for_status()
-                result = resp.json()
-                st.success(
-                    f"Downloaded dataset: {result.get('images', 0)} images, "
-                    f"{result.get('annotations', 0)} annotations"
-                )
-                st.caption(f"Splits: {', '.join(result.get('splits', [])) or 'train'}")
-                st.caption(f"Extracted files: {result.get('extracted_files', 0)}")
-            except Exception as exc:
-                st.error(f"Download failed: {exc}")
-
-    st.markdown("---")
-    st.markdown("##### How to use")
-    st.markdown("""
-1. Annotate shelf images in [Roboflow](https://app.roboflow.com) with bounding boxes around cigarette packs
-2. Use a single class: `cigarette_pack`
-3. Export as **COCO JSON** or **COCO ZIP** format
-4. Upload the JSON/ZIP file here
-5. Then run `python train.py` on the GPU server to fine-tune RF-DETR
-    """)
-    st.markdown("</div>", unsafe_allow_html=True)
-
-# ════════════════════════════════════════════════════════
-# TAB 5: Label Training Crops
+# TAB 4: Label Training Crops
 # ════════════════════════════════════════════════════════
 with tab_label:
     st.markdown('<div class="panel">', unsafe_allow_html=True)
@@ -1342,7 +1261,7 @@ with tab_label:
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════════════
-# TAB 6: Training
+# TAB 5: Training
 # ════════════════════════════════════════════════════════
 with tab_train:
     st.markdown('<div class="panel">', unsafe_allow_html=True)
@@ -1427,31 +1346,68 @@ with tab_train:
         rfdetr_epochs = st.number_input("Epochs", value=50, min_value=5, max_value=200, key="rfdetr_epochs")
         rfdetr_lr = st.number_input("Learning rate", value=0.0001, format="%.5f", key="rfdetr_lr")
         rfdetr_batch = st.number_input("Batch size", value=4, min_value=1, max_value=16, key="rfdetr_batch")
+        if "show_rfdetr_url_prompt" not in st.session_state:
+            st.session_state["show_rfdetr_url_prompt"] = False
 
         if st.button("Train RF-DETR", type="primary", key="btn_train_rfdetr"):
-            try:
-                resp = requests.post(
-                    f"{BACKEND_URL}/train-rfdetr",
-                    params={
-                        "epochs": rfdetr_epochs,
-                        "lr": rfdetr_lr,
-                        "batch_size": rfdetr_batch,
-                        "version": training_version,
-                    },
-                    timeout=15,
-                )
-                resp.raise_for_status()
-                result = resp.json()
-                if result.get("skipped"):
-                    st.warning(
-                        f"Skipped: same dataset/settings already trained for {training_version} "
-                        f"(job: {str(result.get('existing_job_id', ''))[:8]}...)."
-                    )
+            st.session_state["show_rfdetr_url_prompt"] = True
+
+        if st.session_state.get("show_rfdetr_url_prompt", False):
+            st.markdown("**Dataset source (required)**")
+            rfdetr_url = st.text_input(
+                "Roboflow raw dataset URL",
+                value=st.session_state.get("rfdetr_url", ""),
+                placeholder="https://app.roboflow.com/ds/xxxxx?key=yyyyy",
+                key="rfdetr_url",
+            )
+            rfdetr_clean = st.checkbox(
+                "Clean existing dataset before download",
+                value=True,
+                key="rfdetr_clean_dataset",
+            )
+            confirm_col, cancel_col = st.columns(2)
+            do_start = confirm_col.button("Confirm and Start RF-DETR Training", key="btn_train_rfdetr_confirm")
+            do_cancel = cancel_col.button("Cancel", key="btn_train_rfdetr_cancel")
+            if do_cancel:
+                st.session_state["show_rfdetr_url_prompt"] = False
+                st.rerun()
+            if do_start:
+                if not rfdetr_url.strip():
+                    st.error("Please paste a Roboflow URL before starting training.")
                 else:
-                    st.session_state["train_rfdetr_job"] = result["job_id"]
-                    st.success(f"Training started (job: {result['job_id'][:8]}...)")
-            except Exception as exc:
-                st.error(f"Failed to start: {exc}")
+                    try:
+                        resp = requests.post(
+                            f"{BACKEND_URL}/train-rfdetr",
+                            params={
+                                "epochs": rfdetr_epochs,
+                                "lr": rfdetr_lr,
+                                "batch_size": rfdetr_batch,
+                                "version": training_version,
+                                "roboflow_url": rfdetr_url.strip(),
+                                "clean_dataset": str(rfdetr_clean).lower(),
+                            },
+                            timeout=180,
+                        )
+                        resp.raise_for_status()
+                        result = resp.json()
+                        if result.get("skipped"):
+                            st.warning(
+                                f"Skipped: same dataset/settings already trained for {training_version} "
+                                f"(job: {str(result.get('existing_job_id', ''))[:8]}...)."
+                            )
+                        else:
+                            st.session_state["train_rfdetr_job"] = result["job_id"]
+                            st.session_state["show_rfdetr_url_prompt"] = False
+                            ds_info = result.get("dataset_import") or {}
+                            st.success(f"Training started (job: {result['job_id'][:8]}...)")
+                            if ds_info:
+                                st.caption(
+                                    f"Dataset loaded: {ds_info.get('images', 0)} images, "
+                                    f"{ds_info.get('annotations', 0)} annotations "
+                                    f"({', '.join(ds_info.get('splits', [])) or 'train'})"
+                                )
+                    except Exception as exc:
+                        st.error(f"Failed to start: {exc}")
 
     # --- DINOv2 Fine-tune ---
     with train_col3:

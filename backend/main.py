@@ -1230,12 +1230,23 @@ def train_rfdetr_endpoint(
     epochs: int = 50,
     batch_size: int = 4,
     lr: float = 0.0001,
+    roboflow_url: str = "",
+    clean_dataset: bool = False,
     version: str = "",
     force: bool = False,
 ):
     """Train RF-DETR detection model. Requires GPU for reasonable speed."""
     version = (version or _get_current_training_version()).strip() or DEFAULT_TRAINING_VERSION
-    params = {"epochs": epochs, "batch_size": batch_size, "lr": lr}
+    dataset_import = None
+    if roboflow_url.strip():
+        dataset_import = download_roboflow_coco(url=roboflow_url.strip(), clean=clean_dataset)
+
+    params = {
+        "epochs": epochs,
+        "batch_size": batch_size,
+        "lr": lr,
+        "dataset_source": "roboflow_url" if roboflow_url.strip() else "existing_local",
+    }
     dataset_hash = _dataset_hash_for_type("rfdetr")
     hp_sig = _hparam_signature("rfdetr", version, params)
     if not force:
@@ -1265,6 +1276,7 @@ def train_rfdetr_endpoint(
             "hparam_signature": hp_sig,
             "status": "queued",
             "params": params,
+            "dataset_import": dataset_import,
             "progress": {},
             "error": None,
             "start_time": start_time,
@@ -1279,7 +1291,14 @@ def train_rfdetr_endpoint(
         args=(job_id, "train.py", args),
         daemon=True,
     ).start()
-    return {"job_id": job_id, "type": "rfdetr", "epochs": epochs, "version": version, "skipped": False}
+    return {
+        "job_id": job_id,
+        "type": "rfdetr",
+        "epochs": epochs,
+        "version": version,
+        "skipped": False,
+        "dataset_import": dataset_import,
+    }
 
 
 @app.post("/finetune-dinov2")
