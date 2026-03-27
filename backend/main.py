@@ -293,7 +293,7 @@ async def detect_single(image_file: UploadFile = File(...)):
         "image_width": img_w,
         "image_height": img_h,
         "boxes": boxes_data,
-        "ocr_independent": ocr_independent,
+        "ocr_independent": [],
         "brands": [b for b, _ in all_sorted],
         "confidence": [round(c, 3) for _, c in all_sorted],
         "num_boxes": sum(1 for b in boxes_data if not b.get("is_full_image")),
