@@ -244,19 +244,34 @@ def index_status():
 async def detect_single(image_file: UploadFile = File(...)):
     """Run detection on a single image. Returns per-box brand assignments for interactive UI."""
     from PIL import Image
-    import numpy as np
     import base64
     try:
         from .pipeline import (
-            _detect_brands_from_image,
-            _format_brand_scores,
-            MIN_OUTPUT_CONFIDENCE,
+            embed_images_batch,
+            classify_embeddings,
+            _build_label_profiles,
+            _run_ocr_on_image,
+            _ocr_brand_scores_from_items,
+            _aggregate_to_products,
+            CLASSIFIER_TOP_K,
+            OCR_ENABLED,
+            OCR_FULLIMG_ENABLED,
+            OCR_STRONG_THRESHOLD,
+            CLASSIFIER_HIGH_CONF,
         )
     except ImportError:
         from pipeline import (
-            _detect_brands_from_image,
-            _format_brand_scores,
-            MIN_OUTPUT_CONFIDENCE,
+            embed_images_batch,
+            classify_embeddings,
+            _build_label_profiles,
+            _run_ocr_on_image,
+            _ocr_brand_scores_from_items,
+            _aggregate_to_products,
+            CLASSIFIER_TOP_K,
+            OCR_ENABLED,
+            OCR_FULLIMG_ENABLED,
+            OCR_STRONG_THRESHOLD,
+            CLASSIFIER_HIGH_CONF,
         )
 
     data = await image_file.read()
@@ -270,23 +285,114 @@ async def detect_single(image_file: UploadFile = File(...)):
     processor, model = load_dino(device)
     rfdetr_model = load_rfdetr()
     img_w, img_h = pil_img.size
+    label_profiles = _build_label_profiles(labels)
 
-    # Use the same pipeline as run_pipeline
-    brand_scores = _detect_brands_from_image(
-        pil_img, rfdetr_model, processor, model, device, index, labels,
-    )
+    # RF-DETR detection
+    detections = rfdetr_model.predict(pil_img, threshold=RFDETR_CONF_THRESHOLD)
+    crops = []
+    boxes_data = []
+    has_detections = detections is not None and len(detections) > 0
 
-    all_sorted = sorted(brand_scores.items(), key=lambda x: x[1], reverse=True)
+    if has_detections:
+        for i, (box, conf) in enumerate(zip(detections.xyxy, detections.confidence)):
+            x1, y1, x2, y2 = [int(v) for v in box]
+            bw, bh = x2 - x1, y2 - y1
+            pad_x, pad_y = int(bw * 0.10), int(bh * 0.10)
+            x1 = max(0, x1 - pad_x)
+            y1 = max(0, y1 - pad_y)
+            x2 = min(img_w, x2 + pad_x)
+            y2 = min(img_h, y2 + pad_y)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            crops.append(pil_img.crop((x1, y1, x2, y2)))
+            boxes_data.append({
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "det_conf": round(float(conf), 3),
+                "brands": [],
+                "ocr_texts": [],
+                "ocr_brand_scores": [],
+            })
+    else:
+        crops.append(pil_img)
+        boxes_data.append({
+            "x1": 0, "y1": 0, "x2": img_w, "y2": img_h,
+            "det_conf": 0.0,
+            "is_full_image": True,
+            "brands": [],
+            "ocr_texts": [],
+            "ocr_brand_scores": [],
+        })
 
-    # Build simple box data (full image if no detections)
-    boxes_data = [{"x1": 0, "y1": 0, "x2": img_w, "y2": img_h,
-                   "det_conf": 0.0, "is_full_image": True,
-                   "brands": [{"brand": b, "confidence": round(c, 3)} for b, c in all_sorted[:5]]}]
+    # Classify all crops
+    all_vecs = embed_images_batch(crops, processor, model, device)
+    all_cls_results = classify_embeddings(all_vecs, device, top_k=CLASSIFIER_TOP_K)
+
+    all_brand_scores = {}
+
+    for crop_idx in range(len(crops)):
+        # OCR per crop
+        ocr_items = _run_ocr_on_image(crops[crop_idx]) if OCR_ENABLED else []
+        ocr_texts = []
+        for item in ocr_items:
+            try:
+                text = str(item[1]).strip()
+                conf = float(item[2])
+            except Exception:
+                continue
+            if not text or text.lower() in ("nan",) or len(text) < 2:
+                continue
+            ocr_texts.append({"text": text, "confidence": round(conf, 3)})
+        ocr_texts.sort(key=lambda x: x["confidence"], reverse=True)
+        boxes_data[crop_idx]["ocr_texts"] = ocr_texts[:8]
+
+        # OCR brand scores
+        ocr_scores = _ocr_brand_scores_from_items(ocr_items, label_profiles) if ocr_items else {}
+        ocr_product_scores = _aggregate_to_products(ocr_scores)
+        boxes_data[crop_idx]["ocr_brand_scores"] = [
+            {"brand": b, "confidence": round(s, 3)}
+            for b, s in sorted(ocr_product_scores.items(), key=lambda x: -x[1])[:5]
+        ]
+
+        # Classifier + OCR fusion for this crop
+        crop_cls = dict(all_cls_results[crop_idx])
+        label_profile_map = {p["label"]: p for p in label_profiles}
+        ocr_families = {}
+        for label, ocr_conf in ocr_scores.items():
+            prof = label_profile_map.get(label, {})
+            family = prof.get("brand", "")
+            if family:
+                ocr_families[family] = max(ocr_families.get(family, 0.0), ocr_conf)
+
+        fused = {}
+        for label, cls_conf in crop_cls.items():
+            prof = label_profile_map.get(label, {})
+            brand_family = prof.get("brand", "")
+            ocr_fam = ocr_families.get(brand_family, 0.0) if brand_family else 0.0
+            if ocr_fam >= OCR_STRONG_THRESHOLD:
+                fused[label] = min(1.0, cls_conf + ocr_fam * 0.3)
+            elif ocr_fam > 0:
+                fused[label] = min(1.0, cls_conf + ocr_fam * 0.15)
+            elif cls_conf >= CLASSIFIER_HIGH_CONF:
+                fused[label] = cls_conf
+            else:
+                fused[label] = cls_conf * 0.7
+
+        crop_products = _aggregate_to_products(fused)
+        crop_brands = [{"brand": p, "confidence": round(c, 3)} for p, c in crop_products.items()]
+        crop_brands.sort(key=lambda x: x["confidence"], reverse=True)
+        boxes_data[crop_idx]["brands"] = crop_brands[:5]
+
+        for label, conf in fused.items():
+            if conf > all_brand_scores.get(label, 0.0):
+                all_brand_scores[label] = conf
 
     # Encode image
     buf = io.BytesIO()
     pil_img.save(buf, format="JPEG", quality=90)
     img_b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+
+    all_product_scores = _aggregate_to_products(all_brand_scores)
+    all_sorted = sorted(all_product_scores.items(), key=lambda x: x[1], reverse=True)
 
     return {
         "image_b64": img_b64,
@@ -450,9 +556,9 @@ def get_brand_registry():
         "brands": hierarchy,
         "total_brands": len(BRAND_REGISTRY),
         "total_products": sum(len(p) for p in BRAND_REGISTRY.values()),
-        "products_with_refs": audit["total_products_found"],
-        "products_missing": audit["total_products_missing"],
-        "total_images": audit["total_images"],
+        "products_with_refs": audit.get("total_products_found", len(audit.get("found", {}))),
+        "products_missing": audit.get("total_products_missing", len(audit.get("missing", []))),
+        "total_images": audit.get("total_images", 0),
     }
 
 
