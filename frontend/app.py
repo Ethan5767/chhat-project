@@ -1119,6 +1119,7 @@ with tab_coco:
     st.markdown('<div class="panel">', unsafe_allow_html=True)
     st.markdown("#### Upload COCO Annotations")
     st.caption("Upload COCO JSON or ZIP export files to add RF-DETR detection training data.")
+    st.caption("You can also paste a raw Roboflow dataset URL and download it directly.")
 
     coco_file = st.file_uploader(
         "COCO JSON or ZIP file",
@@ -1151,6 +1152,35 @@ with tab_coco:
                     st.caption(f"Extracted files: {result.get('extracted_files', 0)}")
             except Exception as exc:
                 st.error(f"Upload failed: {exc}")
+
+    st.markdown("##### Download From Roboflow URL")
+    rf_url = st.text_input(
+        "Roboflow raw dataset URL",
+        value="",
+        placeholder="https://app.roboflow.com/ds/xxxxx?key=yyyyy",
+        key="rf_raw_url",
+    )
+    rf_clean = st.checkbox("Clean existing dataset folder before download", value=False, key="rf_raw_clean")
+    if st.button("Download Dataset From URL", key="btn_rf_download"):
+        if not rf_url.strip():
+            st.error("Please paste a Roboflow URL first.")
+        else:
+            try:
+                resp = requests.post(
+                    f"{BACKEND_URL}/download-roboflow-coco",
+                    data={"url": rf_url.strip(), "clean": str(rf_clean).lower()},
+                    timeout=180,
+                )
+                resp.raise_for_status()
+                result = resp.json()
+                st.success(
+                    f"Downloaded dataset: {result.get('images', 0)} images, "
+                    f"{result.get('annotations', 0)} annotations"
+                )
+                st.caption(f"Splits: {', '.join(result.get('splits', [])) or 'train'}")
+                st.caption(f"Extracted files: {result.get('extracted_files', 0)}")
+            except Exception as exc:
+                st.error(f"Download failed: {exc}")
 
     st.markdown("---")
     st.markdown("##### How to use")

@@ -525,6 +525,109 @@ async def upload_coco(coco_file: UploadFile = File(...)):
     }
 
 
+@app.post("/download-roboflow-coco")
+def download_roboflow_coco(url: str = Form(...), clean: bool = Form(False)):
+    """Download a Roboflow raw dataset URL and extract COCO files/images."""
+    from urllib.parse import parse_qs, urlparse
+    import requests
+    import shutil
+
+    parsed = urlparse(url.strip())
+    if "roboflow.com" not in parsed.netloc:
+        raise HTTPException(status_code=400, detail="URL must be from roboflow.com")
+    if "key" not in parse_qs(parsed.query):
+        raise HTTPException(status_code=400, detail="Roboflow URL must include ?key=...")
+
+    datasets_dir = _BACKEND_ROOT.parent / "datasets" / "cigarette_packs"
+    datasets_dir.mkdir(parents=True, exist_ok=True)
+
+    if clean and datasets_dir.exists():
+        shutil.rmtree(datasets_dir)
+        datasets_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        resp = requests.get(url.strip(), timeout=120)
+        resp.raise_for_status()
+        payload = resp.content
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=f"Failed to download URL: {exc}")
+
+    # Reuse upload extraction path by treating payload as uploaded zip
+    try:
+        zf = zipfile.ZipFile(BytesIO(payload))
+    except Exception:
+        raise HTTPException(status_code=400, detail="Downloaded file is not a valid ZIP.")
+
+    members = [m for m in zf.namelist() if not m.endswith("/")]
+    ann_candidates = [m for m in members if m.lower().endswith("_annotations.coco.json")]
+    if not ann_candidates:
+        raise HTTPException(status_code=400, detail="ZIP must include _annotations.coco.json.")
+
+    def _safe_parts(member_name: str) -> list[str]:
+        return [p for p in member_name.replace("\\", "/").split("/") if p not in ("", ".", "..")]
+
+    def _extract_member(member_name: str, out_path: Path) -> None:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(member_name) as src, out_path.open("wb") as dst:
+            dst.write(src.read())
+
+    target_splits = ("train", "valid", "test")
+    split_ann_map: dict[str, str] = {}
+    for ann in ann_candidates:
+        parts = [p.lower() for p in _safe_parts(ann)]
+        for split in target_splits:
+            if split in parts:
+                split_ann_map[split] = ann
+    if not split_ann_map:
+        split_ann_map["train"] = ann_candidates[0]
+
+    extracted_images = 0
+    extracted_annotations = 0
+    extracted_files = 0
+    saved_dirs: list[str] = []
+
+    for split, ann_member in split_ann_map.items():
+        split_dir = datasets_dir / split
+        saved_dirs.append(str(split_dir))
+        ann_out = split_dir / "_annotations.coco.json"
+        _extract_member(ann_member, ann_out)
+        extracted_files += 1
+        try:
+            coco_data = json.loads(ann_out.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        extracted_images += len(coco_data.get("images", []))
+        extracted_annotations += len(coco_data.get("annotations", []))
+
+        ann_parts = _safe_parts(ann_member)
+        ann_prefix = "/".join(ann_parts[:-1])
+        for img in coco_data.get("images", []):
+            img_name = img.get("file_name", "")
+            if not img_name:
+                continue
+            safe_img_name = "/".join(_safe_parts(img_name))
+            if not safe_img_name:
+                continue
+            prefixed_candidate = f"{ann_prefix}/{safe_img_name}" if ann_prefix else safe_img_name
+            if prefixed_candidate in members:
+                _extract_member(prefixed_candidate, split_dir / safe_img_name)
+                extracted_files += 1
+            elif safe_img_name in members:
+                _extract_member(safe_img_name, split_dir / safe_img_name)
+                extracted_files += 1
+
+    return {
+        "status": "downloaded",
+        "source": "roboflow_url",
+        "images": extracted_images,
+        "annotations": extracted_annotations,
+        "extracted_files": extracted_files,
+        "splits": sorted(split_ann_map.keys()),
+        "saved_to": saved_dirs,
+    }
+
+
 @app.post("/generate-crops")
 async def generate_crops(image_file: UploadFile = File(...)):
     """Run RF-DETR on an image, classify each crop, and return for labeling."""
