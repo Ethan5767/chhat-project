@@ -154,6 +154,7 @@ def _show_result_preview(result_df: pd.DataFrame):
         st.dataframe(result_df.head(20), width="stretch")
 
 
+@st.cache_data(ttl=300, show_spinner=False)
 def _fetch_reference_image_bytes(filename: str):
     """Fetch reference image from backend on server side for public deployments."""
     try:
@@ -162,6 +163,30 @@ def _fetch_reference_image_bytes(filename: str):
         return resp.content
     except Exception:
         return None
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def _fetch_brand_hierarchy():
+    """Fetch brand registry once and cache."""
+    try:
+        resp = requests.get(f"{BACKEND_URL}/brand-registry", timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        return data.get("brands", {}), data
+    except Exception:
+        return {}, {}
+
+
+@st.cache_data(ttl=120, show_spinner=False)
+def _fetch_reference_listing(internal_name: str):
+    """Fetch reference image listing for a product, cached."""
+    try:
+        resp = requests.get(f"{BACKEND_URL}/reference-images/{internal_name}", timeout=5)
+        if resp.status_code == 200:
+            return resp.json()
+    except Exception:
+        pass
+    return None
 
 
 # -- Page config --
@@ -1036,10 +1061,8 @@ with tab_index:
             if picked_internal:
                 with st.expander(f"Show references for {picked_product_display}", expanded=True):
                     try:
-                        ref_resp = requests.get(f"{BACKEND_URL}/reference-images/{picked_internal}", timeout=5)
-                        ref_resp.raise_for_status()
-                        ref_data = ref_resp.json()
-                        filenames = ref_data.get("filenames", [])
+                        ref_data = _fetch_reference_listing(picked_internal)
+                        filenames = ref_data.get("filenames", []) if ref_data else []
                         if filenames:
                             cols = st.columns(min(5, len(filenames)))
                             for img_idx, fname in enumerate(filenames):
@@ -1148,20 +1171,16 @@ with tab_label:
     st.markdown("#### Label Training Crops")
     st.caption("Upload a shelf image, review detected crops, confirm brand and product, and add to training data.")
 
-    # Load brand registry hierarchy
-    brand_hierarchy = {}
-    try:
-        reg_resp = requests.get(f"{BACKEND_URL}/brand-registry", timeout=10)
-        reg_resp.raise_for_status()
-        reg_data = reg_resp.json()
-        brand_hierarchy = reg_data.get("brands", {})
+    # Load brand registry hierarchy (cached)
+    brand_hierarchy, reg_data = _fetch_brand_hierarchy()
+    if brand_hierarchy:
         st.caption(
             f"{reg_data.get('total_brands', 0)} brands, "
             f"{reg_data.get('total_products', 0)} products "
             f"({reg_data.get('products_with_refs', 0)} with references, "
             f"{reg_data.get('products_missing', 0)} missing)"
         )
-    except Exception:
+    else:
         st.warning("Could not load brand registry from backend.")
 
     # Step 1: Upload image
@@ -1197,7 +1216,9 @@ with tab_label:
         brand_names = sorted(brand_hierarchy.keys())
         import base64 as b64lib
 
-        for crop in crops:
+        @st.fragment
+        def _render_crop_card(crop, brand_names, brand_hierarchy):
+            """Render a single crop card as a fragment -- selectbox changes only rerun this card."""
             col_img, col_form = st.columns([1, 2])
 
             with col_img:
@@ -1259,32 +1280,34 @@ with tab_label:
                                 resp.raise_for_status()
                                 result = resp.json()
                                 st.success(f"Added as {result['filename']} ({result['total_for_product']} total for {selected_product})")
+                                _fetch_reference_listing.clear()
+                                _fetch_brand_hierarchy.clear()
                             except Exception as exc:
                                 st.error(f"Failed: {exc}")
 
-                    # Show one reference image directly under Add button
+                    # Show one reference image directly under Add button (cached)
                     internal_name = product_internals.get(selected_product, "")
                     if internal_name:
-                        try:
-                            ref_resp = requests.get(f"{BACKEND_URL}/reference-images/{internal_name}", timeout=5)
-                            if ref_resp.status_code == 200:
-                                ref_data = ref_resp.json()
-                                if ref_data["filenames"]:
-                                    first_ref = ref_data["filenames"][0]
-                                    img_bytes = _fetch_reference_image_bytes(first_ref)
-                                    if img_bytes:
-                                        st.image(
-                                            img_bytes,
-                                            caption=f"Reference preview: {selected_product}",
-                                            width=170,
-                                        )
-                                    st.caption(f"{ref_data['count']} refs total")
-                                else:
-                                    st.caption("No reference images yet")
-                        except Exception:
+                        ref_data = _fetch_reference_listing(internal_name)
+                        if ref_data and ref_data.get("filenames"):
+                            first_ref = ref_data["filenames"][0]
+                            img_bytes = _fetch_reference_image_bytes(first_ref)
+                            if img_bytes:
+                                st.image(
+                                    img_bytes,
+                                    caption=f"Reference preview: {selected_product}",
+                                    width=170,
+                                )
+                            st.caption(f"{ref_data['count']} refs total")
+                        elif ref_data:
+                            st.caption("No reference images yet")
+                        else:
                             st.caption("Reference preview unavailable")
 
             st.markdown("---")
+
+        for crop in crops:
+            _render_crop_card(crop, brand_names, brand_hierarchy)
 
     st.markdown("</div>", unsafe_allow_html=True)
 
