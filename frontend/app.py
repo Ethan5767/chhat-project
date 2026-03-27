@@ -980,12 +980,40 @@ with tab_index:
         except Exception as exc:
             st.error(f"Index rebuild failed: {exc}")
 
-    if index_exists:
-        with st.expander("View indexed brands", expanded=False):
-            brands_list = idx_data.get("brands", [])
-            if brands_list:
-                st.caption(f"{len(brands_list)} total references")
-                st.json(brands_list)
+    # Brand/Product registry with reference counts
+    st.markdown("---")
+    st.markdown("##### Brand & Product Registry")
+    try:
+        reg_resp = requests.get(f"{BACKEND_URL}/brand-registry", timeout=10)
+        reg_resp.raise_for_status()
+        reg_data = reg_resp.json()
+        brand_hierarchy = reg_data.get("brands", {})
+
+        st.caption(
+            f"{reg_data.get('total_brands', 0)} brands, "
+            f"{reg_data.get('total_products', 0)} products total -- "
+            f"{reg_data.get('products_with_refs', 0)} with references, "
+            f"{reg_data.get('products_missing', 0)} missing"
+        )
+
+        for brand_idx, (brand_name, products) in enumerate(sorted(brand_hierarchy.items()), 1):
+            total_refs = sum(p["reference_count"] for p in products)
+            has_refs = total_refs > 0
+            status = f"({total_refs} images)" if has_refs else "(no references)"
+
+            with st.expander(f"{brand_idx}. {brand_name} -- {len(products)} products {status}", expanded=False):
+                for prod_idx, prod in enumerate(products, 1):
+                    count = prod["reference_count"]
+                    name = prod["display_name"]
+                    internal = prod["internal_name"]
+                    if count > 0:
+                        st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{brand_idx}.{prod_idx} **{name}** -- {count} reference images `({internal})`")
+                    else:
+                        st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{brand_idx}.{prod_idx} ~~{name}~~ -- missing `(need: {internal}_1.jpg)`")
+
+    except Exception as exc:
+        st.warning(f"Could not load brand registry: {exc}")
+
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════════════
