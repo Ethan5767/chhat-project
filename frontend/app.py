@@ -454,9 +454,9 @@ except Exception:
     pass
 
 # -- Tabs --
-tab_batch, tab_single, tab_index, tab_coco, tab_label = st.tabs([
+tab_batch, tab_single, tab_index, tab_coco, tab_label, tab_train = st.tabs([
     "Batch CSV Detection", "Single Image Test", "Reference Index",
-    "Upload COCO Annotations", "Label Training Crops",
+    "Upload COCO Annotations", "Label Training Crops", "Training",
 ])
 
 # ════════════════════════════════════════════════════════
@@ -1161,5 +1161,139 @@ with tab_label:
                                 st.error(f"Failed: {exc}")
 
             st.markdown("---")
+
+    st.markdown("</div>", unsafe_allow_html=True)
+
+# ════════════════════════════════════════════════════════
+# TAB 6: Training
+# ════════════════════════════════════════════════════════
+with tab_train:
+    st.markdown('<div class="panel">', unsafe_allow_html=True)
+    st.markdown("#### Model Training")
+
+    device_info = "unknown"
+    try:
+        h = requests.get(f"{BACKEND_URL}/health", timeout=5).json()
+        device_info = h.get("device", "unknown")
+    except Exception:
+        pass
+    st.caption(f"Server device: **{device_info}**")
+
+    train_col1, train_col2, train_col3 = st.columns(3)
+
+    # --- Brand Classifier (frozen DINOv2 + MLP) ---
+    with train_col1:
+        st.markdown("##### Brand Classifier")
+        st.caption("Frozen DINOv2 + MLP head. Fast, works on CPU.")
+        cls_epochs = st.number_input("Epochs", value=100, min_value=10, max_value=500, key="cls_epochs")
+        cls_lr = st.number_input("Learning rate", value=0.001, format="%.4f", key="cls_lr")
+        cls_batch = st.number_input("Batch size", value=64, min_value=8, max_value=256, key="cls_batch")
+
+        if st.button("Train Classifier", type="primary", key="btn_train_cls"):
+            try:
+                resp = requests.post(
+                    f"{BACKEND_URL}/train-classifier",
+                    params={"epochs": cls_epochs, "lr": cls_lr, "batch_size": cls_batch},
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                result = resp.json()
+                st.session_state["train_cls_job"] = result["job_id"]
+                st.success(f"Training started (job: {result['job_id'][:8]}...)")
+            except Exception as exc:
+                st.error(f"Failed to start: {exc}")
+
+    # --- RF-DETR Detection ---
+    with train_col2:
+        st.markdown("##### RF-DETR Detection")
+        st.caption("Fine-tune pack detector. GPU recommended.")
+        rfdetr_epochs = st.number_input("Epochs", value=50, min_value=5, max_value=200, key="rfdetr_epochs")
+        rfdetr_lr = st.number_input("Learning rate", value=0.0001, format="%.5f", key="rfdetr_lr")
+        rfdetr_batch = st.number_input("Batch size", value=4, min_value=1, max_value=16, key="rfdetr_batch")
+
+        if st.button("Train RF-DETR", type="primary", key="btn_train_rfdetr"):
+            try:
+                resp = requests.post(
+                    f"{BACKEND_URL}/train-rfdetr",
+                    params={"epochs": rfdetr_epochs, "lr": rfdetr_lr, "batch_size": rfdetr_batch},
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                result = resp.json()
+                st.session_state["train_rfdetr_job"] = result["job_id"]
+                st.success(f"Training started (job: {result['job_id'][:8]}...)")
+            except Exception as exc:
+                st.error(f"Failed to start: {exc}")
+
+    # --- DINOv2 Fine-tune ---
+    with train_col3:
+        st.markdown("##### DINOv2 Fine-tune")
+        st.caption("Unfreeze DINOv2 layers. Needs 16GB+ VRAM.")
+        dino_epochs = st.number_input("Epochs", value=30, min_value=5, max_value=100, key="dino_epochs")
+        dino_lr = st.number_input("Learning rate", value=0.00001, format="%.6f", key="dino_lr")
+        dino_layers = st.number_input("Unfreeze layers", value=4, min_value=1, max_value=12, key="dino_layers")
+        dino_batch = st.number_input("Batch size", value=8, min_value=2, max_value=32, key="dino_batch")
+
+        if st.button("Fine-tune DINOv2", type="primary", key="btn_train_dino"):
+            try:
+                resp = requests.post(
+                    f"{BACKEND_URL}/finetune-dinov2",
+                    params={
+                        "epochs": dino_epochs, "lr": dino_lr,
+                        "batch_size": dino_batch, "unfreeze_layers": dino_layers,
+                    },
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                result = resp.json()
+                st.session_state["train_dino_job"] = result["job_id"]
+                st.success(f"Training started (job: {result['job_id'][:8]}...)")
+            except Exception as exc:
+                st.error(f"Failed to start: {exc}")
+
+    # --- Training Progress Monitor ---
+    st.markdown("---")
+    st.markdown("##### Training Progress")
+
+    active_jobs = []
+    for key in ["train_cls_job", "train_rfdetr_job", "train_dino_job"]:
+        job_id = st.session_state.get(key, "")
+        if job_id:
+            label = key.replace("train_", "").replace("_job", "").upper()
+            active_jobs.append((label, job_id))
+
+    if active_jobs:
+        for label, job_id in active_jobs:
+            try:
+                resp = requests.get(f"{BACKEND_URL}/training-status/{job_id}", timeout=5)
+                if resp.status_code == 200:
+                    status = resp.json()
+                    progress = status.get("progress", {})
+                    epoch = progress.get("epoch", 0)
+                    total = progress.get("total_epochs", 1)
+                    train_acc = progress.get("train_acc", 0)
+                    val_acc = progress.get("val_acc", 0)
+                    best_acc = progress.get("best_val_acc", 0)
+                    job_status = status.get("status", "unknown")
+
+                    pct = epoch / total if total > 0 else 0
+                    st.markdown(f"**{label}** -- {job_status}")
+                    st.progress(pct)
+                    st.caption(
+                        f"Epoch {epoch}/{total} | "
+                        f"Train acc: {train_acc:.3f} | Val acc: {val_acc:.3f} | "
+                        f"Best: {best_acc:.3f}"
+                    )
+
+                    if status.get("error"):
+                        with st.expander("Error details"):
+                            st.code(status["error"][-1000:])
+            except Exception:
+                st.caption(f"{label}: Could not fetch status")
+
+        if st.button("Refresh", key="btn_refresh_training"):
+            st.rerun()
+    else:
+        st.caption("No active training jobs. Start one above.")
 
     st.markdown("</div>", unsafe_allow_html=True)

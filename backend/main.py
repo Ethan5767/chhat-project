@@ -6,7 +6,7 @@ import traceback
 import uuid
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
 
 try:
@@ -478,7 +478,7 @@ async def generate_crops(image_file: UploadFile = File(...)):
 
 
 @app.post("/add-reference")
-async def add_reference(image_file: UploadFile = File(...), product_name: str = ""):
+async def add_reference(image_file: UploadFile = File(...), product_name: str = Form(...)):
     """Add a confirmed crop as a reference image for a specific product."""
     if not product_name:
         raise HTTPException(status_code=400, detail="product_name is required.")
@@ -560,6 +560,158 @@ def get_brand_registry():
         "products_missing": audit.get("total_products_missing", len(audit.get("missing", []))),
         "total_images": audit.get("total_images", 0),
     }
+
+
+_TRAINING_PROGRESS_DIR = _BACKEND_ROOT.parent
+_training_jobs: dict[str, dict] = {}
+
+
+def _run_training_job(job_id: str, script: str, args: list[str]):
+    """Run a training script as a subprocess with progress file polling."""
+    import subprocess
+    import sys
+    import time
+
+    progress_file = _TRAINING_PROGRESS_DIR / f".training_progress_{job_id}.json"
+    full_args = [sys.executable, str(_TRAINING_PROGRESS_DIR / script),
+                 "--progress-file", str(progress_file)] + args
+
+    try:
+        _training_jobs[job_id] = {"status": "running", "progress": {}, "error": None}
+
+        process = subprocess.Popen(
+            full_args, cwd=str(_TRAINING_PROGRESS_DIR),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+        )
+
+        # Poll progress file while process runs
+        while process.poll() is None:
+            time.sleep(2)
+            if progress_file.exists():
+                try:
+                    progress = json.loads(progress_file.read_text())
+                    _training_jobs[job_id]["progress"] = progress
+                    # Push to SSE queue if job has one
+                    with jobs_lock:
+                        job = jobs.get(job_id)
+                    if job:
+                        epoch = progress.get("epoch", 0)
+                        total = progress.get("total_epochs", 1)
+                        val_acc = progress.get("val_acc", 0)
+                        pct = int((epoch / total) * 100) if total > 0 else 0
+                        job["queue"].put((pct, f"Epoch {epoch}/{total} | Val acc: {val_acc:.3f}"))
+                except Exception:
+                    pass
+
+        # Final read
+        if progress_file.exists():
+            try:
+                _training_jobs[job_id]["progress"] = json.loads(progress_file.read_text())
+            except Exception:
+                pass
+            progress_file.unlink(missing_ok=True)
+
+        stdout = process.stdout.read() if process.stdout else ""
+
+        if process.returncode == 0:
+            _training_jobs[job_id]["status"] = "done"
+            with jobs_lock:
+                job = jobs.get(job_id)
+            if job:
+                job["queue"].put((100, "Training complete"))
+                jobs[job_id]["status"] = "done"
+                jobs[job_id]["result"] = "TRAINING_COMPLETE"
+        else:
+            _training_jobs[job_id]["status"] = "error"
+            _training_jobs[job_id]["error"] = stdout[-2000:]
+            with jobs_lock:
+                if job_id in jobs:
+                    jobs[job_id]["status"] = "error"
+                    jobs[job_id]["error"] = stdout[-2000:]
+
+    except Exception:
+        err = traceback.format_exc()
+        _training_jobs[job_id]["status"] = "error"
+        _training_jobs[job_id]["error"] = err
+        with jobs_lock:
+            if job_id in jobs:
+                jobs[job_id]["status"] = "error"
+                jobs[job_id]["error"] = err
+
+
+@app.post("/train-classifier")
+def train_classifier_endpoint(
+    epochs: int = 100,
+    batch_size: int = 64,
+    embed_batch_size: int = 8,
+    lr: float = 0.001,
+):
+    """Train the brand classifier (frozen DINOv2 + MLP head). Works on CPU."""
+    job_id = create_job()
+    args = [
+        "--epochs", str(epochs),
+        "--batch-size", str(batch_size),
+        "--embed-batch-size", str(embed_batch_size),
+        "--lr", str(lr),
+    ]
+    threading.Thread(
+        target=_run_training_job,
+        args=(job_id, "brand_classifier.py", args),
+        daemon=True,
+    ).start()
+    return {"job_id": job_id, "type": "classifier", "epochs": epochs}
+
+
+@app.post("/train-rfdetr")
+def train_rfdetr_endpoint(
+    epochs: int = 50,
+    batch_size: int = 4,
+    lr: float = 0.0001,
+):
+    """Train RF-DETR detection model. Requires GPU for reasonable speed."""
+    job_id = create_job()
+    args = [
+        "--epochs", str(epochs),
+        "--batch-size", str(batch_size),
+        "--lr", str(lr),
+    ]
+    threading.Thread(
+        target=_run_training_job,
+        args=(job_id, "train.py", args),
+        daemon=True,
+    ).start()
+    return {"job_id": job_id, "type": "rfdetr", "epochs": epochs}
+
+
+@app.post("/finetune-dinov2")
+def finetune_dinov2_endpoint(
+    epochs: int = 30,
+    batch_size: int = 8,
+    lr: float = 0.00001,
+    unfreeze_layers: int = 4,
+):
+    """Fine-tune DINOv2 backbone. Requires 16GB+ VRAM (RunPod recommended)."""
+    job_id = create_job()
+    args = [
+        "--epochs", str(epochs),
+        "--batch-size", str(batch_size),
+        "--lr", str(lr),
+        "--unfreeze-layers", str(unfreeze_layers),
+    ]
+    threading.Thread(
+        target=_run_training_job,
+        args=(job_id, "finetune_dinov2.py", args),
+        daemon=True,
+    ).start()
+    return {"job_id": job_id, "type": "dinov2_finetune", "epochs": epochs}
+
+
+@app.get("/training-status/{job_id}")
+def training_status(job_id: str):
+    """Get training progress for a running job."""
+    if job_id in _training_jobs:
+        return _training_jobs[job_id]
+    raise HTTPException(status_code=404, detail="Training job not found")
 
 
 @app.get("/health")

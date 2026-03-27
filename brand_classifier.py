@@ -233,6 +233,15 @@ def train_classifier(args):
         val_acc = val_correct / val_total if val_total > 0 else 0
         avg_loss = train_loss / train_total if train_total > 0 else 0
 
+        # Write progress for UI polling
+        if hasattr(args, 'progress_file') and args.progress_file:
+            Path(args.progress_file).write_text(json.dumps({
+                "epoch": epoch, "total_epochs": args.epochs,
+                "train_acc": round(train_acc, 4), "val_acc": round(val_acc, 4),
+                "train_loss": round(avg_loss, 4), "best_val_acc": round(best_val_acc, 4),
+                "status": "training",
+            }, indent=2))
+
         if epoch % 5 == 0 or epoch == 1:
             print(f"  Epoch {epoch:3d}/{args.epochs} | Loss: {avg_loss:.4f} | "
                   f"Train acc: {train_acc:.3f} | Val acc: {val_acc:.3f}")
@@ -279,6 +288,7 @@ def main():
     parser.add_argument("--embed-batch-size", type=int, default=8, help="Batch size for DINOv2 embedding (lower for low VRAM)")
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--patience", type=int, default=20, help="Early stopping patience")
+    parser.add_argument("--progress-file", type=str, default="", help="Path to write progress JSON for UI polling")
     args = parser.parse_args()
     train_classifier(args)
 
