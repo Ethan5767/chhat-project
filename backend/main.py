@@ -1,7 +1,9 @@
 import io
 import hashlib
 import json
+import os
 import queue
+import subprocess
 import threading
 import traceback
 import uuid
@@ -9,6 +11,8 @@ import zipfile
 from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
+
+import requests as http_requests  # avoid clash with fastapi.requests
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, StreamingResponse
@@ -213,6 +217,253 @@ def run_pipeline_job(job_id: str, csv_path: Path):
                 jobs[job_id]["error"] = err
 
 
+# ── RunPod GPU batch processing ──
+
+RUNPOD_API_URL = "https://api.runpod.io/graphql"
+RUNPOD_GPU_ID = "NVIDIA A100 80GB PCIe"
+RUNPOD_TEMPLATE = "runpod-torch-v21"
+RUNPOD_REPO = "https://github.com/Ethan5767/chhat-project.git"
+
+
+def _get_runpod_api_key() -> str:
+    key = os.environ.get("RUNPOD_API_KEY", "")
+    if key:
+        return key
+    env_file = _BACKEND_ROOT.parent / ".env"
+    if env_file.exists():
+        for line in env_file.read_text().splitlines():
+            if line.startswith("RUNPOD_API_KEY="):
+                return line.split("=", 1)[1].strip().strip('"').strip("'")
+    return ""
+
+
+def _runpod_gql(api_key: str, query: str, variables: dict = None) -> dict:
+    payload = {"query": query}
+    if variables:
+        payload["variables"] = variables
+    resp = http_requests.post(RUNPOD_API_URL, headers={"Authorization": f"Bearer {api_key}"}, json=payload, timeout=30)
+    resp.raise_for_status()
+    data = resp.json()
+    if "errors" in data:
+        raise RuntimeError(f"RunPod API: {data['errors'][0].get('message', data['errors'])}")
+    return data["data"]
+
+
+def _ssh_cmd(host: str, port: int, key: str, command: str, timeout: int = 300) -> subprocess.CompletedProcess:
+    """Run command on remote host via SSH. Only works from Linux servers."""
+    return subprocess.run(
+        ["ssh", "-T", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=15",
+         "-o", "ServerAliveInterval=30", "-i", key, "-p", str(port), f"root@{host}", command],
+        capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def _scp_to(host: str, port: int, key: str, local: str, remote: str, timeout: int = 300):
+    """Upload file to remote host via SCP."""
+    return subprocess.run(
+        ["scp", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=15",
+         "-i", key, "-P", str(port), local, f"root@{host}:{remote}"],
+        capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def _scp_from(host: str, port: int, key: str, remote: str, local: str, timeout: int = 300):
+    """Download file from remote host via SCP."""
+    return subprocess.run(
+        ["scp", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=15",
+         "-i", key, "-P", str(port), f"root@{host}:{remote}", local],
+        capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def run_pipeline_gpu_job(job_id: str, csv_path: Path):
+    """Process a CSV batch on a RunPod GPU pod. Creates pod, uploads, runs, downloads, terminates."""
+    import os
+    import time as _time
+
+    api_key = _get_runpod_api_key()
+    if not api_key:
+        _append_batch_history({
+            "job_id": job_id, "filename": csv_path.name, "status": "error",
+            "start_time": datetime.now(timezone.utc).isoformat(), "end_time": datetime.now(timezone.utc).isoformat(),
+            "error": "RUNPOD_API_KEY not set. Add it to .env or environment variables.", "rows": None,
+        })
+        with jobs_lock:
+            jobs[job_id]["status"] = "error"
+            jobs[job_id]["error"] = "RUNPOD_API_KEY not set"
+        return
+
+    start_time = datetime.now(timezone.utc).isoformat()
+    _append_batch_history({
+        "job_id": job_id, "filename": csv_path.name, "status": "running_gpu",
+        "start_time": start_time, "end_time": None, "rows": None, "error": None,
+    })
+
+    pod_id = None
+    try:
+        update_progress(job_id, 1, 100, "Creating RunPod GPU pod...")
+
+        # 1. Create pod
+        pod = _runpod_gql(api_key, """
+            mutation CreatePod($input: PodFindAndDeployOnDemandInput!) {
+                podFindAndDeployOnDemand(input: $input) { id costPerHr machine { podHostId } }
+            }""", {"input": {
+                "name": f"batch-{job_id[:8]}",
+                "templateId": RUNPOD_TEMPLATE,
+                "gpuTypeId": RUNPOD_GPU_ID,
+                "cloudType": "COMMUNITY",
+                "containerDiskInGb": 20,
+                "volumeInGb": 50,
+                "volumeMountPath": "/workspace",
+                "gpuCount": 1,
+                "ports": "22/tcp",
+            }})["podFindAndDeployOnDemand"]
+        pod_id = pod["id"]
+        cost_hr = pod.get("costPerHr", 0)
+        update_progress(job_id, 5, 100, f"Pod created ({pod_id[:8]}..., ${cost_hr}/hr). Waiting for SSH...")
+
+        # 2. Wait for SSH port
+        ssh_host = ssh_port = None
+        for attempt in range(30):
+            d = _runpod_gql(api_key, f"""query {{
+                pod(input: {{ podId: "{pod_id}" }}) {{
+                    runtime {{ uptimeInSeconds ports {{ ip publicPort privatePort type }} }}
+                }}
+            }}""")
+            rt = d["pod"].get("runtime")
+            if rt and rt.get("ports"):
+                ssh_ports = [p for p in rt["ports"] if p["privatePort"] == 22]
+                if ssh_ports:
+                    ssh_host = ssh_ports[0]["ip"]
+                    ssh_port = ssh_ports[0]["publicPort"]
+                    break
+            _time.sleep(10)
+
+        if not ssh_host:
+            raise RuntimeError("Pod SSH port not available after 5 minutes")
+
+        update_progress(job_id, 10, 100, "Pod ready. Waiting for SSH daemon...")
+        _time.sleep(45)
+
+        # Find SSH key on server
+        ssh_key = None
+        for key_path in [
+            os.path.expanduser("~/.runpod/ssh/RunPod-Key-Go"),
+            os.path.expanduser("~/.ssh/id_ed25519"),
+            os.path.expanduser("~/.ssh/id_rsa"),
+        ]:
+            if os.path.exists(key_path):
+                ssh_key = key_path
+                break
+        if not ssh_key:
+            raise RuntimeError("No SSH key found on server. Add key to ~/.ssh/ or run runpodctl config.")
+
+        # 3. Test SSH connection
+        for attempt in range(6):
+            r = _ssh_cmd(ssh_host, ssh_port, ssh_key, "echo SSH_OK", timeout=20)
+            if "SSH_OK" in r.stdout:
+                break
+            _time.sleep(10)
+        else:
+            raise RuntimeError(f"SSH connection failed after retries: {r.stderr[:200]}")
+
+        update_progress(job_id, 15, 100, "SSH connected. Setting up environment...")
+
+        # 4. Clone repo and bootstrap
+        r = _ssh_cmd(ssh_host, ssh_port, ssh_key,
+                      f"ls /workspace/chhat-project/train.py 2>/dev/null && echo REPO_EXISTS || echo NEED_CLONE",
+                      timeout=30)
+        if "NEED_CLONE" in r.stdout:
+            update_progress(job_id, 18, 100, "Cloning repository and installing dependencies...")
+            r = _ssh_cmd(ssh_host, ssh_port, ssh_key,
+                          f"cd /workspace && git clone {RUNPOD_REPO} && cd chhat-project && bash runpod/bootstrap_training_pod.sh",
+                          timeout=600)
+            if r.returncode != 0:
+                raise RuntimeError(f"Bootstrap failed: {r.stdout[-500:]}")
+        else:
+            _ssh_cmd(ssh_host, ssh_port, ssh_key, "cd /workspace/chhat-project && git pull", timeout=60)
+
+        update_progress(job_id, 25, 100, "Uploading CSV...")
+
+        # 5. Upload CSV
+        r = _scp_to(ssh_host, ssh_port, ssh_key, str(csv_path),
+                     "/workspace/chhat-project/backend/uploads/", timeout=120)
+        if r.returncode != 0:
+            raise RuntimeError(f"CSV upload failed: {r.stderr[:200]}")
+
+        # 6. Run pipeline on pod
+        update_progress(job_id, 30, 100, "Running detection pipeline on GPU...")
+        remote_csv = f"/workspace/chhat-project/backend/uploads/{csv_path.name}"
+        remote_out = f"/workspace/chhat-project/backend/uploads/{csv_path.stem}_results.csv"
+
+        r = _ssh_cmd(ssh_host, ssh_port, ssh_key,
+                      f"cd /workspace/chhat-project && source .venv/bin/activate && "
+                      f"python -c \""
+                      f"from backend.pipeline import run_pipeline; "
+                      f"out = run_pipeline('{remote_csv}'); "
+                      f"print(f'RESULT_PATH={{out}}')"
+                      f"\"",
+                      timeout=7200)  # 2 hour timeout for large batches
+
+        if r.returncode != 0:
+            raise RuntimeError(f"Pipeline failed on GPU: {r.stdout[-500:]}")
+
+        # Parse actual output path
+        result_line = [l for l in r.stdout.splitlines() if "RESULT_PATH=" in l]
+        if result_line:
+            remote_result = result_line[-1].split("RESULT_PATH=")[1].strip()
+        else:
+            remote_result = remote_out
+
+        update_progress(job_id, 90, 100, "Downloading results...")
+
+        # 7. Download results
+        job_out_path = RESULTS_DIR / f"{job_id}_{csv_path.stem}_results.csv"
+        r = _scp_from(ssh_host, ssh_port, ssh_key, remote_result, str(job_out_path), timeout=120)
+        if r.returncode != 0:
+            raise RuntimeError(f"Result download failed: {r.stderr[:200]}")
+
+        _save_result_meta(job_id, job_out_path)
+
+        try:
+            import pandas as _pd
+            result_df = _pd.read_csv(job_out_path)
+            row_count = len(result_df)
+        except Exception:
+            row_count = None
+
+        _update_batch_history(job_id, {
+            "status": "done",
+            "end_time": datetime.now(timezone.utc).isoformat(),
+            "rows": row_count,
+            "result_file": job_out_path.name,
+        })
+        with jobs_lock:
+            jobs[job_id]["status"] = "done"
+            jobs[job_id]["result"] = str(job_out_path)
+
+        update_progress(job_id, 100, 100, f"GPU processing complete! ({row_count or '?'} rows)")
+
+    except Exception:
+        err = traceback.format_exc()
+        _update_batch_history(job_id, {
+            "status": "error",
+            "end_time": datetime.now(timezone.utc).isoformat(),
+            "error": str(err)[:500],
+        })
+        with jobs_lock:
+            jobs[job_id]["status"] = "error"
+            jobs[job_id]["error"] = err
+    finally:
+        # Always terminate pod to avoid charges
+        if pod_id:
+            try:
+                _runpod_gql(api_key, f'mutation {{ podTerminate(input: {{ podId: "{pod_id}" }}) }}')
+                print(f"[gpu-batch] Pod {pod_id} terminated")
+            except Exception as exc:
+                print(f"[gpu-batch] WARNING: Failed to terminate pod {pod_id}: {exc}")
+
+
 @app.on_event("startup")
 def startup_event():
     device = get_device()
@@ -235,7 +486,7 @@ def build_index_endpoint():
 
 
 @app.post("/run-pipeline")
-async def run_pipeline_endpoint(csv_file: UploadFile = File(...)):
+async def run_pipeline_endpoint(csv_file: UploadFile = File(...), use_gpu: str = Form("false")):
     if not csv_file.filename.lower().endswith(".csv"):
         raise HTTPException(status_code=400, detail="Only .csv files are accepted.")
 
@@ -245,8 +496,12 @@ async def run_pipeline_endpoint(csv_file: UploadFile = File(...)):
     save_path.write_bytes(data)
 
     job_id = create_job()
-    threading.Thread(target=run_pipeline_job, args=(job_id, save_path), daemon=True).start()
-    return {"job_id": job_id}
+    gpu = use_gpu.lower() in ("true", "1", "yes")
+    if gpu:
+        threading.Thread(target=run_pipeline_gpu_job, args=(job_id, save_path), daemon=True).start()
+    else:
+        threading.Thread(target=run_pipeline_job, args=(job_id, save_path), daemon=True).start()
+    return {"job_id": job_id, "gpu": gpu}
 
 
 @app.get("/progress/{job_id}")

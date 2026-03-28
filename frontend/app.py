@@ -521,11 +521,24 @@ with tab_batch:
             st.error(f"Could not preview CSV: {exc}")
 
     run_disabled = uploaded is None or not index_exists
-    if st.button("Run Detection", disabled=run_disabled, type="primary", width="stretch", key="run_batch"):
+    run_col1, run_col2 = st.columns(2)
+    with run_col1:
+        run_local = st.button("Run Detection (Local)", disabled=run_disabled, type="primary", key="run_batch")
+    with run_col2:
+        run_gpu = st.button("Run Detection (RunPod GPU)", disabled=uploaded is None, type="secondary", key="run_batch_gpu")
+        st.caption("Spins up A100 pod, processes, auto-terminates")
+
+    use_gpu = run_gpu
+    if run_local or run_gpu:
         job_id = None
         try:
             files = {"csv_file": (uploaded.name, uploaded.getvalue(), "text/csv")}
-            run_res = requests.post(f"{BACKEND_URL}/run-pipeline", files=files, timeout=60)
+            run_res = requests.post(
+                f"{BACKEND_URL}/run-pipeline",
+                files=files,
+                data={"use_gpu": "true" if use_gpu else "false"},
+                timeout=60,
+            )
             run_res.raise_for_status()
             job_id = run_res.json()["job_id"]
 
