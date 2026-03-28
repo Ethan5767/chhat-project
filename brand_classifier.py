@@ -25,10 +25,11 @@ from torch.utils.data import DataLoader, TensorDataset
 from transformers import AutoImageProcessor, AutoModel
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-REFERENCES_DIR = PROJECT_ROOT / "backend" / "references"
-OUTPUT_DIR = PROJECT_ROOT / "backend" / "classifier_model"
+REFERENCES_BASE_DIR = PROJECT_ROOT / "backend" / "references"
+OUTPUT_BASE_DIR = PROJECT_ROOT / "backend" / "classifier_model"
 DINO_MODEL_ID = "facebook/dinov2-base"
 EMBED_DIM = 1536  # CLS (768) + mean-pooled patches (768)
+PACKAGING_TYPES = ("pack", "box")
 
 
 def label_from_filename(filename: str) -> str:
@@ -114,10 +115,13 @@ class BrandClassifier(nn.Module):
 
 
 def train_classifier(args):
+    pkg_type = getattr(args, "packaging_type", "pack")
+    REFERENCES_DIR = REFERENCES_BASE_DIR / pkg_type
+    OUTPUT_DIR = OUTPUT_BASE_DIR / pkg_type
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # 1. Collect reference images and labels
-    print("Scanning reference images...")
+    print(f"Scanning {pkg_type} reference images from {REFERENCES_DIR}...")
     image_paths = []
     for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.bmp"):
         image_paths.extend(REFERENCES_DIR.glob(ext))
@@ -268,11 +272,12 @@ def train_classifier(args):
         "num_classes": num_classes,
         "embed_dim": EMBED_DIM,
         "hidden_dim": 512,
+        "packaging_type": pkg_type,
     }
     with open(OUTPUT_DIR / "class_mapping.json", "w", encoding="utf-8") as f:
         json.dump(class_mapping, f, ensure_ascii=False, indent=2)
 
-    print(f"\nTraining complete!")
+    print(f"\nTraining complete ({pkg_type} classifier)!")
     print(f"  Best val accuracy: {best_val_acc:.3f}")
     print(f"  Model saved to: {OUTPUT_DIR}")
     print(f"  Classes: {num_classes}")
@@ -289,6 +294,7 @@ def main():
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--patience", type=int, default=20, help="Early stopping patience")
     parser.add_argument("--progress-file", type=str, default="", help="Path to write progress JSON for UI polling")
+    parser.add_argument("--packaging-type", type=str, default="pack", choices=["pack", "box"], help="Which packaging type to train classifier for")
     args = parser.parse_args()
     train_classifier(args)
 
