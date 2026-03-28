@@ -19,7 +19,11 @@ BATCH_MODE: Optional[int] = None
 SAVE_INTERVAL = 50
 _BACKEND_ROOT = Path(__file__).resolve().parent
 REFERENCES_DIR = _BACKEND_ROOT / "references"
-CLASSIFIER_DIR = _BACKEND_ROOT / "classifier_model"
+CLASSIFIER_BASE_DIR = _BACKEND_ROOT / "classifier_model"
+PACKAGING_TYPES = ("pack", "box")
+
+# Per-type paths (backward compat aliases pointing to pack)
+CLASSIFIER_DIR = CLASSIFIER_BASE_DIR / "pack"
 CLASSIFIER_WEIGHTS = CLASSIFIER_DIR / "best_classifier.pth"
 CLASS_MAPPING_JSON = CLASSIFIER_DIR / "class_mapping.json"
 DINO_MODEL_ID = "facebook/dinov2-base"
@@ -50,6 +54,9 @@ _dino_processor = None
 _dino_model = None
 _rfdetr_model = None
 _ocr_reader = None
+# Per-type classifiers: {"pack": (classifier, mapping), "box": (classifier, mapping)}
+_classifiers: dict[str, tuple] = {}
+# Legacy single-classifier aliases (for backward compat)
 _brand_classifier = None
 _class_mapping = None
 
@@ -226,7 +233,7 @@ def embed_images_batch(pil_imgs: list[Image.Image], processor, model, device: st
 
 
 def build_index(device: str, progress_cb: Optional[Callable[[int, int, str], None]] = None) -> None:
-    """Train the brand classifier from reference images."""
+    """Train brand classifiers for each packaging type that has reference images."""
     import subprocess
     import sys
 
@@ -234,74 +241,124 @@ def build_index(device: str, progress_cb: Optional[Callable[[int, int, str], Non
     if not train_script.exists():
         raise FileNotFoundError(f"Training script not found: {train_script}")
 
-    if progress_cb:
-        progress_cb(0, 100, "Training brand classifier...")
+    trained_types = []
+    for idx, pkg_type in enumerate(PACKAGING_TYPES):
+        type_dir = REFERENCES_DIR / pkg_type
+        if not type_dir.exists():
+            continue
+        # Check if there are any images
+        has_images = any(type_dir.glob("*.jpg")) or any(type_dir.glob("*.png"))
+        if not has_images:
+            if progress_cb:
+                progress_cb(
+                    int((idx + 1) / len(PACKAGING_TYPES) * 100),
+                    100,
+                    f"Skipping {pkg_type} classifier (no reference images)",
+                )
+            continue
 
-    result = subprocess.run(
-        [sys.executable, str(train_script), "--epochs", "100", "--embed-batch-size", "8"],
-        cwd=str(_PROJECT_ROOT),
-        capture_output=True,
-        text=True,
-    )
+        if progress_cb:
+            progress_cb(
+                int(idx / len(PACKAGING_TYPES) * 50),
+                100,
+                f"Training {pkg_type} classifier...",
+            )
 
-    if result.returncode != 0:
-        raise RuntimeError(f"Classifier training failed:\n{result.stderr}")
-
-    if progress_cb:
-        progress_cb(100, 100, "Classifier trained successfully")
-
-    # Reload the classifier
-    global _brand_classifier, _class_mapping
-    _brand_classifier = None
-    _class_mapping = None
-    load_classifier(device)
-
-
-def load_classifier(device: str = None):
-    """Load the trained brand classifier and class mapping."""
-    global _brand_classifier, _class_mapping
-
-    if _brand_classifier is not None and _class_mapping is not None:
-        return _brand_classifier, _class_mapping
-
-    if not CLASSIFIER_WEIGHTS.exists() or not CLASS_MAPPING_JSON.exists():
-        raise FileNotFoundError(
-            f"Missing classifier model. Expected {CLASSIFIER_WEIGHTS} and {CLASS_MAPPING_JSON}. "
-            "Run 'python brand_classifier.py' or /build-index first."
+        result = subprocess.run(
+            [sys.executable, str(train_script), "--packaging-type", pkg_type,
+             "--epochs", "100", "--embed-batch-size", "8"],
+            cwd=str(_PROJECT_ROOT),
+            capture_output=True,
+            text=True,
         )
 
-    with CLASS_MAPPING_JSON.open("r", encoding="utf-8") as f:
-        _class_mapping = json.load(f)
+        if result.returncode != 0:
+            raise RuntimeError(f"{pkg_type} classifier training failed:\n{result.stderr}")
 
-    num_classes = _class_mapping["num_classes"]
-    embed_dim = _class_mapping["embed_dim"]
-    hidden_dim = _class_mapping.get("hidden_dim", 512)
+        trained_types.append(pkg_type)
 
-    _brand_classifier = BrandClassifier(embed_dim, num_classes, hidden_dim)
+    if progress_cb:
+        progress_cb(100, 100, f"Classifiers trained: {', '.join(trained_types)}")
+
+    # Reload classifiers
+    global _classifiers
+    _classifiers = {}
+    for pkg_type in trained_types:
+        try:
+            load_classifier(device, packaging_type=pkg_type)
+        except FileNotFoundError:
+            pass
+
+
+def load_classifier(device: str = None, packaging_type: str = "pack"):
+    """Load the trained brand classifier and class mapping for a packaging type."""
+    global _classifiers, _brand_classifier, _class_mapping
+
+    if packaging_type in _classifiers:
+        return _classifiers[packaging_type]
+
+    type_dir = CLASSIFIER_BASE_DIR / packaging_type
+    weights_path = type_dir / "best_classifier.pth"
+    mapping_path = type_dir / "class_mapping.json"
+
+    if not weights_path.exists() or not mapping_path.exists():
+        # Fallback: check legacy flat structure (pre-migration)
+        legacy_weights = CLASSIFIER_BASE_DIR / "best_classifier.pth"
+        legacy_mapping = CLASSIFIER_BASE_DIR / "class_mapping.json"
+        if packaging_type == "pack" and legacy_weights.exists() and legacy_mapping.exists():
+            weights_path = legacy_weights
+            mapping_path = legacy_mapping
+        else:
+            raise FileNotFoundError(
+                f"Missing {packaging_type} classifier model. Expected {weights_path} and {mapping_path}. "
+                f"Run 'python brand_classifier.py --packaging-type {packaging_type}' or /build-index first."
+            )
+
+    with mapping_path.open("r", encoding="utf-8") as f:
+        mapping = json.load(f)
+
+    num_classes = mapping["num_classes"]
+    embed_dim = mapping["embed_dim"]
+    hidden_dim = mapping.get("hidden_dim", 512)
+
+    classifier = BrandClassifier(embed_dim, num_classes, hidden_dim)
 
     if device is None:
         device = get_device()
-    state = torch.load(CLASSIFIER_WEIGHTS, map_location=device, weights_only=True)
-    _brand_classifier.load_state_dict(state)
-    _brand_classifier.to(device)
-    _brand_classifier.eval()
+    state = torch.load(weights_path, map_location=device, weights_only=True)
+    classifier.load_state_dict(state)
+    classifier.to(device)
+    classifier.eval()
 
-    logger.info("Loaded brand classifier: %d classes", num_classes)
-    return _brand_classifier, _class_mapping
+    _classifiers[packaging_type] = (classifier, mapping)
+
+    # Keep legacy aliases pointing to pack classifier
+    if packaging_type == "pack":
+        _brand_classifier = classifier
+        _class_mapping = mapping
+
+    logger.info("Loaded %s brand classifier: %d classes", packaging_type, num_classes)
+    return classifier, mapping
 
 
-def classify_embeddings(embeddings: np.ndarray, device: str, top_k: int = CLASSIFIER_TOP_K) -> list[list[tuple[str, float]]]:
+def classify_embeddings(
+    embeddings: np.ndarray,
+    device: str,
+    top_k: int = CLASSIFIER_TOP_K,
+    packaging_type: str = "pack",
+) -> list[list[tuple[str, float]]]:
     """Run the brand classifier on pre-computed DINOv2 embeddings.
 
     Args:
         embeddings: (N, embed_dim) numpy array of L2-normalized embeddings
         device: torch device
         top_k: number of top predictions to return per sample
+        packaging_type: "pack" or "box" -- determines which classifier to use
 
     Returns:
         List of N lists, each containing top_k (label, confidence) tuples.
     """
-    classifier, mapping = load_classifier(device)
+    classifier, mapping = load_classifier(device, packaging_type=packaging_type)
     idx_to_label = mapping["idx_to_label"]
 
     with torch.no_grad():
@@ -322,10 +379,10 @@ def classify_embeddings(embeddings: np.ndarray, device: str, top_k: int = CLASSI
 
 
 # Keep for backward compatibility with main.py imports
-def load_index():
+def load_index(packaging_type: str = "pack"):
     """Load classifier and return (classifier, labels) for backward compatibility."""
     device = get_device()
-    classifier, mapping = load_classifier(device)
+    classifier, mapping = load_classifier(device, packaging_type=packaging_type)
     labels = list(mapping["label_to_idx"].keys())
     return classifier, labels
 
@@ -508,22 +565,40 @@ def _detect_brands_from_image(
     """Detect and classify cigarette brands in an image.
 
     Pipeline (classifier-first with OCR fallback):
-      1. RF-DETR detects pack bounding boxes
-      2. DINOv2 classifier predicts products for each crop
-      3. EasyOCR runs only on uncertain crops (low confidence / low margin)
-      4. OCR signals boost matching classifier families for uncertain crops
+      1. RF-DETR detects bounding boxes with class_id (0=pack, 1=box)
+      2. Crops are grouped by packaging type
+      3. Each group is classified by its type-specific DINOv2 classifier
+      4. EasyOCR runs only on uncertain crops (low confidence / low margin)
+      5. OCR signals boost matching classifier families for uncertain crops
     """
-    label_profiles = _build_label_profiles(labels)
-    label_profile_map = {p["label"]: p for p in label_profiles}
+    # Load labels for each available packaging type
+    type_labels = {}
+    type_label_profiles = {}
+    for pkg_type in PACKAGING_TYPES:
+        try:
+            _, pkg_labels = load_index(packaging_type=pkg_type)
+            type_labels[pkg_type] = pkg_labels
+            type_label_profiles[pkg_type] = _build_label_profiles(pkg_labels)
+        except FileNotFoundError:
+            pass
+
+    # Fallback: if no type-specific classifiers, use legacy labels
+    if not type_labels:
+        type_labels["pack"] = labels
+        type_label_profiles["pack"] = _build_label_profiles(labels)
+
     detections = rfdetr_model.predict(image, threshold=RFDETR_CONF_THRESHOLD)
     crops: list[Image.Image] = []
+    crop_types: list[str] = []  # "pack" or "box" per crop
 
     has_detections = len(detections) > 0 if detections is not None else False
 
     if has_detections:
         width, height = image.size
         xyxy = detections.xyxy
-        for box in xyxy:
+        # class_id: 0 = pack (or single-class legacy), 1 = box
+        class_ids = detections.class_id if hasattr(detections, "class_id") and detections.class_id is not None else None
+        for i, box in enumerate(xyxy):
             x1, y1, x2, y2 = [int(v) for v in box]
             bw, bh = x2 - x1, y2 - y1
             pad_x, pad_y = int(bw * 0.10), int(bh * 0.10)
@@ -534,12 +609,43 @@ def _detect_brands_from_image(
             if x2 <= x1 or y2 <= y1:
                 continue
             crops.append(image.crop((x1, y1, x2, y2)))
+
+            # Determine packaging type from class_id
+            if class_ids is not None and len(class_ids) > i:
+                cid = int(class_ids[i])
+                crop_types.append("box" if cid == 1 else "pack")
+            else:
+                crop_types.append("pack")
     else:
         crops.append(image)
+        crop_types.append("pack")
 
-    # ── Step 1: DINOv2 classifier picks specific product ──
+    # Group crops by packaging type for batch classification
+    type_crop_indices: dict[str, list[int]] = {}
+    for idx, pkg_type in enumerate(crop_types):
+        effective_type = pkg_type if pkg_type in type_labels else "pack"
+        type_crop_indices.setdefault(effective_type, []).append(idx)
+
+    # Embed all crops at once (DINOv2 is shared)
     all_vecs = embed_images_batch(crops, processor, model, device)
-    all_cls_results = classify_embeddings(all_vecs, device, top_k=CLASSIFIER_TOP_K)
+
+    # Classify per type
+    all_cls_results: list[list[tuple[str, float]]] = [[] for _ in crops]
+
+    for pkg_type, indices in type_crop_indices.items():
+        if not indices:
+            continue
+        type_vecs = all_vecs[indices]
+        type_results = classify_embeddings(type_vecs, device, top_k=CLASSIFIER_TOP_K, packaging_type=pkg_type)
+        for local_idx, global_idx in enumerate(indices):
+            all_cls_results[global_idx] = type_results[local_idx]
+
+    # Build combined label profiles for OCR matching (union of all types)
+    combined_labels = set()
+    for pkg_labels in type_labels.values():
+        combined_labels.update(pkg_labels)
+    combined_label_profiles = _build_label_profiles(list(combined_labels))
+    label_profile_map = {p["label"]: p for p in combined_label_profiles}
 
     def _needs_ocr_fallback(crop_results: list[tuple[str, float]]) -> bool:
         if not OCR_ENABLED:
@@ -553,23 +659,23 @@ def _detect_brands_from_image(
 
     ocr_needed = [_needs_ocr_fallback(r) for r in all_cls_results]
 
-    # ── Step 2: OCR fallback only for uncertain crops ──
+    # OCR fallback only for uncertain crops
     per_crop_ocr_scores: list[dict[str, float]] = [{} for _ in crops]
     ocr_best: dict[str, float] = {}
     for idx, crop in enumerate(crops):
         if not ocr_needed[idx]:
             continue
         ocr_items = _run_ocr_on_image(crop)
-        crop_ocr_scores = _ocr_brand_scores_from_items(ocr_items, label_profiles)
+        crop_ocr_scores = _ocr_brand_scores_from_items(ocr_items, combined_label_profiles)
         per_crop_ocr_scores[idx] = crop_ocr_scores
         for label, conf in crop_ocr_scores.items():
             if conf > ocr_best.get(label, 0.0):
                 ocr_best[label] = conf
 
-    # Optional full-image OCR context only when at least one crop was uncertain.
+    # Optional full-image OCR context
     fullimg_ocr_families: dict[str, float] = {}
     if OCR_FULLIMG_ENABLED and has_detections and any(ocr_needed):
-        fullimg_scores = _ocr_brand_scores_from_items(_run_ocr_on_image(image), label_profiles)
+        fullimg_scores = _ocr_brand_scores_from_items(_run_ocr_on_image(image), combined_label_profiles)
         for label, conf in fullimg_scores.items():
             if conf > ocr_best.get(label, 0.0):
                 ocr_best[label] = conf
@@ -577,7 +683,7 @@ def _detect_brands_from_image(
             if family:
                 fullimg_ocr_families[family] = max(fullimg_ocr_families.get(family, 0.0), conf)
 
-    # ── Step 3: Fuse classifier with OCR fallback on uncertain crops ──
+    # Fuse classifier with OCR fallback
     fused: dict[str, float] = {}
     for crop_idx, crop_results in enumerate(all_cls_results):
         crop_ocr_scores = per_crop_ocr_scores[crop_idx]
@@ -604,8 +710,7 @@ def _detect_brands_from_image(
             if out_conf > fused.get(label, 0.0):
                 fused[label] = out_conf
 
-    # OCR-only brands: OCR found brands the classifier missed entirely
-    # Use OCR score directly (the brand is there, classifier just didn't see it)
+    # OCR-only brands
     for label, ocr_conf in ocr_best.items():
         if label in fused:
             continue
