@@ -561,13 +561,27 @@ def batch_history(limit: int = 50):
 
 @app.get("/index-status")
 def index_status():
-    if not CLASS_MAPPING_JSON.exists():
-        return {"exists": False, "brand_count": 0, "brands": [], "products": []}
-    with CLASS_MAPPING_JSON.open("r", encoding="utf-8") as f:
+    # Check pack/ subfolder first, then legacy flat path
+    mapping_path = CLASS_MAPPING_JSON
+    if not mapping_path.exists():
+        legacy = CLASS_MAPPING_JSON.parent.parent / "class_mapping.json"
+        if legacy.exists():
+            mapping_path = legacy
+        else:
+            return {"exists": False, "brand_count": 0, "brands": [], "products": [], "total_images": 0, "num_labels": 0}
+    with mapping_path.open("r", encoding="utf-8") as f:
         mapping = json.load(f)
     brands = list(mapping.get("label_to_idx", {}).keys())
     products = sorted(set(label_to_product(b) for b in brands))
-    return {"exists": True, "brand_count": len(brands), "brands": brands, "products": products}
+    # Count reference images
+    try:
+        from brand_registry import audit_references
+        audit = audit_references()
+        total_images = audit.get("total_images", 0)
+    except Exception:
+        total_images = len(brands)
+    return {"exists": True, "brand_count": len(brands), "brands": brands, "products": products,
+            "total_images": total_images, "num_labels": len(brands)}
 
 
 @app.post("/detect-single")
