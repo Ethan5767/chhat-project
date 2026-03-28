@@ -1330,6 +1330,7 @@ def train_classifier_endpoint(
         "--batch-size", str(batch_size),
         "--embed-batch-size", str(embed_batch_size),
         "--lr", str(lr),
+        "--packaging-type", "pack",
     ]
     with _training_lock:
         _training_jobs[job_id] = {
