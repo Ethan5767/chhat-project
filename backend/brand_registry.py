@@ -10,6 +10,7 @@ from pathlib import Path
 from collections import Counter
 
 REFERENCES_DIR = Path(__file__).resolve().parent / "references"
+PACKAGING_TYPES = ("pack", "box")
 
 # ─── Complete brand/product registry ───
 # Structure: brand_name -> list of (product_display_name, internal_filename_prefix)
@@ -212,38 +213,60 @@ def get_display_name(internal_name: str) -> str:
 
 
 def audit_references() -> dict:
-    """Check what's in backend/references/ vs what the registry expects.
+    """Check what's in backend/references/{pack,box}/ vs what the registry expects.
 
     Returns a dict with:
-      - found: {internal_name: count} for products with reference images
-      - missing: [(brand, product_display, internal_name)] for products with 0 images
+      - found: {internal_name: {"pack": count, "box": count}} for products with reference images
+      - missing: [(brand, product_display, internal_name)] for products with 0 images in either type
       - unregistered: {filename_prefix: count} for images not in registry
       - legacy: {old_name: new_name} for images using old naming
+      - per_type: {"pack": total_count, "box": total_count}
     """
     if not REFERENCES_DIR.exists():
-        return {"found": {}, "missing": [], "unregistered": {}, "legacy": {}}
+        return {"found": {}, "missing": [], "unregistered": {}, "legacy": {}, "per_type": {}}
 
-    image_paths = []
-    for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.bmp"):
-        image_paths.extend(REFERENCES_DIR.glob(ext))
-        image_paths.extend(REFERENCES_DIR.glob(ext.upper()))
+    all_found: dict[str, dict[str, int]] = {}
+    total_images = 0
+    all_label_counts = Counter()
+    per_type_totals = {}
 
-    # Count images per internal name
-    file_labels = [_label_from_filename(p.name) for p in image_paths]
-    label_counts = Counter(file_labels)
+    for pkg_type in PACKAGING_TYPES:
+        type_dir = REFERENCES_DIR / pkg_type
+        if not type_dir.exists():
+            per_type_totals[pkg_type] = 0
+            continue
+
+        image_paths = []
+        for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.bmp"):
+            image_paths.extend(type_dir.glob(ext))
+            image_paths.extend(type_dir.glob(ext.upper()))
+
+        per_type_totals[pkg_type] = len(image_paths)
+        total_images += len(image_paths)
+
+        file_labels = [_label_from_filename(p.name) for p in image_paths]
+        label_counts = Counter(file_labels)
+        all_label_counts += label_counts
+
+        for label, count in label_counts.items():
+            if label not in all_found:
+                all_found[label] = {t: 0 for t in PACKAGING_TYPES}
+            all_found[label][pkg_type] = count
 
     # Check each registry entry
     found = {}
     missing = []
     for brand, products in BRAND_REGISTRY.items():
         for product_display, internal in products:
-            count = label_counts.get(internal, 0)
+            counts = all_found.get(internal, {t: 0 for t in PACKAGING_TYPES})
             # Also check legacy aliases
             for old, new in LEGACY_ALIASES.items():
-                if new == internal:
-                    count += label_counts.get(old, 0)
-            if count > 0:
-                found[internal] = count
+                if new == internal and old in all_found:
+                    for t in PACKAGING_TYPES:
+                        counts[t] = counts.get(t, 0) + all_found[old].get(t, 0)
+            total = sum(counts.values())
+            if total > 0:
+                found[internal] = counts
             else:
                 missing.append((brand, product_display, internal))
 
@@ -255,14 +278,14 @@ def audit_references() -> dict:
     all_registered.update(LEGACY_ALIASES.keys())
 
     unregistered = {}
-    for label, count in label_counts.items():
+    for label, count in all_label_counts.items():
         if label not in all_registered:
             unregistered[label] = count
 
     # Find legacy-named files
     legacy_found = {}
     for old, new in LEGACY_ALIASES.items():
-        if old != new and label_counts.get(old, 0) > 0:
+        if old != new and all_label_counts.get(old, 0) > 0:
             legacy_found[old] = new
 
     return {
@@ -270,9 +293,10 @@ def audit_references() -> dict:
         "missing": missing,
         "unregistered": unregistered,
         "legacy": legacy_found,
-        "total_images": len(image_paths),
+        "total_images": total_images,
         "total_products_found": len(found),
         "total_products_missing": len(missing),
+        "per_type": per_type_totals,
     }
 
 
@@ -284,19 +308,23 @@ def print_audit():
     print(f"=== Brand Registry Audit ===")
     print(f"Registry: {len(BRAND_REGISTRY)} brands, {total_products} products")
     print(f"References: {result['total_images']} images")
+    for pkg_type, count in result.get("per_type", {}).items():
+        print(f"  {pkg_type}: {count} images")
     print(f"Products with images: {result['total_products_found']}/{total_products}")
     print(f"Products missing: {result['total_products_missing']}/{total_products}")
 
     if result["found"]:
         print(f"\n--- Products with references ({result['total_products_found']}) ---")
-        for internal, count in sorted(result["found"].items()):
+        for internal, counts in sorted(result["found"].items()):
             brand, display = INTERNAL_TO_BRAND_product.get(internal, ("?", internal))
-            print(f"  {display:<40} {count:>3} images  ({internal})")
+            count_str = ", ".join(f"{t}={c}" for t, c in counts.items() if c > 0)
+            total = sum(counts.values())
+            print(f"  {display:<40} {total:>3} images  ({count_str})  ({internal})")
 
     if result["missing"]:
         print(f"\n--- MISSING Products ({result['total_products_missing']}) ---")
         for brand, product_display, internal in result["missing"]:
-            print(f"  {brand:<15} {product_display:<40} (need: {internal}_1.jpg)")
+            print(f"  {brand:<15} {product_display:<40} (need: pack/{internal}_1.jpg)")
 
     if result["legacy"]:
         print(f"\n--- Legacy-named files (should rename) ---")
