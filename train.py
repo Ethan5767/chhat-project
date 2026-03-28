@@ -25,6 +25,23 @@ def main():
     parser.add_argument("--progress-file", type=str, default="")
     args = parser.parse_args()
 
+    # Validate dataset exists before starting training
+    for split in ("train", "valid"):
+        ann_file = DATASET_DIR / split / "_annotations.coco.json"
+        if not ann_file.exists():
+            msg = (
+                f"Missing dataset: {ann_file}\n"
+                f"Upload a COCO dataset via /upload-coco or provide a Roboflow URL "
+                f"when starting training."
+            )
+            print(f"ERROR: {msg}", flush=True)
+            if args.progress_file:
+                Path(args.progress_file).write_text(json.dumps({
+                    "epoch": 0, "total_epochs": args.epochs,
+                    "status": "failed", "error": msg,
+                }, indent=2))
+            raise FileNotFoundError(msg)
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     model = RFDETRMedium()
