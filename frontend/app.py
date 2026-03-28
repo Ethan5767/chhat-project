@@ -1130,31 +1130,51 @@ with tab_index:
                     break
             if picked_internal:
                 ref_type = st.radio("Reference type", options=["pack", "box"], horizontal=True, key="ref_viewer_type")
-                with st.expander(f"Show {ref_type} references for {picked_product_display}", expanded=True):
+
+                @st.fragment
+                def _ref_viewer_fragment(internal, pkg_type, product_display):
+                    """Isolated fragment -- delete only reruns this viewer, not the whole page."""
                     try:
-                        ref_data = _fetch_reference_listing(picked_internal, ref_type)
+                        ref_data = _fetch_reference_listing(internal, pkg_type)
                         filenames = ref_data.get("filenames", []) if ref_data else []
-                        if filenames:
-                            cols = st.columns(min(5, len(filenames)))
-                            for img_idx, fname in enumerate(filenames):
-                                with cols[img_idx % len(cols)]:
-                                    img_bytes = _fetch_reference_image_bytes(ref_type, fname)
-                                    if img_bytes:
-                                        st.image(img_bytes, caption=fname, width=110)
-                                    if st.button("Delete", key=f"picker_del_{ref_type}_{fname}", type="secondary"):
-                                        try:
-                                            del_resp = requests.delete(f"{BACKEND_URL}/reference-image/{ref_type}/{fname}", timeout=5)
-                                            del_resp.raise_for_status()
-                                            _fetch_reference_listing.clear()
-                                            _fetch_reference_image_bytes.clear()
-                                            _fetch_brand_hierarchy.clear()
-                                            st.rerun()
-                                        except Exception as exc:
-                                            st.error(f"Delete failed: {exc}")
-                        else:
-                            st.caption(f"No {ref_type} reference images yet for this product.")
+                        if not filenames:
+                            st.caption(f"No {pkg_type} reference images yet for this product.")
+                            return
+
+                        st.caption(f"{len(filenames)} {pkg_type} reference images for {product_display}")
+
+                        # Checkbox select for batch delete
+                        to_delete = []
+                        cols = st.columns(min(5, len(filenames)))
+                        for img_idx, fname in enumerate(filenames):
+                            with cols[img_idx % len(cols)]:
+                                img_bytes = _fetch_reference_image_bytes(pkg_type, fname)
+                                if img_bytes:
+                                    st.image(img_bytes, width=110)
+                                checked = st.checkbox(fname, key=f"sel_{pkg_type}_{fname}", label_visibility="collapsed")
+                                st.caption(fname)
+                                if checked:
+                                    to_delete.append(fname)
+
+                        if to_delete:
+                            if st.button(f"Delete {len(to_delete)} selected", type="secondary", key=f"batch_del_{pkg_type}_{internal}"):
+                                deleted = 0
+                                for fname in to_delete:
+                                    try:
+                                        resp = requests.delete(f"{BACKEND_URL}/reference-image/{pkg_type}/{fname}", timeout=5)
+                                        if resp.status_code == 200:
+                                            deleted += 1
+                                    except Exception:
+                                        pass
+                                if deleted:
+                                    _fetch_reference_listing.clear()
+                                    _fetch_brand_hierarchy.clear()
+                                    st.success(f"Deleted {deleted}/{len(to_delete)} images")
+                                    st.rerun(scope="fragment")
                     except Exception as exc:
                         st.caption(f"Could not load references: {exc}")
+
+                _ref_viewer_fragment(picked_internal, ref_type, picked_product_display)
 
         st.markdown("---")
 
@@ -1173,34 +1193,6 @@ with tab_index:
                     if count > 0:
                         type_detail = f"pack={pack_c}" + (f", box={box_c}" if box_c > 0 else "")
                         st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{brand_idx}.{prod_idx} **{name}** -- {count} refs ({type_detail})")
-                        for ref_type in ("pack", "box"):
-                            with st.expander(f"View {name} {ref_type} references", expanded=False):
-                                try:
-                                    ref_data = _fetch_reference_listing(internal, ref_type)
-                                    if ref_data and ref_data.get("filenames"):
-                                        fnames = ref_data["filenames"][:20]
-                                        cols = st.columns(min(5, len(fnames)))
-                                        for img_idx, fname in enumerate(fnames):
-                                            with cols[img_idx % len(cols)]:
-                                                img_bytes = _fetch_reference_image_bytes(ref_type, fname)
-                                                if img_bytes:
-                                                    st.image(img_bytes, caption=fname, width=120)
-                                                if st.button("Delete", key=f"brand_del_{ref_type}_{fname}", type="secondary"):
-                                                    try:
-                                                        del_resp = requests.delete(f"{BACKEND_URL}/reference-image/{ref_type}/{fname}", timeout=5)
-                                                        del_resp.raise_for_status()
-                                                        _fetch_reference_listing.clear()
-                                                        _fetch_reference_image_bytes.clear()
-                                                        _fetch_brand_hierarchy.clear()
-                                                        st.rerun()
-                                                    except Exception as exc:
-                                                        st.error(f"Delete failed: {exc}")
-                                        if len(ref_data["filenames"]) > 20:
-                                            st.caption(f"... and {len(ref_data['filenames']) - 20} more")
-                                    else:
-                                        st.caption(f"No {ref_type} references")
-                                except Exception:
-                                    st.caption("Could not load images")
                     else:
                         st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{brand_idx}.{prod_idx} ~~{name}~~ -- missing `(need: pack/{internal}_1.jpg)`")
 
