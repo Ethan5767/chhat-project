@@ -28,6 +28,8 @@ try:
         load_classifier,
         load_rfdetr,
         reload_rfdetr,
+        reload_classifiers,
+        reload_dino,
         run_pipeline,
         classify_embeddings,
         _detect_brands_from_image,
@@ -49,6 +51,8 @@ except ImportError:
         load_classifier,
         load_rfdetr,
         reload_rfdetr,
+        reload_classifiers,
+        reload_dino,
         run_pipeline,
         classify_embeddings,
         _detect_brands_from_image,
@@ -1547,6 +1551,19 @@ def _run_training_job(job_id: str, script: str, args: list[str]):
                     print(f"[train] RF-DETR model hot-reloaded after training (job {job_id[:8]})")
                 except Exception as exc:
                     print(f"[train] WARNING: Failed to hot-reload RF-DETR: {exc}")
+            elif model_type == "classifier":
+                try:
+                    reload_classifiers()
+                    print(f"[train] Brand classifiers hot-reloaded after training (job {job_id[:8]})")
+                except Exception as exc:
+                    print(f"[train] WARNING: Failed to hot-reload classifiers: {exc}")
+            elif model_type == "dinov2_finetune":
+                try:
+                    reload_dino()
+                    reload_classifiers()
+                    print(f"[train] DINOv2 + classifiers hot-reloaded after fine-tuning (job {job_id[:8]})")
+                except Exception as exc:
+                    print(f"[train] WARNING: Failed to hot-reload DINOv2: {exc}")
 
             with jobs_lock:
                 job = jobs.get(job_id)

@@ -188,6 +188,31 @@ def reload_rfdetr():
     return load_rfdetr()
 
 
+def reload_classifiers():
+    """Force-reload all brand classifiers. Call after classifier or DINOv2 training."""
+    global _classifiers, _brand_classifier, _class_mapping
+    _classifiers = {}
+    _brand_classifier = None
+    _class_mapping = None
+    device = get_device()
+    for pkg_type in PACKAGING_TYPES:
+        try:
+            load_classifier(device, packaging_type=pkg_type)
+        except FileNotFoundError:
+            pass
+    logger.info("Brand classifiers reloaded")
+
+
+def reload_dino():
+    """Force-reload DINOv2 backbone. Call after DINOv2 fine-tuning."""
+    global _dino_processor, _dino_model
+    _dino_processor = None
+    _dino_model = None
+    device = get_device()
+    load_dino(device)
+    logger.info("DINOv2 model reloaded")
+
+
 def load_ocr():
     """Load EasyOCR reader (English). Cached after first call."""
     global _ocr_reader
