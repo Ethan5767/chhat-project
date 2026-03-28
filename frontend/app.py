@@ -581,6 +581,63 @@ with tab_batch:
                         _show_result_preview(result_df)
                 except Exception:
                     pass
+
+    # ── Batch Processing History ──
+    st.markdown("---")
+    st.markdown("##### Processing History")
+    try:
+        hist_resp = requests.get(f"{BACKEND_URL}/batch-history", params={"limit": 20}, timeout=5)
+        if hist_resp.status_code == 200:
+            hist_jobs = hist_resp.json().get("jobs", [])
+            if hist_jobs:
+                for hj in hist_jobs:
+                    job_id = hj.get("job_id", "?")
+                    fname = hj.get("filename", "unknown")
+                    status = hj.get("status", "?")
+                    rows = hj.get("rows")
+                    start = hj.get("start_time", "")[:19].replace("T", " ")
+                    end = hj.get("end_time", "")[:19].replace("T", " ") if hj.get("end_time") else ""
+
+                    # Status indicator
+                    if status == "done":
+                        icon = "[OK]"
+                    elif status == "running":
+                        icon = "[...]"
+                    elif "error" in status:
+                        icon = "[!]"
+                    else:
+                        icon = "[?]"
+
+                    row_info = f" -- {rows} rows" if rows else ""
+                    time_info = f" ({start})" if start else ""
+
+                    col_info, col_dl = st.columns([3, 1])
+                    with col_info:
+                        st.caption(f"{icon} **{fname}**{row_info}{time_info}")
+                        if status == "running":
+                            st.caption("Processing...")
+                        elif hj.get("error"):
+                            with st.expander("Error details"):
+                                st.code(hj["error"][:500])
+                    with col_dl:
+                        if hj.get("result_file") or status == "done":
+                            try:
+                                dl = requests.get(f"{BACKEND_URL}/download/{job_id}", timeout=10)
+                                if dl.status_code == 200:
+                                    st.download_button(
+                                        "Download",
+                                        data=dl.content,
+                                        file_name=hj.get("result_file", f"{job_id}_results.csv"),
+                                        mime="text/csv",
+                                        key=f"hist_dl_{job_id}",
+                                    )
+                            except Exception:
+                                st.caption("unavailable")
+            else:
+                st.caption("No batch jobs yet.")
+    except Exception:
+        st.caption("Could not load history.")
+
     st.markdown("</div>", unsafe_allow_html=True)
 
 # ════════════════════════════════════════════════════════
