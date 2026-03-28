@@ -31,6 +31,7 @@ try:
         _aggregate_to_products,
         MIN_OUTPUT_CONFIDENCE,
         RFDETR_CONF_THRESHOLD,
+        PACKAGING_TYPES,
     )
 except ImportError:
     from pipeline import (
@@ -50,6 +51,7 @@ except ImportError:
         _aggregate_to_products,
         MIN_OUTPUT_CONFIDENCE,
         RFDETR_CONF_THRESHOLD,
+        PACKAGING_TYPES,
     )
 
 app = FastAPI(title="Local Cigarette Brand Detector")
@@ -300,6 +302,7 @@ async def detect_single(image_file: UploadFile = File(...)):
     has_detections = detections is not None and len(detections) > 0
 
     if has_detections:
+        class_ids = detections.class_id if hasattr(detections, "class_id") and detections.class_id is not None else None
         for i, (box, conf) in enumerate(zip(detections.xyxy, detections.confidence)):
             x1, y1, x2, y2 = [int(v) for v in box]
             bw, bh = x2 - x1, y2 - y1
@@ -311,9 +314,13 @@ async def detect_single(image_file: UploadFile = File(...)):
             if x2 <= x1 or y2 <= y1:
                 continue
             crops.append(pil_img.crop((x1, y1, x2, y2)))
+            pkg_type = "pack"
+            if class_ids is not None and len(class_ids) > i:
+                pkg_type = "box" if int(class_ids[i]) == 1 else "pack"
             boxes_data.append({
                 "x1": x1, "y1": y1, "x2": x2, "y2": y2,
                 "det_conf": round(float(conf), 3),
+                "packaging_type": pkg_type,
                 "brands": [],
                 "ocr_texts": [],
                 "ocr_brand_scores": [],
@@ -324,14 +331,33 @@ async def detect_single(image_file: UploadFile = File(...)):
             "x1": 0, "y1": 0, "x2": img_w, "y2": img_h,
             "det_conf": 0.0,
             "is_full_image": True,
+            "packaging_type": "pack",
             "brands": [],
             "ocr_texts": [],
             "ocr_brand_scores": [],
         })
 
-    # Classify all crops
+    # Classify crops grouped by packaging type
     all_vecs = embed_images_batch(crops, processor, model, device)
-    all_cls_results = classify_embeddings(all_vecs, device, top_k=CLASSIFIER_TOP_K)
+    crop_pkg_types = [b.get("packaging_type", "pack") for b in boxes_data]
+
+    type_indices: dict[str, list[int]] = {}
+    for idx, pkg_type in enumerate(crop_pkg_types):
+        type_indices.setdefault(pkg_type, []).append(idx)
+
+    all_cls_results: list[list[tuple[str, float]]] = [[] for _ in crops]
+    for pkg_type, indices in type_indices.items():
+        try:
+            type_vecs = all_vecs[indices]
+            type_results = classify_embeddings(type_vecs, device, top_k=CLASSIFIER_TOP_K, packaging_type=pkg_type)
+            for local_idx, global_idx in enumerate(indices):
+                all_cls_results[global_idx] = type_results[local_idx]
+        except FileNotFoundError:
+            # Fall back to pack classifier
+            type_vecs = all_vecs[indices]
+            type_results = classify_embeddings(type_vecs, device, top_k=CLASSIFIER_TOP_K, packaging_type="pack")
+            for local_idx, global_idx in enumerate(indices):
+                all_cls_results[global_idx] = type_results[local_idx]
 
     all_brand_scores = {}
 
@@ -658,6 +684,7 @@ async def generate_crops(image_file: UploadFile = File(...)):
     crop_meta = []
     if detections is not None and len(detections) > 0:
         width, height = pil_img.size
+        class_ids = detections.class_id if hasattr(detections, "class_id") and detections.class_id is not None else None
         for i, (box, conf) in enumerate(zip(detections.xyxy, detections.confidence)):
             x1, y1, x2, y2 = [int(v) for v in box]
             bw, bh = x2 - x1, y2 - y1
@@ -668,23 +695,38 @@ async def generate_crops(image_file: UploadFile = File(...)):
                 continue
             crop = pil_img.crop((x1, y1, x2, y2))
             crop_images.append(crop)
-            crop_meta.append({"index": i, "w": x2 - x1, "h": y2 - y1, "conf": float(conf)})
+            pkg_type = "pack"
+            if class_ids is not None and len(class_ids) > i:
+                pkg_type = "box" if int(class_ids[i]) == 1 else "pack"
+            crop_meta.append({"index": i, "w": x2 - x1, "h": y2 - y1, "conf": float(conf), "packaging_type": pkg_type})
 
-    # Classify all crops at once
     suggested_labels = []
     if crop_images:
         try:
             processor, model = load_dino(device)
-            _, labels = load_index()
 
             vecs = embed_images_batch(crop_images, processor, model, device)
-            cls_results = classify_embeddings(vecs, device, top_k=3)
 
-            for crop_idx, crop in enumerate(crop_images):
-                top_pred = cls_results[crop_idx][0] if cls_results[crop_idx] else ("unknown", 0.0)
+            # Group by packaging type for classification
+            type_indices: dict[str, list[int]] = {}
+            for idx, meta in enumerate(crop_meta):
+                pkg = meta["packaging_type"]
+                type_indices.setdefault(pkg, []).append(idx)
+
+            per_crop_results: list[tuple[str, float]] = [("unknown", 0.0)] * len(crop_images)
+            for pkg_type, indices in type_indices.items():
+                try:
+                    type_vecs = vecs[indices]
+                    cls_results = classify_embeddings(type_vecs, device, top_k=3, packaging_type=pkg_type)
+                    for local_idx, global_idx in enumerate(indices):
+                        if cls_results[local_idx]:
+                            per_crop_results[global_idx] = cls_results[local_idx][0]
+                except FileNotFoundError:
+                    pass  # No classifier for this type yet
+
+            for crop_idx, top_pred in enumerate(per_crop_results):
                 internal_name = resolve_internal_name(top_pred[0])
                 cls_conf = top_pred[1]
-
                 brand = get_brand(internal_name)
                 suggested_labels.append({
                     "internal_name": internal_name,
@@ -707,6 +749,7 @@ async def generate_crops(image_file: UploadFile = File(...)):
             "width": meta["w"],
             "height": meta["h"],
             "det_conf": round(meta["conf"], 3),
+            "packaging_type": meta["packaging_type"],
             "suggested_brand": suggestion.get("brand", ""),
             "suggested_product": suggestion.get("internal_name", ""),
             "suggested_confidence": suggestion.get("confidence", 0.0),
@@ -716,10 +759,16 @@ async def generate_crops(image_file: UploadFile = File(...)):
 
 
 @app.post("/add-reference")
-async def add_reference(image_file: UploadFile = File(...), product_name: str = Form(...)):
-    """Add a confirmed crop as a reference image for a specific product."""
+async def add_reference(
+    image_file: UploadFile = File(...),
+    product_name: str = Form(...),
+    packaging_type: str = Form("pack"),
+):
+    """Add a confirmed crop as a reference image for a specific product and packaging type."""
     if not product_name:
         raise HTTPException(status_code=400, detail="product_name is required.")
+    if packaging_type not in ("pack", "box"):
+        raise HTTPException(status_code=400, detail="packaging_type must be 'pack' or 'box'.")
 
     try:
         from .brand_registry import BRAND_REGISTRY
@@ -745,12 +794,11 @@ async def add_reference(image_file: UploadFile = File(...), product_name: str = 
     except Exception:
         raise HTTPException(status_code=400, detail="Could not open image.")
 
-    REFERENCES_DIR = _BACKEND_ROOT / "references"
-    REFERENCES_DIR.mkdir(parents=True, exist_ok=True)
+    TYPE_DIR = _BACKEND_ROOT / "references" / packaging_type
+    TYPE_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Find next index
     import re
-    existing = list(REFERENCES_DIR.glob(f"{product_name}_*.*"))
+    existing = list(TYPE_DIR.glob(f"{product_name}_*.*"))
     max_idx = 0
     for p in existing:
         match = re.search(r"_(\d+)$", p.stem)
@@ -758,12 +806,13 @@ async def add_reference(image_file: UploadFile = File(...), product_name: str = 
             max_idx = max(max_idx, int(match.group(1)))
     next_idx = max_idx + 1
 
-    save_path = REFERENCES_DIR / f"{product_name}_{next_idx}.jpg"
+    save_path = TYPE_DIR / f"{product_name}_{next_idx}.jpg"
     save_path.write_bytes(data)
 
     return {
         "status": "added",
         "product": product_name,
+        "packaging_type": packaging_type,
         "filename": save_path.name,
         "total_for_product": next_idx,
     }
@@ -771,7 +820,7 @@ async def add_reference(image_file: UploadFile = File(...), product_name: str = 
 
 @app.get("/brand-registry")
 def get_brand_registry():
-    """Return the full brand->products hierarchy."""
+    """Return the full brand->products hierarchy with per-type reference counts."""
     try:
         from .brand_registry import BRAND_REGISTRY, audit_references
     except ImportError:
@@ -783,11 +832,16 @@ def get_brand_registry():
     for brand, products in BRAND_REGISTRY.items():
         hierarchy[brand] = []
         for display_name, internal_name in products:
-            count = audit["found"].get(internal_name, 0)
+            found_entry = audit["found"].get(internal_name, {})
+            # found_entry is now {pkg_type: count} dict
+            pack_count = found_entry.get("pack", 0) if isinstance(found_entry, dict) else found_entry
+            box_count = found_entry.get("box", 0) if isinstance(found_entry, dict) else 0
             hierarchy[brand].append({
                 "display_name": display_name,
                 "internal_name": internal_name,
-                "reference_count": count,
+                "reference_count": pack_count + box_count,
+                "pack_count": pack_count,
+                "box_count": box_count,
             })
 
     return {
@@ -797,34 +851,79 @@ def get_brand_registry():
         "products_with_refs": audit.get("total_products_found", len(audit.get("found", {}))),
         "products_missing": audit.get("total_products_missing", len(audit.get("missing", []))),
         "total_images": audit.get("total_images", 0),
+        "per_type": audit.get("per_type", {}),
     }
 
 
-@app.get("/reference-image/{filename}")
-def get_reference_image(filename: str):
-    """Serve a reference image by filename."""
-    REFERENCES_DIR = _BACKEND_ROOT / "references"
+@app.get("/reference-image/{packaging_type}/{filename}")
+def get_reference_image(packaging_type: str, filename: str):
+    """Serve a reference image by packaging type and filename."""
+    if packaging_type not in ("pack", "box"):
+        raise HTTPException(status_code=400, detail="packaging_type must be 'pack' or 'box'")
+    REFERENCES_DIR = _BACKEND_ROOT / "references" / packaging_type
     path = REFERENCES_DIR / filename
     if not path.exists() or not path.is_file():
         raise HTTPException(status_code=404, detail="Image not found")
     return FileResponse(str(path), media_type="image/jpeg")
 
 
+@app.delete("/reference-image/{packaging_type}/{filename}")
+def delete_reference_image(packaging_type: str, filename: str):
+    """Delete a reference image by packaging type and filename."""
+    if packaging_type not in ("pack", "box"):
+        raise HTTPException(status_code=400, detail="packaging_type must be 'pack' or 'box'")
+    REFERENCES_DIR = _BACKEND_ROOT / "references" / packaging_type
+    path = REFERENCES_DIR / filename
+    if not path.exists() or not path.is_file():
+        raise HTTPException(status_code=404, detail="Image not found")
+    if not path.resolve().parent == REFERENCES_DIR.resolve():
+        raise HTTPException(status_code=400, detail="Invalid path")
+    path.unlink()
+    return {"status": "deleted", "packaging_type": packaging_type, "filename": filename}
+
+
 @app.get("/reference-images/{product_name}")
-def list_reference_images(product_name: str):
-    """List all reference image filenames for a product."""
-    import re as re_mod
-    REFERENCES_DIR = _BACKEND_ROOT / "references"
-    files = sorted(REFERENCES_DIR.glob(f"{product_name}_*.*"))
+def list_reference_images(product_name: str, packaging_type: str = "pack"):
+    """List all reference image filenames for a product in a packaging type subfolder."""
+    if packaging_type not in ("pack", "box"):
+        raise HTTPException(status_code=400, detail="packaging_type must be 'pack' or 'box'")
+    REFERENCES_DIR = _BACKEND_ROOT / "references" / packaging_type
+    files = sorted(REFERENCES_DIR.glob(f"{product_name}_*.*")) if REFERENCES_DIR.exists() else []
     return {
         "product": product_name,
+        "packaging_type": packaging_type,
         "count": len(files),
         "filenames": [f.name for f in files],
     }
 
 
+@app.get("/dataset-status")
+def dataset_status():
+    """Check if COCO dataset splits exist for RF-DETR training."""
+    ds_root = _BACKEND_ROOT.parent / "datasets" / "cigarette_packs"
+    splits = {}
+    for split in ("train", "valid", "test"):
+        ann = ds_root / split / "_annotations.coco.json"
+        if ann.exists():
+            import json as json_mod
+            try:
+                data = json_mod.loads(ann.read_text(encoding="utf-8"))
+                splits[split] = {
+                    "exists": True,
+                    "images": len(data.get("images", [])),
+                    "annotations": len(data.get("annotations", [])),
+                }
+            except Exception:
+                splits[split] = {"exists": True, "images": 0, "annotations": 0}
+        else:
+            splits[split] = {"exists": False, "images": 0, "annotations": 0}
+    ready = splits.get("train", {}).get("exists", False) and splits.get("valid", {}).get("exists", False)
+    return {"ready": ready, "splits": splits}
+
+
 _TRAINING_PROGRESS_DIR = _BACKEND_ROOT.parent
 _training_jobs: dict[str, dict] = {}
+_training_processes: dict[str, object] = {}
 _training_lock = threading.Lock()
 _TRAINING_HISTORY_PATH = _BACKEND_ROOT / "training_history.json"
 _MODEL_REGISTRY_PATH = _BACKEND_ROOT / "model_registry.json"
@@ -1038,6 +1137,9 @@ def _run_training_job(job_id: str, script: str, args: list[str]):
             full_args, cwd=str(_TRAINING_PROGRESS_DIR),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
         )
+        with _training_lock:
+            _training_processes[job_id] = process
+            _training_jobs[job_id]["pid"] = process.pid
 
         # Poll progress file while process runs
         while process.poll() is None:
@@ -1120,6 +1222,22 @@ def _run_training_job(job_id: str, script: str, args: list[str]):
             })
         else:
             with _training_lock:
+                stop_requested = bool(_training_jobs.get(job_id, {}).get("stop_requested"))
+            if stop_requested:
+                with _training_lock:
+                    _training_jobs[job_id]["status"] = "stopped"
+                    _training_jobs[job_id]["error"] = None
+                    _training_jobs[job_id]["end_time"] = _now_iso()
+                _update_training_history(job_id, {
+                    "status": "stopped",
+                    "end_time": _now_iso(),
+                })
+                _update_model_registry(job_id, {
+                    "status": "stopped",
+                    "end_time": _now_iso(),
+                })
+                return
+            with _training_lock:
                 _training_jobs[job_id]["status"] = "error"
                 _training_jobs[job_id]["error"] = stdout[-2000:]
                 _training_jobs[job_id]["end_time"] = _now_iso()
@@ -1158,6 +1276,9 @@ def _run_training_job(job_id: str, script: str, args: list[str]):
             "error": err,
             "end_time": _now_iso(),
         })
+    finally:
+        with _training_lock:
+            _training_processes.pop(job_id, None)
 
 
 @app.post("/train-classifier")
@@ -1373,6 +1494,37 @@ def training_status(job_id: str):
         if job_id in _training_jobs:
             return _training_jobs[job_id]
     raise HTTPException(status_code=404, detail="Training job not found")
+
+
+@app.post("/training-stop/{job_id}")
+def training_stop(job_id: str):
+    """Stop a running training job by terminating its subprocess."""
+    with _training_lock:
+        job = _training_jobs.get(job_id)
+        process = _training_processes.get(job_id)
+        if not job:
+            raise HTTPException(status_code=404, detail="Training job not found")
+        status = job.get("status", "")
+        if status not in ("queued", "running", "stopping"):
+            return {"job_id": job_id, "status": status, "message": "Job is not running."}
+        job["stop_requested"] = True
+        job["status"] = "stopping"
+        job["last_update"] = _now_iso()
+
+    if process is None:
+        with _training_lock:
+            _training_jobs[job_id]["status"] = "stopped"
+            _training_jobs[job_id]["end_time"] = _now_iso()
+        _update_training_history(job_id, {"status": "stopped", "end_time": _now_iso()})
+        _update_model_registry(job_id, {"status": "stopped", "end_time": _now_iso()})
+        return {"job_id": job_id, "status": "stopped", "message": "Queued job cancelled."}
+
+    try:
+        process.terminate()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to terminate process: {exc}")
+
+    return {"job_id": job_id, "status": "stopping", "message": "Termination requested."}
 
 
 @app.get("/training-progress/{job_id}")
