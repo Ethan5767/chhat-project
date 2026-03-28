@@ -63,6 +63,7 @@ UPLOADS_DIR = _BACKEND_ROOT / "uploads"
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR = UPLOADS_DIR / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+_BATCH_HISTORY_PATH = _BACKEND_ROOT / "batch_history.json"
 
 jobs_lock = threading.Lock()
 jobs: dict[str, dict] = {}
@@ -90,6 +91,29 @@ def _load_result_meta(job_id: str) -> Path | None:
         return path if path.exists() else None
     except Exception:
         return None
+
+
+def _load_batch_history() -> list[dict]:
+    if not _BATCH_HISTORY_PATH.exists():
+        return []
+    try:
+        return json.loads(_BATCH_HISTORY_PATH.read_text(encoding="utf-8"))
+    except Exception:
+        return []
+
+
+def _append_batch_history(entry: dict) -> None:
+    rows = _load_batch_history()
+    rows.append(entry)
+    _BATCH_HISTORY_PATH.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _update_batch_history(job_id: str, updates: dict) -> None:
+    rows = _load_batch_history()
+    for row in rows:
+        if row.get("job_id") == job_id:
+            row.update(updates)
+    _BATCH_HISTORY_PATH.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def create_job() -> str:
@@ -127,6 +151,16 @@ def run_build_index_job(job_id: str):
 
 
 def run_pipeline_job(job_id: str, csv_path: Path):
+    start_time = datetime.now(timezone.utc).isoformat()
+    _append_batch_history({
+        "job_id": job_id,
+        "filename": csv_path.name,
+        "status": "running",
+        "start_time": start_time,
+        "end_time": None,
+        "rows": None,
+        "error": None,
+    })
     try:
         out_path = run_pipeline(
             csv_path,
@@ -135,6 +169,19 @@ def run_pipeline_job(job_id: str, csv_path: Path):
         job_out_path = RESULTS_DIR / f"{job_id}_{out_path.name}"
         out_path.replace(job_out_path)
         _save_result_meta(job_id, job_out_path)
+        # Count rows in result
+        try:
+            import pandas as pd
+            result_df = pd.read_csv(job_out_path)
+            row_count = len(result_df)
+        except Exception:
+            row_count = None
+        _update_batch_history(job_id, {
+            "status": "done",
+            "end_time": datetime.now(timezone.utc).isoformat(),
+            "rows": row_count,
+            "result_file": job_out_path.name,
+        })
         with jobs_lock:
             jobs[job_id]["status"] = "done"
             jobs[job_id]["result"] = str(job_out_path)
@@ -145,11 +192,22 @@ def run_pipeline_job(job_id: str, csv_path: Path):
             job_out_path = RESULTS_DIR / f"{job_id}_{partial_path.name}"
             partial_path.replace(job_out_path)
             _save_result_meta(job_id, job_out_path)
+            _update_batch_history(job_id, {
+                "status": "error_partial",
+                "end_time": datetime.now(timezone.utc).isoformat(),
+                "error": str(err)[:500],
+                "result_file": job_out_path.name,
+            })
             with jobs_lock:
                 jobs[job_id]["status"] = "error"
                 jobs[job_id]["error"] = err
                 jobs[job_id]["result"] = str(job_out_path)
         else:
+            _update_batch_history(job_id, {
+                "status": "error",
+                "end_time": datetime.now(timezone.utc).isoformat(),
+                "error": str(err)[:500],
+            })
             with jobs_lock:
                 jobs[job_id]["status"] = "error"
                 jobs[job_id]["error"] = err
@@ -235,6 +293,15 @@ def download_endpoint(job_id: str):
     if not path.exists():
         raise HTTPException(status_code=404, detail="Result file missing.")
     return FileResponse(path=str(path), filename=path.name, media_type="text/csv")
+
+
+@app.get("/batch-history")
+def batch_history(limit: int = 50):
+    """List past batch processing jobs with status and download info."""
+    rows = _load_batch_history()
+    # Most recent first
+    rows = list(reversed(rows))[:limit]
+    return {"jobs": rows}
 
 
 @app.get("/index-status")
