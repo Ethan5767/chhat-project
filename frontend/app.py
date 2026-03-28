@@ -1212,14 +1212,12 @@ with tab_label:
                 product_internals = {}
                 selected_product = ""
 
-                # Packaging type selector (default from RF-DETR detection)
-                detected_type = crop.get("packaging_type", "pack")
+                # Packaging type: default pack for label training (most refs are pack); RF-DETR hint shown on image
                 type_options = ["pack", "box"]
-                default_type_idx = type_options.index(detected_type) if detected_type in type_options else 0
                 selected_type = st.radio(
                     "Type",
                     options=type_options,
-                    index=default_type_idx,
+                    index=0,
                     key=f"{crop_key}_type",
                     horizontal=True,
                 )
