@@ -1331,16 +1331,13 @@ with tab_train:
         st.session_state["cls_lr"] = 0.001
         st.session_state["cls_batch"] = 64
         st.session_state["cls_embed_batch"] = 8
-        st.session_state["rfdetr_epochs"] = 50
-        st.session_state["rfdetr_lr"] = 0.0001
-        st.session_state["rfdetr_batch"] = 4
         st.session_state["dino_epochs"] = 30
         st.session_state["dino_lr"] = 0.00001
         st.session_state["dino_layers"] = 4
         st.session_state["dino_batch"] = 8
         st.rerun()
 
-    train_col1, train_col2, train_col3 = st.columns(3)
+    train_col1, train_col2 = st.columns(2)
 
     # --- Brand Classifier (frozen DINOv2 + MLP) ---
     with train_col1:
@@ -1388,99 +1385,8 @@ with tab_train:
             except Exception as exc:
                 st.error(f"Failed to start: {exc}")
 
-    # --- RF-DETR Detection ---
-    with train_col2:
-        st.markdown("##### RF-DETR Detection")
-        st.caption("Fine-tune pack/box detector. GPU recommended.")
-        st.caption("Recommended: epochs=50, lr=0.0001, batch=4")
-
-        # Show dataset status
-        _rfdetr_ds_ready = False
-        try:
-            ds_resp = requests.get(f"{BACKEND_URL}/dataset-status", timeout=5)
-            if ds_resp.status_code == 200:
-                ds_info = ds_resp.json()
-                if ds_info["ready"]:
-                    splits = ds_info["splits"]
-                    train_ct = splits.get("train", {}).get("images", 0)
-                    valid_ct = splits.get("valid", {}).get("images", 0)
-                    st.caption(f"Dataset: {train_ct} train / {valid_ct} valid images")
-                    _rfdetr_ds_ready = True
-        except Exception:
-            pass
-
-        rfdetr_epochs = st.number_input("Epochs", value=50, min_value=5, max_value=200, key="rfdetr_epochs")
-        rfdetr_lr = st.number_input("Learning rate", value=0.0001, format="%.5f", key="rfdetr_lr")
-        rfdetr_batch = st.number_input("Batch size", value=4, min_value=1, max_value=16, key="rfdetr_batch")
-
-        # Roboflow URL input (always visible)
-        rfdetr_url = st.text_input(
-            "Roboflow dataset URL (optional -- downloads fresh data before training)",
-            value="",
-            placeholder="https://app.roboflow.com/ds/xxxxx?key=yyyyy",
-            key="rfdetr_url",
-        )
-        rfdetr_clean = st.checkbox(
-            "Clean existing dataset before download",
-            value=True,
-            key="rfdetr_clean_dataset",
-        )
-
-        # Single button: download (if URL provided) + start training
-        can_train = _rfdetr_ds_ready or rfdetr_url.strip()
-        if not can_train:
-            st.warning("No dataset found. Provide a Roboflow URL or upload COCO data first.")
-
-        if st.button("Start RF-DETR Training", type="primary", key="btn_train_rfdetr", disabled=not can_train):
-            try:
-                # Step 1: Download dataset if URL provided
-                if rfdetr_url.strip():
-                    with st.spinner("Downloading dataset from Roboflow..."):
-                        dl_resp = requests.post(
-                            f"{BACKEND_URL}/download-roboflow-coco",
-                            data={"url": rfdetr_url.strip(), "clean": str(rfdetr_clean).lower()},
-                            timeout=300,
-                        )
-                        dl_resp.raise_for_status()
-                        dl_result = dl_resp.json()
-                        st.caption(
-                            f"Downloaded: {dl_result.get('images', 0)} images, "
-                            f"{dl_result.get('annotations', 0)} annotations "
-                            f"({', '.join(dl_result.get('splits', [])) or 'train'})"
-                        )
-
-                # Step 2: Start training
-                with st.spinner("Starting RF-DETR training..."):
-                    resp = requests.post(
-                        f"{BACKEND_URL}/train-rfdetr",
-                        params={
-                            "epochs": rfdetr_epochs,
-                            "lr": rfdetr_lr,
-                            "batch_size": rfdetr_batch,
-                            "version": training_version,
-                        },
-                        timeout=30,
-                    )
-                    resp.raise_for_status()
-                    result = resp.json()
-
-                if result.get("skipped"):
-                    st.warning(
-                        f"Skipped: same dataset/settings already trained for {training_version} "
-                        f"(job: {str(result.get('existing_job_id', ''))[:8]}...). "
-                        f"Change settings or use force=True."
-                    )
-                else:
-                    st.session_state["train_rfdetr_job"] = result["job_id"]
-                    st.success(f"Training started (job: {result['job_id'][:8]}...)")
-
-            except requests.exceptions.Timeout:
-                st.error("Request timed out. The dataset download may still be running -- check server logs.")
-            except Exception as exc:
-                st.error(f"Failed: {exc}")
-
     # --- DINOv2 Fine-tune ---
-    with train_col3:
+    with train_col2:
         st.markdown("##### DINOv2 Fine-tune")
         st.caption("Unfreeze DINOv2 layers. Needs 16GB+ VRAM.")
         st.caption("Recommended: epochs=30, lr=1e-5, unfreeze_layers=4, batch=8")
