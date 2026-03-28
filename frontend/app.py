@@ -1393,10 +1393,11 @@ with tab_train:
     # --- RF-DETR Detection ---
     with train_col2:
         st.markdown("##### RF-DETR Detection")
-        st.caption("Fine-tune pack detector. GPU recommended.")
+        st.caption("Fine-tune pack/box detector. GPU recommended.")
         st.caption("Recommended: epochs=50, lr=0.0001, batch=4")
 
         # Show dataset status
+        _rfdetr_ds_ready = False
         try:
             ds_resp = requests.get(f"{BACKEND_URL}/dataset-status", timeout=5)
             if ds_resp.status_code == 200:
@@ -1406,93 +1407,79 @@ with tab_train:
                     train_ct = splits.get("train", {}).get("images", 0)
                     valid_ct = splits.get("valid", {}).get("images", 0)
                     st.caption(f"Dataset: {train_ct} train / {valid_ct} valid images")
-                else:
-                    st.warning("No dataset found. Provide a Roboflow URL or upload COCO data first.")
+                    _rfdetr_ds_ready = True
         except Exception:
             pass
 
         rfdetr_epochs = st.number_input("Epochs", value=50, min_value=5, max_value=200, key="rfdetr_epochs")
         rfdetr_lr = st.number_input("Learning rate", value=0.0001, format="%.5f", key="rfdetr_lr")
         rfdetr_batch = st.number_input("Batch size", value=4, min_value=1, max_value=16, key="rfdetr_batch")
-        if "show_rfdetr_url_prompt" not in st.session_state:
-            st.session_state["show_rfdetr_url_prompt"] = False
-        if "rfdetr_dataset_ready" not in st.session_state:
-            st.session_state["rfdetr_dataset_ready"] = None
 
-        if st.button("Train RF-DETR", type="primary", key="btn_train_rfdetr"):
-            st.session_state["show_rfdetr_url_prompt"] = True
+        # Roboflow URL input (always visible)
+        rfdetr_url = st.text_input(
+            "Roboflow dataset URL (optional -- downloads fresh data before training)",
+            value="",
+            placeholder="https://app.roboflow.com/ds/xxxxx?key=yyyyy",
+            key="rfdetr_url",
+        )
+        rfdetr_clean = st.checkbox(
+            "Clean existing dataset before download",
+            value=True,
+            key="rfdetr_clean_dataset",
+        )
 
-        if st.session_state.get("show_rfdetr_url_prompt", False):
-            st.markdown("**Dataset source (required)**")
-            rfdetr_url = st.text_input(
-                "Roboflow raw dataset URL",
-                value=st.session_state.get("rfdetr_url", ""),
-                placeholder="https://app.roboflow.com/ds/xxxxx?key=yyyyy",
-                key="rfdetr_url",
-            )
-            rfdetr_clean = st.checkbox(
-                "Clean existing dataset before download",
-                value=True,
-                key="rfdetr_clean_dataset",
-            )
-            confirm_col, cancel_col = st.columns(2)
-            do_prepare = confirm_col.button("Prepare Dataset", key="btn_train_rfdetr_prepare")
-            do_cancel = cancel_col.button("Cancel", key="btn_train_rfdetr_cancel")
-            if do_cancel:
-                st.session_state["show_rfdetr_url_prompt"] = False
-                st.session_state["rfdetr_dataset_ready"] = None
-                st.rerun()
-            if do_prepare:
-                if not rfdetr_url.strip():
-                    st.error("Please paste a Roboflow URL first.")
-                else:
-                    try:
-                        resp = requests.post(
+        # Single button: download (if URL provided) + start training
+        can_train = _rfdetr_ds_ready or rfdetr_url.strip()
+        if not can_train:
+            st.warning("No dataset found. Provide a Roboflow URL or upload COCO data first.")
+
+        if st.button("Start RF-DETR Training", type="primary", key="btn_train_rfdetr", disabled=not can_train):
+            try:
+                # Step 1: Download dataset if URL provided
+                if rfdetr_url.strip():
+                    with st.spinner("Downloading dataset from Roboflow..."):
+                        dl_resp = requests.post(
                             f"{BACKEND_URL}/download-roboflow-coco",
                             data={"url": rfdetr_url.strip(), "clean": str(rfdetr_clean).lower()},
-                            timeout=240,
+                            timeout=300,
                         )
-                        resp.raise_for_status()
-                        result = resp.json()
-                        st.session_state["rfdetr_dataset_ready"] = result
-                        st.success("Dataset prepared successfully. Confirm to start RF-DETR training.")
+                        dl_resp.raise_for_status()
+                        dl_result = dl_resp.json()
                         st.caption(
-                            f"Prepared: {result.get('images', 0)} images, {result.get('annotations', 0)} annotations "
-                            f"({', '.join(result.get('splits', [])) or 'train'})"
+                            f"Downloaded: {dl_result.get('images', 0)} images, "
+                            f"{dl_result.get('annotations', 0)} annotations "
+                            f"({', '.join(dl_result.get('splits', [])) or 'train'})"
                         )
-                    except Exception as exc:
-                        st.session_state["rfdetr_dataset_ready"] = None
-                        st.error(f"Dataset preparation failed: {exc}")
 
-            ds_ready = st.session_state.get("rfdetr_dataset_ready")
-            if ds_ready:
-                st.info("Dataset is ready. Click confirm to run training.")
-                if st.button("Confirm and Start RF-DETR Training", key="btn_train_rfdetr_confirm_run"):
-                    try:
-                        resp = requests.post(
-                            f"{BACKEND_URL}/train-rfdetr",
-                            params={
-                                "epochs": rfdetr_epochs,
-                                "lr": rfdetr_lr,
-                                "batch_size": rfdetr_batch,
-                                "version": training_version,
-                            },
-                            timeout=30,
-                        )
-                        resp.raise_for_status()
-                        result = resp.json()
-                        if result.get("skipped"):
-                            st.warning(
-                                f"Skipped: same dataset/settings already trained for {training_version} "
-                                f"(job: {str(result.get('existing_job_id', ''))[:8]}...)."
-                            )
-                        else:
-                            st.session_state["train_rfdetr_job"] = result["job_id"]
-                            st.session_state["show_rfdetr_url_prompt"] = False
-                            st.session_state["rfdetr_dataset_ready"] = None
-                            st.success(f"Training started (job: {result['job_id'][:8]}...)")
-                    except Exception as exc:
-                        st.error(f"Failed to start training: {exc}")
+                # Step 2: Start training
+                with st.spinner("Starting RF-DETR training..."):
+                    resp = requests.post(
+                        f"{BACKEND_URL}/train-rfdetr",
+                        params={
+                            "epochs": rfdetr_epochs,
+                            "lr": rfdetr_lr,
+                            "batch_size": rfdetr_batch,
+                            "version": training_version,
+                        },
+                        timeout=30,
+                    )
+                    resp.raise_for_status()
+                    result = resp.json()
+
+                if result.get("skipped"):
+                    st.warning(
+                        f"Skipped: same dataset/settings already trained for {training_version} "
+                        f"(job: {str(result.get('existing_job_id', ''))[:8]}...). "
+                        f"Change settings or use force=True."
+                    )
+                else:
+                    st.session_state["train_rfdetr_job"] = result["job_id"]
+                    st.success(f"Training started (job: {result['job_id'][:8]}...)")
+
+            except requests.exceptions.Timeout:
+                st.error("Request timed out. The dataset download may still be running -- check server logs.")
+            except Exception as exc:
+                st.error(f"Failed: {exc}")
 
     # --- DINOv2 Fine-tune ---
     with train_col3:
