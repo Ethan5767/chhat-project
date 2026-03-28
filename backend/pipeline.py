@@ -26,6 +26,13 @@ PACKAGING_TYPES = ("pack", "box")
 CLASSIFIER_DIR = CLASSIFIER_BASE_DIR / "pack"
 CLASSIFIER_WEIGHTS = CLASSIFIER_DIR / "best_classifier.pth"
 CLASS_MAPPING_JSON = CLASSIFIER_DIR / "class_mapping.json"
+# Legacy flat layout (pre pack/box split): startup and endpoints use these paths
+if not (CLASSIFIER_WEIGHTS.exists() and CLASS_MAPPING_JSON.exists()):
+    _legacy_w = CLASSIFIER_BASE_DIR / "best_classifier.pth"
+    _legacy_m = CLASSIFIER_BASE_DIR / "class_mapping.json"
+    if _legacy_w.exists() and _legacy_m.exists():
+        CLASSIFIER_WEIGHTS = _legacy_w
+        CLASS_MAPPING_JSON = _legacy_m
 DINO_MODEL_ID = "facebook/dinov2-base"
 _PROJECT_ROOT = _BACKEND_ROOT.parent
 _RFDETR_CHECKPOINT_DIR = _PROJECT_ROOT / "runs"
