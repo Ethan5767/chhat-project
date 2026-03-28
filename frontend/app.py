@@ -155,10 +155,10 @@ def _show_result_preview(result_df: pd.DataFrame):
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def _fetch_reference_image_bytes(filename: str):
-    """Fetch reference image from backend on server side for public deployments."""
+def _fetch_reference_image_bytes(packaging_type: str, filename: str):
+    """Fetch reference image from backend."""
     try:
-        resp = requests.get(f"{BACKEND_URL}/reference-image/{filename}", timeout=10)
+        resp = requests.get(f"{BACKEND_URL}/reference-image/{packaging_type}/{filename}", timeout=10)
         resp.raise_for_status()
         return resp.content
     except Exception:
@@ -178,10 +178,10 @@ def _fetch_brand_hierarchy():
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def _fetch_reference_listing(internal_name: str):
+def _fetch_reference_listing(internal_name: str, packaging_type: str = "pack"):
     """Fetch reference image listing for a product, cached."""
     try:
-        resp = requests.get(f"{BACKEND_URL}/reference-images/{internal_name}", timeout=5)
+        resp = requests.get(f"{BACKEND_URL}/reference-images/{internal_name}?packaging_type={packaging_type}", timeout=5)
         if resp.status_code == 200:
             return resp.json()
     except Exception:
@@ -1059,19 +1059,30 @@ with tab_index:
                     picked_internal = p["internal_name"]
                     break
             if picked_internal:
-                with st.expander(f"Show references for {picked_product_display}", expanded=True):
+                ref_type = st.radio("Reference type", options=["pack", "box"], horizontal=True, key="ref_viewer_type")
+                with st.expander(f"Show {ref_type} references for {picked_product_display}", expanded=True):
                     try:
-                        ref_data = _fetch_reference_listing(picked_internal)
+                        ref_data = _fetch_reference_listing(picked_internal, ref_type)
                         filenames = ref_data.get("filenames", []) if ref_data else []
                         if filenames:
                             cols = st.columns(min(5, len(filenames)))
                             for img_idx, fname in enumerate(filenames):
                                 with cols[img_idx % len(cols)]:
-                                    img_bytes = _fetch_reference_image_bytes(fname)
+                                    img_bytes = _fetch_reference_image_bytes(ref_type, fname)
                                     if img_bytes:
                                         st.image(img_bytes, caption=fname, width=110)
+                                    if st.button("Delete", key=f"picker_del_{ref_type}_{fname}", type="secondary"):
+                                        try:
+                                            del_resp = requests.delete(f"{BACKEND_URL}/reference-image/{ref_type}/{fname}", timeout=5)
+                                            del_resp.raise_for_status()
+                                            _fetch_reference_listing.clear()
+                                            _fetch_reference_image_bytes.clear()
+                                            _fetch_brand_hierarchy.clear()
+                                            st.rerun()
+                                        except Exception as exc:
+                                            st.error(f"Delete failed: {exc}")
                         else:
-                            st.caption("No reference images yet for this product.")
+                            st.caption(f"No {ref_type} reference images yet for this product.")
                     except Exception as exc:
                         st.caption(f"Could not load references: {exc}")
 
@@ -1085,27 +1096,43 @@ with tab_index:
             with st.expander(f"{brand_idx}. {brand_name} -- {len(products)} products {status}", expanded=False):
                 for prod_idx, prod in enumerate(products, 1):
                     count = prod["reference_count"]
+                    pack_c = prod.get("pack_count", count)
+                    box_c = prod.get("box_count", 0)
                     name = prod["display_name"]
                     internal = prod["internal_name"]
                     if count > 0:
-                        st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{brand_idx}.{prod_idx} **{name}** -- {count} reference images")
-                        with st.expander(f"View {name} references", expanded=False):
-                            try:
-                                ref_resp = requests.get(f"{BACKEND_URL}/reference-images/{internal}", timeout=5)
-                                if ref_resp.status_code == 200:
-                                    ref_data = ref_resp.json()
-                                    cols = st.columns(min(5, len(ref_data["filenames"])))
-                                    for img_idx, fname in enumerate(ref_data["filenames"][:20]):
-                                        with cols[img_idx % len(cols)]:
-                                            img_bytes = _fetch_reference_image_bytes(fname)
-                                            if img_bytes:
-                                                st.image(img_bytes, caption=fname, width=120)
-                                    if len(ref_data["filenames"]) > 20:
-                                        st.caption(f"... and {len(ref_data['filenames']) - 20} more")
-                            except Exception:
-                                st.caption("Could not load images")
+                        type_detail = f"pack={pack_c}" + (f", box={box_c}" if box_c > 0 else "")
+                        st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{brand_idx}.{prod_idx} **{name}** -- {count} refs ({type_detail})")
+                        for ref_type in ("pack", "box"):
+                            with st.expander(f"View {name} {ref_type} references", expanded=False):
+                                try:
+                                    ref_data = _fetch_reference_listing(internal, ref_type)
+                                    if ref_data and ref_data.get("filenames"):
+                                        fnames = ref_data["filenames"][:20]
+                                        cols = st.columns(min(5, len(fnames)))
+                                        for img_idx, fname in enumerate(fnames):
+                                            with cols[img_idx % len(cols)]:
+                                                img_bytes = _fetch_reference_image_bytes(ref_type, fname)
+                                                if img_bytes:
+                                                    st.image(img_bytes, caption=fname, width=120)
+                                                if st.button("Delete", key=f"brand_del_{ref_type}_{fname}", type="secondary"):
+                                                    try:
+                                                        del_resp = requests.delete(f"{BACKEND_URL}/reference-image/{ref_type}/{fname}", timeout=5)
+                                                        del_resp.raise_for_status()
+                                                        _fetch_reference_listing.clear()
+                                                        _fetch_reference_image_bytes.clear()
+                                                        _fetch_brand_hierarchy.clear()
+                                                        st.rerun()
+                                                    except Exception as exc:
+                                                        st.error(f"Delete failed: {exc}")
+                                        if len(ref_data["filenames"]) > 20:
+                                            st.caption(f"... and {len(ref_data['filenames']) - 20} more")
+                                    else:
+                                        st.caption(f"No {ref_type} references")
+                                except Exception:
+                                    st.caption("Could not load images")
                     else:
-                        st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{brand_idx}.{prod_idx} ~~{name}~~ -- missing `(need: {internal}_1.jpg)`")
+                        st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{brand_idx}.{prod_idx} ~~{name}~~ -- missing `(need: pack/{internal}_1.jpg)`")
 
     except Exception as exc:
         st.warning(f"Could not load brand registry: {exc}")
@@ -1175,12 +1202,27 @@ with tab_label:
                 st.image(crop_bytes, caption=f"Crop #{crop['index']+1} ({crop['width']}x{crop['height']})", width=200)
                 if crop.get("suggested_confidence", 0) > 0:
                     st.caption(f"AI suggests: **{crop.get('suggested_brand', '?')}** / {crop.get('suggested_product', '?').replace('_', ' ')} ({crop['suggested_confidence']:.0%})")
+                detected_type = crop.get("packaging_type", "pack")
+                if detected_type == "box":
+                    st.caption("Detected as: **box**")
 
             with col_form:
                 crop_key = f"crop_{crop['index']}"
                 products_for_brand = []
                 product_internals = {}
                 selected_product = ""
+
+                # Packaging type selector (default from RF-DETR detection)
+                detected_type = crop.get("packaging_type", "pack")
+                type_options = ["pack", "box"]
+                default_type_idx = type_options.index(detected_type) if detected_type in type_options else 0
+                selected_type = st.radio(
+                    "Type",
+                    options=type_options,
+                    index=default_type_idx,
+                    key=f"{crop_key}_type",
+                    horizontal=True,
+                )
 
                 # Pre-select brand from AI suggestion
                 suggested_brand = crop.get("suggested_brand", "")
@@ -1223,33 +1265,33 @@ with tab_label:
                                 resp = requests.post(
                                     f"{BACKEND_URL}/add-reference",
                                     files={"image_file": ("crop.jpg", crop_bytes_data, "image/jpeg")},
-                                    data={"product_name": internal_name},
+                                    data={"product_name": internal_name, "packaging_type": selected_type},
                                     timeout=15,
                                 )
                                 resp.raise_for_status()
                                 result = resp.json()
-                                st.success(f"Added as {result['filename']} ({result['total_for_product']} total for {selected_product})")
+                                st.success(f"Added as {selected_type}/{result['filename']} ({result['total_for_product']} total for {selected_product} [{selected_type}])")
                                 _fetch_reference_listing.clear()
                                 _fetch_brand_hierarchy.clear()
                             except Exception as exc:
                                 st.error(f"Failed: {exc}")
 
-                    # Show one reference image directly under Add button (cached)
+                    # Show reference preview for selected type
                     internal_name = product_internals.get(selected_product, "")
                     if internal_name:
-                        ref_data = _fetch_reference_listing(internal_name)
+                        ref_data = _fetch_reference_listing(internal_name, selected_type)
                         if ref_data and ref_data.get("filenames"):
                             first_ref = ref_data["filenames"][0]
-                            img_bytes = _fetch_reference_image_bytes(first_ref)
+                            img_bytes = _fetch_reference_image_bytes(selected_type, first_ref)
                             if img_bytes:
                                 st.image(
                                     img_bytes,
-                                    caption=f"Reference preview: {selected_product}",
+                                    caption=f"Reference preview: {selected_product} [{selected_type}]",
                                     width=170,
                                 )
-                            st.caption(f"{ref_data['count']} refs total")
+                            st.caption(f"{ref_data['count']} {selected_type} refs total")
                         elif ref_data:
-                            st.caption("No reference images yet")
+                            st.caption(f"No {selected_type} reference images yet")
                         else:
                             st.caption("Reference preview unavailable")
 
@@ -1307,6 +1349,16 @@ with tab_train:
         st.markdown("##### Brand Classifier")
         st.caption("Frozen DINOv2 + MLP head. Fast, works on CPU.")
         st.caption("Recommended: epochs=100, lr=0.001, batch=64, embed_batch=8")
+
+        # Show reference image count
+        try:
+            idx_resp = requests.get(f"{BACKEND_URL}/index-status", timeout=5)
+            if idx_resp.status_code == 200:
+                idx_info = idx_resp.json()
+                st.caption(f"References: {idx_info.get('total_images', '?')} images, {idx_info.get('num_labels', '?')} classes")
+        except Exception:
+            pass
+
         cls_epochs = st.number_input("Epochs", value=100, min_value=10, max_value=500, key="cls_epochs")
         cls_lr = st.number_input("Learning rate", value=0.001, format="%.4f", key="cls_lr")
         cls_batch = st.number_input("Batch size", value=64, min_value=8, max_value=256, key="cls_batch")
@@ -1343,11 +1395,29 @@ with tab_train:
         st.markdown("##### RF-DETR Detection")
         st.caption("Fine-tune pack detector. GPU recommended.")
         st.caption("Recommended: epochs=50, lr=0.0001, batch=4")
+
+        # Show dataset status
+        try:
+            ds_resp = requests.get(f"{BACKEND_URL}/dataset-status", timeout=5)
+            if ds_resp.status_code == 200:
+                ds_info = ds_resp.json()
+                if ds_info["ready"]:
+                    splits = ds_info["splits"]
+                    train_ct = splits.get("train", {}).get("images", 0)
+                    valid_ct = splits.get("valid", {}).get("images", 0)
+                    st.caption(f"Dataset: {train_ct} train / {valid_ct} valid images")
+                else:
+                    st.warning("No dataset found. Provide a Roboflow URL or upload COCO data first.")
+        except Exception:
+            pass
+
         rfdetr_epochs = st.number_input("Epochs", value=50, min_value=5, max_value=200, key="rfdetr_epochs")
         rfdetr_lr = st.number_input("Learning rate", value=0.0001, format="%.5f", key="rfdetr_lr")
         rfdetr_batch = st.number_input("Batch size", value=4, min_value=1, max_value=16, key="rfdetr_batch")
         if "show_rfdetr_url_prompt" not in st.session_state:
             st.session_state["show_rfdetr_url_prompt"] = False
+        if "rfdetr_dataset_ready" not in st.session_state:
+            st.session_state["rfdetr_dataset_ready"] = None
 
         if st.button("Train RF-DETR", type="primary", key="btn_train_rfdetr"):
             st.session_state["show_rfdetr_url_prompt"] = True
@@ -1366,15 +1436,38 @@ with tab_train:
                 key="rfdetr_clean_dataset",
             )
             confirm_col, cancel_col = st.columns(2)
-            do_start = confirm_col.button("Confirm and Start RF-DETR Training", key="btn_train_rfdetr_confirm")
+            do_prepare = confirm_col.button("Prepare Dataset", key="btn_train_rfdetr_prepare")
             do_cancel = cancel_col.button("Cancel", key="btn_train_rfdetr_cancel")
             if do_cancel:
                 st.session_state["show_rfdetr_url_prompt"] = False
+                st.session_state["rfdetr_dataset_ready"] = None
                 st.rerun()
-            if do_start:
+            if do_prepare:
                 if not rfdetr_url.strip():
-                    st.error("Please paste a Roboflow URL before starting training.")
+                    st.error("Please paste a Roboflow URL first.")
                 else:
+                    try:
+                        resp = requests.post(
+                            f"{BACKEND_URL}/download-roboflow-coco",
+                            data={"url": rfdetr_url.strip(), "clean": str(rfdetr_clean).lower()},
+                            timeout=240,
+                        )
+                        resp.raise_for_status()
+                        result = resp.json()
+                        st.session_state["rfdetr_dataset_ready"] = result
+                        st.success("Dataset prepared successfully. Confirm to start RF-DETR training.")
+                        st.caption(
+                            f"Prepared: {result.get('images', 0)} images, {result.get('annotations', 0)} annotations "
+                            f"({', '.join(result.get('splits', [])) or 'train'})"
+                        )
+                    except Exception as exc:
+                        st.session_state["rfdetr_dataset_ready"] = None
+                        st.error(f"Dataset preparation failed: {exc}")
+
+            ds_ready = st.session_state.get("rfdetr_dataset_ready")
+            if ds_ready:
+                st.info("Dataset is ready. Click confirm to run training.")
+                if st.button("Confirm and Start RF-DETR Training", key="btn_train_rfdetr_confirm_run"):
                     try:
                         resp = requests.post(
                             f"{BACKEND_URL}/train-rfdetr",
@@ -1383,10 +1476,8 @@ with tab_train:
                                 "lr": rfdetr_lr,
                                 "batch_size": rfdetr_batch,
                                 "version": training_version,
-                                "roboflow_url": rfdetr_url.strip(),
-                                "clean_dataset": str(rfdetr_clean).lower(),
                             },
-                            timeout=180,
+                            timeout=30,
                         )
                         resp.raise_for_status()
                         result = resp.json()
@@ -1398,16 +1489,10 @@ with tab_train:
                         else:
                             st.session_state["train_rfdetr_job"] = result["job_id"]
                             st.session_state["show_rfdetr_url_prompt"] = False
-                            ds_info = result.get("dataset_import") or {}
+                            st.session_state["rfdetr_dataset_ready"] = None
                             st.success(f"Training started (job: {result['job_id'][:8]}...)")
-                            if ds_info:
-                                st.caption(
-                                    f"Dataset loaded: {ds_info.get('images', 0)} images, "
-                                    f"{ds_info.get('annotations', 0)} annotations "
-                                    f"({', '.join(ds_info.get('splits', [])) or 'train'})"
-                                )
                     except Exception as exc:
-                        st.error(f"Failed to start: {exc}")
+                        st.error(f"Failed to start training: {exc}")
 
     # --- DINOv2 Fine-tune ---
     with train_col3:
@@ -1455,43 +1540,51 @@ with tab_train:
             active_jobs.append((label, job_id))
 
     if active_jobs:
-        auto_refresh = st.checkbox("Auto-refresh live progress (2s)", value=True, key="train_auto_refresh")
-        for label, job_id in active_jobs:
-            try:
-                resp = requests.get(f"{BACKEND_URL}/training-status/{job_id}", timeout=5)
-                if resp.status_code == 200:
-                    status = resp.json()
-                    progress = status.get("progress", {})
-                    epoch = progress.get("epoch", 0)
-                    total = progress.get("total_epochs", 1)
-                    train_acc = progress.get("train_acc", 0)
-                    val_acc = progress.get("val_acc", 0)
-                    best_acc = progress.get("best_val_acc", 0)
-                    job_status = status.get("status", "unknown")
-                    last_update = status.get("last_update", "")
+        @st.fragment(run_every=3)
+        def _training_progress_panel(active_jobs):
+            """Auto-refreshing fragment -- only this panel reruns, not the whole page."""
+            for label, job_id in active_jobs:
+                try:
+                    resp = requests.get(f"{BACKEND_URL}/training-status/{job_id}", timeout=5)
+                    if resp.status_code == 200:
+                        status = resp.json()
+                        progress = status.get("progress", {})
+                        epoch = progress.get("epoch", 0)
+                        total = progress.get("total_epochs", 1)
+                        train_acc = progress.get("train_acc", 0)
+                        val_acc = progress.get("val_acc", 0)
+                        best_acc = progress.get("best_val_acc", 0)
+                        job_status = status.get("status", "unknown")
+                        last_update = status.get("last_update", "")
+                        error_msg = status.get("error", "") or (progress.get("error", "") if progress else "")
 
-                    pct = epoch / total if total > 0 else 0
-                    st.markdown(f"**{label}** -- {job_status}")
-                    st.progress(pct)
-                    st.caption(
-                        f"Epoch {epoch}/{total} | "
-                        f"Train acc: {train_acc:.3f} | Val acc: {val_acc:.3f} | "
-                        f"Best: {best_acc:.3f}"
-                    )
-                    if last_update:
-                        st.caption(f"Last update: {last_update}")
+                        pct = epoch / total if total > 0 else 0
+                        st.markdown(f"**{label}** -- {job_status}")
+                        st.progress(pct)
+                        st.caption(
+                            f"Epoch {epoch}/{total} | "
+                            f"Train acc: {train_acc:.3f} | Val acc: {val_acc:.3f} | "
+                            f"Best: {best_acc:.3f}"
+                        )
+                        if last_update:
+                            st.caption(f"Last update: {last_update}")
 
-                    if status.get("error"):
-                        with st.expander("Error details"):
-                            st.code(status["error"][-1000:])
-            except Exception:
-                st.caption(f"{label}: Could not fetch status")
+                        if error_msg:
+                            with st.expander("Error details"):
+                                st.code(str(error_msg)[-1000:])
+                        if job_status in ("running", "queued", "stopping"):
+                            if st.button(f"Terminate {label}", key=f"btn_stop_{job_id}"):
+                                try:
+                                    stop_resp = requests.post(f"{BACKEND_URL}/training-stop/{job_id}", timeout=10)
+                                    stop_resp.raise_for_status()
+                                    stop_data = stop_resp.json()
+                                    st.warning(f"{label}: {stop_data.get('message', 'Stop requested')}")
+                                except Exception as exc:
+                                    st.error(f"Failed to terminate {label}: {exc}")
+                except Exception:
+                    st.caption(f"{label}: Could not fetch status")
 
-        if st.button("Refresh", key="btn_refresh_training"):
-            st.rerun()
-        if auto_refresh:
-            time.sleep(2)
-            st.rerun()
+        _training_progress_panel(active_jobs)
     else:
         st.caption("No active training jobs. Start one above.")
 
