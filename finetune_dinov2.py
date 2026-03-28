@@ -131,15 +131,20 @@ def train(args):
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     progress_file = Path(args.progress_file) if args.progress_file else None
 
-    # 1. Collect images and labels
+    # 1. Collect images and labels from pack/ and box/ subfolders
     image_paths = []
-    for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.bmp"):
-        image_paths.extend(REFERENCES_DIR.glob(ext))
-        image_paths.extend(REFERENCES_DIR.glob(ext.upper()))
+    for pkg_type in ("pack", "box"):
+        type_dir = REFERENCES_DIR / pkg_type
+        if not type_dir.exists():
+            print(f"Skipping missing subfolder: {type_dir}")
+            continue
+        for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.bmp"):
+            image_paths.extend(type_dir.glob(ext))
+            image_paths.extend(type_dir.glob(ext.upper()))
     image_paths = sorted(set(image_paths))
 
     if not image_paths:
-        print(f"No reference images found in {REFERENCES_DIR}")
+        print(f"No reference images found in {REFERENCES_DIR}/pack/ or {REFERENCES_DIR}/box/")
         sys.exit(1)
 
     labels_str = [label_from_filename(p.name) for p in image_paths]
