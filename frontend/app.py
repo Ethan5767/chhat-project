@@ -1461,7 +1461,7 @@ with tab_train:
                         "embed_batch_size": cls_embed_batch,
                         "version": training_version,
                     },
-                    timeout=15,
+                    timeout=120,
                 )
                 resp.raise_for_status()
                 result = resp.json()
@@ -1501,7 +1501,7 @@ with tab_train:
                         "batch_size": dino_batch, "unfreeze_layers": dino_layers,
                         "version": training_version,
                     },
-                    timeout=15,
+                    timeout=120,
                 )
                 resp.raise_for_status()
                 result = resp.json()
