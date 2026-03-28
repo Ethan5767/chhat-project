@@ -181,6 +181,13 @@ def load_rfdetr():
     return _rfdetr_model
 
 
+def reload_rfdetr():
+    """Force-reload RF-DETR from the latest checkpoint. Call after training completes."""
+    global _rfdetr_model
+    _rfdetr_model = None
+    return load_rfdetr()
+
+
 def load_ocr():
     """Load EasyOCR reader (English). Cached after first call."""
     global _ocr_reader

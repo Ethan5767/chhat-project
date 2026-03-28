@@ -23,6 +23,7 @@ try:
         load_index,
         load_classifier,
         load_rfdetr,
+        reload_rfdetr,
         run_pipeline,
         classify_embeddings,
         _detect_brands_from_image,
@@ -43,6 +44,7 @@ except ImportError:
         load_index,
         load_classifier,
         load_rfdetr,
+        reload_rfdetr,
         run_pipeline,
         classify_embeddings,
         _detect_brands_from_image,
@@ -1200,6 +1202,16 @@ def _run_training_job(job_id: str, script: str, args: list[str]):
                 _training_jobs[job_id]["status"] = "done"
                 _training_jobs[job_id]["end_time"] = _now_iso()
                 completed_version = _training_jobs[job_id].get("version", DEFAULT_TRAINING_VERSION)
+                model_type = _training_jobs[job_id].get("type", "")
+
+            # Hot-reload the model so inference uses the new weights immediately
+            if model_type == "rfdetr":
+                try:
+                    reload_rfdetr()
+                    print(f"[train] RF-DETR model hot-reloaded after training (job {job_id[:8]})")
+                except Exception as exc:
+                    print(f"[train] WARNING: Failed to hot-reload RF-DETR: {exc}")
+
             with jobs_lock:
                 job = jobs.get(job_id)
             if job:
