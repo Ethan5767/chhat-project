@@ -1462,7 +1462,10 @@ def _run_training_job(job_id: str, script: str, args: list[str]):
     import time
 
     progress_file = _TRAINING_PROGRESS_DIR / f".training_progress_{job_id}.json"
-    full_args = [sys.executable, str(_TRAINING_PROGRESS_DIR / script),
+    script_path = _TRAINING_PROGRESS_DIR / script
+    if not script_path.exists():
+        raise FileNotFoundError(f"Training script not found: {script_path}")
+    full_args = [sys.executable, str(script_path),
                  "--progress-file", str(progress_file)] + args
 
     try:
@@ -1652,6 +1655,7 @@ def train_classifier_endpoint(
     batch_size: int = 64,
     embed_batch_size: int = 8,
     lr: float = 0.001,
+    packaging_type: str = "pack",
     version: str = "",
     force: bool = False,
 ):
@@ -1683,7 +1687,7 @@ def train_classifier_endpoint(
         "--batch-size", str(batch_size),
         "--embed-batch-size", str(embed_batch_size),
         "--lr", str(lr),
-        "--packaging-type", "pack",
+        "--packaging-type", packaging_type,
     ]
     with _training_lock:
         _training_jobs[job_id] = {

@@ -115,6 +115,7 @@ def main():
             )
             print(f"ERROR: {msg}", flush=True)
             if args.progress_file:
+                Path(args.progress_file).parent.mkdir(parents=True, exist_ok=True)
                 Path(args.progress_file).write_text(json.dumps({
                     "epoch": 0, "total_epochs": args.epochs,
                     "status": "failed", "error": msg,
@@ -127,6 +128,7 @@ def main():
 
     # Write initial progress
     if args.progress_file:
+        Path(args.progress_file).parent.mkdir(parents=True, exist_ok=True)
         Path(args.progress_file).write_text(json.dumps({
             "epoch": 0, "total_epochs": args.epochs,
             "status": "starting",
@@ -145,6 +147,7 @@ def main():
 
     # Write final progress
     if args.progress_file:
+        Path(args.progress_file).parent.mkdir(parents=True, exist_ok=True)
         Path(args.progress_file).write_text(json.dumps({
             "epoch": args.epochs, "total_epochs": args.epochs,
             "status": "complete",

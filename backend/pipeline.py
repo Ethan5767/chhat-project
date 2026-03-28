@@ -199,7 +199,7 @@ def reload_classifiers():
         try:
             load_classifier(device, packaging_type=pkg_type)
         except FileNotFoundError:
-            pass
+            logger.info("No %s classifier found (skipping)", pkg_type)
     logger.info("Brand classifiers reloaded")
 
 
@@ -209,8 +209,12 @@ def reload_dino():
     _dino_processor = None
     _dino_model = None
     device = get_device()
-    load_dino(device)
-    logger.info("DINOv2 model reloaded")
+    try:
+        load_dino(device)
+        logger.info("DINOv2 model reloaded")
+    except Exception as exc:
+        logger.error("Failed to reload DINOv2: %s", exc)
+        raise
 
 
 def load_ocr():

@@ -124,6 +124,7 @@ class DINOv2Classifier(nn.Module):
 def write_progress(progress_file: Path, data: dict):
     """Write progress to a JSON file for the frontend to poll."""
     if progress_file:
+        progress_file.parent.mkdir(parents=True, exist_ok=True)
         progress_file.write_text(json.dumps(data, indent=2))
 
 
@@ -271,8 +272,8 @@ def train(args):
         if val_acc > best_val_acc:
             best_val_acc = val_acc
             patience_counter = 0
-            # Save best — extract just the head weights for pipeline compatibility
-            torch.save(model.head.state_dict(), OUTPUT_DIR / "best_classifier.pth")
+            # Save best — extract just the head weights (named to avoid confusion with per-type classifiers)
+            torch.save(model.head.state_dict(), OUTPUT_DIR / "dinov2_finetuned_head.pth")
             # Also save the full model (backbone + head) for future fine-tuning
             torch.save(model.state_dict(), OUTPUT_DIR / "dinov2_finetuned_full.pth")
         else:
@@ -291,6 +292,9 @@ def train(args):
         "hidden_dim": 512,
         "finetuned": True,
         "unfreeze_layers": args.unfreeze_layers,
+        "head_weights": "dinov2_finetuned_head.pth",
+        "full_model_weights": "dinov2_finetuned_full.pth",
+        "note": "Shared backbone. Retrain per-type classifiers (brand_classifier.py) after fine-tuning.",
     }
     with open(OUTPUT_DIR / "class_mapping.json", "w", encoding="utf-8") as f:
         json.dump(class_mapping, f, ensure_ascii=False, indent=2)
@@ -307,7 +311,7 @@ def train(args):
 
     print(f"\nTraining complete!")
     print(f"  Best val accuracy: {best_val_acc:.3f}")
-    print(f"  Head saved to: {OUTPUT_DIR / 'best_classifier.pth'}")
+    print(f"  Head saved to: {OUTPUT_DIR / 'dinov2_finetuned_head.pth'}")
     print(f"  Full model saved to: {OUTPUT_DIR / 'dinov2_finetuned_full.pth'}")
 
 

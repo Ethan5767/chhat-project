@@ -239,6 +239,7 @@ def train_classifier(args):
 
         # Write progress for UI polling
         if hasattr(args, 'progress_file') and args.progress_file:
+            Path(args.progress_file).parent.mkdir(parents=True, exist_ok=True)
             Path(args.progress_file).write_text(json.dumps({
                 "epoch": epoch, "total_epochs": args.epochs,
                 "train_acc": round(train_acc, 4), "val_acc": round(val_acc, 4),
