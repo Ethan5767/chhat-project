@@ -1409,27 +1409,48 @@ with tab_train:
 
     train_col1, train_col2 = st.columns(2)
 
+    # --- Fetch training dataset summary (shared by both columns) ---
+    _train_reg_data = {}
+    _train_pack_total = 0
+    _train_box_total = 0
+    _train_products_with_refs = 0
+    try:
+        _tr_resp = requests.get(f"{BACKEND_URL}/brand-registry", timeout=5)
+        if _tr_resp.status_code == 200:
+            _train_reg_data = _tr_resp.json()
+            for _brand, _prods in _train_reg_data.get("brands", {}).items():
+                for _p in _prods:
+                    _train_pack_total += _p.get("pack_count", 0)
+                    _train_box_total += _p.get("box_count", 0)
+                    if _p.get("reference_count", 0) > 0:
+                        _train_products_with_refs += 1
+    except Exception:
+        pass
+
     # --- Brand Classifier (frozen DINOv2 + MLP) ---
     with train_col1:
         st.markdown("##### Brand Classifier")
         st.caption("Frozen DINOv2 + MLP head. Fast, works on CPU.")
         st.caption("Recommended: epochs=100, lr=0.001, batch=64, embed_batch=8")
 
-        # Show reference image count
-        try:
-            idx_resp = requests.get(f"{BACKEND_URL}/index-status", timeout=5)
-            if idx_resp.status_code == 200:
-                idx_info = idx_resp.json()
-                st.caption(f"References: {idx_info.get('total_images', '?')} images, {idx_info.get('num_labels', '?')} classes")
-        except Exception:
-            pass
+        # Dataset summary
+        st.markdown(f"**Training data (pack references):** {_train_pack_total} images, {_train_products_with_refs} products")
+        if _train_pack_total == 0:
+            st.warning("No pack reference images found. Add references in the Label Crops tab first.")
+        else:
+            with st.expander("View training data breakdown"):
+                for _brand, _prods in sorted(_train_reg_data.get("brands", {}).items()):
+                    for _p in _prods:
+                        pc = _p.get("pack_count", 0)
+                        if pc > 0:
+                            st.caption(f"  {_p['display_name']}: {pc} images")
 
         cls_epochs = st.number_input("Epochs", value=100, min_value=10, max_value=500, key="cls_epochs")
         cls_lr = st.number_input("Learning rate", value=0.001, format="%.4f", key="cls_lr")
         cls_batch = st.number_input("Batch size", value=64, min_value=8, max_value=256, key="cls_batch")
         cls_embed_batch = st.number_input("Embed batch size", value=8, min_value=1, max_value=64, key="cls_embed_batch")
 
-        if st.button("Train Classifier", type="primary", key="btn_train_cls"):
+        if st.button("Train Classifier", type="primary", key="btn_train_cls", disabled=_train_pack_total == 0):
             try:
                 resp = requests.post(
                     f"{BACKEND_URL}/train-classifier",
@@ -1460,6 +1481,12 @@ with tab_train:
         st.markdown("##### DINOv2 Fine-tune")
         st.caption("Unfreeze DINOv2 layers. Needs 16GB+ VRAM.")
         st.caption("Recommended: epochs=30, lr=1e-5, unfreeze_layers=4, batch=8")
+
+        # Dataset summary (uses both pack + box)
+        _dino_total = _train_pack_total + _train_box_total
+        st.markdown(f"**Training data (all references):** {_dino_total} images (pack={_train_pack_total}, box={_train_box_total})")
+        if _dino_total == 0:
+            st.warning("No reference images found.")
         dino_epochs = st.number_input("Epochs", value=30, min_value=5, max_value=100, key="dino_epochs")
         dino_lr = st.number_input("Learning rate", value=0.00001, format="%.6f", key="dino_lr")
         dino_layers = st.number_input("Unfreeze layers", value=4, min_value=1, max_value=12, key="dino_layers")
