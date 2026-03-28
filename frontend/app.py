@@ -473,10 +473,17 @@ st.write("")
 
 # -- Health check --
 try:
-    health = requests.get(f"{BACKEND_URL}/health", timeout=5)
+    health = requests.get(f"{BACKEND_URL}/health", timeout=15)
     health.raise_for_status()
-except Exception:
-    st.error("Backend not running. Start it with:\n`cd backend && uvicorn main:app --port 8000`")
+except Exception as health_exc:
+    st.error(
+        "Cannot reach the FastAPI backend at "
+        f"`{BACKEND_URL}` ({health_exc!s}).\n\n"
+        "**Local dev** (from repo root): "
+        "`uvicorn backend.main:app --host 127.0.0.1 --port 8000`\n\n"
+        "**Production server**: `sudo systemctl restart chhat-backend` "
+        "(ensure `BACKEND_URL` in `.env` is `http://127.0.0.1:8000` for same-host Streamlit)."
+    )
     st.stop()
 
 # -- Index status (sidebar-style) --
@@ -1185,6 +1192,25 @@ with tab_index:
                     if count > 0:
                         type_detail = f"pack={pack_c}" + (f", box={box_c}" if box_c > 0 else "")
                         st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{brand_idx}.{prod_idx} **{name}** -- {count} refs ({type_detail})")
+                        for vtype in ("pack", "box"):
+                            vcount = pack_c if vtype == "pack" else box_c
+                            if vcount == 0:
+                                continue
+                            with st.expander(f"View {name} {vtype} ({vcount})", expanded=False):
+                                try:
+                                    ref_data = _fetch_reference_listing(internal, vtype)
+                                    if ref_data and ref_data.get("filenames"):
+                                        fnames = ref_data["filenames"][:20]
+                                        vcols = st.columns(min(5, len(fnames)))
+                                        for vi, vfname in enumerate(fnames):
+                                            with vcols[vi % len(vcols)]:
+                                                vbytes = _fetch_reference_image_bytes(vtype, vfname)
+                                                if vbytes:
+                                                    st.image(vbytes, caption=vfname, width=120)
+                                        if len(ref_data["filenames"]) > 20:
+                                            st.caption(f"... and {len(ref_data['filenames']) - 20} more")
+                                except Exception:
+                                    st.caption("Could not load images")
                     else:
                         st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;{brand_idx}.{prod_idx} ~~{name}~~ -- missing `(need: pack/{internal}_1.jpg)`")
 
