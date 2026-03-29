@@ -463,6 +463,9 @@ def _paramiko_connect(pod_id: str, pod_host_id: str, key: str, connect_timeout: 
 def _paramiko_proxy_exec(pod_id: str, pod_host_id: str, key: str, command: str,
                          timeout: int = 300) -> subprocess.CompletedProcess:
     """Execute command on RunPod pod via direct Paramiko connection to ssh.runpod.io."""
+    import socket
+    import time as _time
+
     try:
         client = _paramiko_connect(pod_id, pod_host_id, key)
     except Exception as exc:
@@ -473,17 +476,30 @@ def _paramiko_proxy_exec(pod_id: str, pod_host_id: str, key: str, command: str,
         # Request PTY before exec -- RunPod proxy may require it
         channel = client.get_transport().open_session()
         channel.get_pty()
-        channel.settimeout(timeout)
+        channel.settimeout(1.0)
         channel.exec_command(command)
 
         out_chunks = []
         err_chunks = []
-        while not channel.exit_status_ready():
+        deadline = _time.monotonic() + float(timeout)
+        while True:
+            if _time.monotonic() > deadline:
+                return subprocess.CompletedProcess(
+                    args=["paramiko", command], returncode=255, stdout="", stderr="paramiko exec timed out",
+                )
             if channel.recv_ready():
                 out_chunks.append(channel.recv(65536).decode("utf-8", errors="replace"))
             if channel.recv_stderr_ready():
                 err_chunks.append(channel.recv_stderr(65536).decode("utf-8", errors="replace"))
-        # Drain remaining data
+            if channel.exit_status_ready():
+                break
+            # Drive protocol / avoid busy-wait: recv may unblock exit_status
+            try:
+                data = channel.recv(65536)
+                if data:
+                    out_chunks.append(data.decode("utf-8", errors="replace"))
+            except socket.timeout:
+                pass
         while channel.recv_ready():
             out_chunks.append(channel.recv(65536).decode("utf-8", errors="replace"))
         while channel.recv_stderr_ready():
