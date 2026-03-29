@@ -735,7 +735,7 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
             _log_runpod("gpu-batch: cloning repo + bootstrap on pod (may take several minutes)")
             update_progress(job_id, 18, 100, "Cloning repository and installing dependencies...")
             r = _ssh_cmd(ssh_host, ssh_port, ssh_key,
-                          f"cd /workspace && git clone {RUNPOD_REPO} && cd chhat-project && bash runpod/bootstrap_training_pod.sh",
+                          f"cd /workspace && git clone --depth 1 {RUNPOD_REPO} && cd chhat-project && bash runpod/bootstrap_training_pod.sh",
                           timeout=600, pod_id=pod_id, pod_host_id=pod_host_id)
             if r.returncode != 0:
                 raise RuntimeError(f"Bootstrap failed: {r.stdout[-500:]}")
@@ -962,7 +962,7 @@ def run_dinov2_finetune_gpu_job(
             # Ephemeral RunPod pod only (not production server):
             br = _ssh_cmd(
                 ssh_host, ssh_port, ssh_key,
-                f"cd /workspace && rm -rf chhat-project && git clone {RUNPOD_REPO} chhat-project "
+                f"cd /workspace && rm -rf chhat-project && git clone --depth 1 {RUNPOD_REPO} chhat-project "
                 f"&& cd chhat-project && bash runpod/bootstrap_training_pod.sh",
                 timeout=900, pod_id=pod_id, pod_host_id=pod_host_id,
             )
@@ -1289,7 +1289,7 @@ def run_classifier_training_runpod_job(
             _log_runpod("classifier-gpu: repo missing on pod — clone + bootstrap (long)")
             br = _ssh_cmd(
                 ssh_host, ssh_port, ssh_key,
-                f"cd /workspace && rm -rf chhat-project && git clone {RUNPOD_REPO} chhat-project "
+                f"cd /workspace && rm -rf chhat-project && git clone --depth 1 {RUNPOD_REPO} chhat-project "
                 f"&& cd chhat-project && bash runpod/bootstrap_training_pod.sh",
                 timeout=900, pod_id=pod_id, pod_host_id=pod_host_id,
             )
