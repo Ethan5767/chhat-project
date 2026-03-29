@@ -1489,7 +1489,11 @@ with tab_train:
     # --- DINOv2 Fine-tune ---
     with train_col2:
         st.markdown("##### DINOv2 Fine-tune")
-        st.caption("Unfreeze DINOv2 layers. Needs 16GB+ VRAM.")
+        st.caption("Unfreeze DINOv2 layers. Needs **GPU + ~16GB VRAM** for sensible speed.")
+        st.caption(
+            "By default this runs on the **same server as the API** (your droplet is CPU-only: very slow). "
+            "Enable **Run on RunPod** to spin up a GPU pod (requires `RUNPOD_API_KEY` and an SSH key on the server, same as batch GPU)."
+        )
         st.caption("Recommended: epochs=30, lr=1e-5, unfreeze_layers=4, batch=8")
 
         # Dataset summary (uses both pack + box)
@@ -1501,15 +1505,22 @@ with tab_train:
         dino_lr = st.number_input("Learning rate", value=0.00001, format="%.6f", key="dino_lr")
         dino_layers = st.number_input("Unfreeze layers", value=4, min_value=1, max_value=12, key="dino_layers")
         dino_batch = st.number_input("Batch size", value=8, min_value=2, max_value=32, key="dino_batch")
+        dino_use_runpod = st.checkbox(
+            "Run on RunPod GPU (recommended if API server has no GPU)",
+            value=False,
+            key="dino_use_runpod",
+        )
 
         if st.button("Fine-tune DINOv2", type="primary", key="btn_train_dino"):
             try:
+                rp = "true" if dino_use_runpod else "false"
                 resp = requests.post(
                     f"{BACKEND_URL}/finetune-dinov2",
                     params={
                         "epochs": dino_epochs, "lr": dino_lr,
                         "batch_size": dino_batch, "unfreeze_layers": dino_layers,
                         "version": training_version,
+                        "use_runpod": rp,
                     },
                     timeout=120,
                 )
