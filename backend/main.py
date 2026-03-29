@@ -426,7 +426,13 @@ def _ssh_scp_common_opts(key: str) -> list:
 
 
 def _runpod_ssh_user(pod_id: str, pod_host_id: str) -> str:
-    """Build the SSH username for RunPod proxy: {pod_id}-{podHostId}@ssh.runpod.io."""
+    """Build the SSH username for RunPod proxy.
+
+    machine.podHostId already contains the full SSH username (e.g. 'podid-64411df3').
+    Use it directly. Only prepend pod_id if it's not already included.
+    """
+    if pod_host_id.startswith(pod_id):
+        return pod_host_id
     return f"{pod_id}-{pod_host_id}"
 
 
@@ -528,6 +534,8 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
             }})["podFindAndDeployOnDemand"]
         pod_id = pod["id"]
         pod_host_id = (pod.get("machine") or {}).get("podHostId", "")
+        if not pod_host_id:
+            _log_runpod("gpu-batch: WARNING podHostId empty -- SSH proxy disabled, falling back to direct IP")
         cost_hr = pod.get("costPerHr", 0)
         _log_runpod(f"gpu-batch: pod created id={pod_id} host={pod_host_id} ~${cost_hr}/hr template={RUNPOD_TEMPLATE} gpu={RUNPOD_GPU_ID}")
         update_progress(job_id, 5, 100, f"Pod created ({pod_id[:8]}..., ${cost_hr}/hr). Waiting for SSH...")
@@ -759,7 +767,9 @@ def run_dinov2_finetune_gpu_job(
             }})["podFindAndDeployOnDemand"]
         pod_id = pod["id"]
         pod_host_id = (pod.get("machine") or {}).get("podHostId", "")
-        _log_runpod(f"dino-gpu: pod id={pod_id} cost~${pod.get('costPerHr', 0)}/hr")
+        if not pod_host_id:
+            _log_runpod("dino-gpu: WARNING podHostId empty -- SSH proxy disabled, falling back to direct IP")
+        _log_runpod(f"dino-gpu: pod id={pod_id} host={pod_host_id} cost~=${pod.get('costPerHr', 0)}/hr")
 
         ssh_host = None
         ssh_port = None
@@ -1080,6 +1090,8 @@ def run_classifier_training_runpod_job(
             _log_runpod(f"classifier-gpu: using cloud={used_cloud} gpu={gpu_id} volume={vol_gb}Gi")
         pod_id = pod["id"]
         pod_host_id = (pod.get("machine") or {}).get("podHostId", "")
+        if not pod_host_id:
+            _log_runpod("classifier-gpu: WARNING podHostId empty -- SSH proxy disabled, falling back to direct IP")
         with _training_lock:
             _training_jobs[job_id]["runpod_pod_id"] = pod_id
         _log_runpod(
