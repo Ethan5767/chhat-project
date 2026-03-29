@@ -95,6 +95,7 @@ def main() -> None:
     zip_path = output_dir.parent / args.zip_name
 
     if args.clean and output_dir.exists():
+        # --clean: deletes output_dir on this machine before re-download (explicit CLI opt-in).
         print(f"Cleaning existing directory: {output_dir}")
         shutil.rmtree(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)

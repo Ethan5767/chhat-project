@@ -1,12 +1,22 @@
+# Deploy application code to the server. Default: extracts git archive OVER existing tree — does NOT delete
+# /opt/chhat-project. Gitignored data (references, runs/, uploads, etc.) remains unless you opt into destructive flags.
+#
+# DESTRUCTIVE FLAGS (use only when you intend to remove data):
+#   -CleanRemote + -ConfirmFullRemoteWipe   Deletes entire $RemoteDir before unpack (same as old dangerous default).
+#   -IncludeAssets + -ReplaceReferencesOnServer   Deletes server backend/references before unpacking the references tarball.
+#   Normal -IncludeAssets merges/overwrites from tarball without deleting the references folder first.
+
 param(
     [string]$Server = "root@152.42.247.183",
     [string]$RemoteDir = "/opt/chhat-project",
     [switch]$IncludeAssets,
+    # Only with -IncludeAssets: rm -rf backend/references on server before extracting references tarball.
+    [switch]$ReplaceReferencesOnServer,
     [switch]$TrainClassifier,
-    # Copy local runs\*.pth to server (merge into $RemoteDir/runs)
     [switch]$SyncRfdetrCheckpoints,
-    # Full reset: delete entire $RemoteDir before unpacking (wipes references, weights, uploads not in git)
-    [switch]$CleanRemote
+    # Deletes entire $RemoteDir — requires -ConfirmFullRemoteWipe to run (two-switch safety).
+    [switch]$CleanRemote,
+    [switch]$ConfirmFullRemoteWipe
 )
 
 $ErrorActionPreference = "Stop"
@@ -26,8 +36,16 @@ Set-Location $Root
 
 Ensure-File "$Root\.env" "Create .env before deploying."
 
-# Remove leftover systemd drop-in from older CHHAT_DATA_ROOT experiments (harmless if missing)
+# Remove obsolete systemd drop-in from older experiments only (single small conf file, not project data)
 ssh $Server "rm -f /etc/systemd/system/chhat-backend.service.d/chhat-data.conf 2>/dev/null; systemctl daemon-reload 2>/dev/null; true"
+
+if ($CleanRemote -and -not $ConfirmFullRemoteWipe) {
+    throw "CleanRemote is blocked unless you also pass -ConfirmFullRemoteWipe. This would delete everything under $RemoteDir on the server."
+}
+
+if ($ReplaceReferencesOnServer -and -not $IncludeAssets) {
+    throw "-ReplaceReferencesOnServer only applies with -IncludeAssets."
+}
 
 Step "Packaging git HEAD"
 $codeTar = Join-Path $Root "deploy_code.tar"
@@ -36,7 +54,7 @@ git archive --format=tar --output "$codeTar" HEAD
 
 Step "Uploading and extracting code (existing server files outside git are kept)"
 scp "$codeTar" "${Server}:/tmp/chhat_deploy_code.tar"
-if ($CleanRemote) {
+if ($CleanRemote -and $ConfirmFullRemoteWipe) {
     Step "CleanRemote: removing entire $RemoteDir"
     ssh $Server "rm -rf $RemoteDir && mkdir -p $RemoteDir"
 } else {
@@ -65,7 +83,11 @@ if ($IncludeAssets) {
     if (Test-Path $refTar) { Remove-Item $refTar -Force }
     tar -cf "$refTar" -C "$Root\backend" "references"
     scp "$refTar" "${Server}:/tmp/references_sync.tar"
-    ssh $Server "rm -rf $RemoteDir/backend/references && mkdir -p $RemoteDir/backend && tar -xf /tmp/references_sync.tar -C $RemoteDir/backend && rm -f /tmp/references_sync.tar"
+    if ($ReplaceReferencesOnServer) {
+        ssh $Server "rm -rf $RemoteDir/backend/references && mkdir -p $RemoteDir/backend && tar -xf /tmp/references_sync.tar -C $RemoteDir/backend && rm -f /tmp/references_sync.tar"
+    } else {
+        ssh $Server "mkdir -p $RemoteDir/backend && tar -xf /tmp/references_sync.tar -C $RemoteDir/backend && rm -f /tmp/references_sync.tar"
+    }
     Remove-Item $refTar -Force
 
     scp "$Root\backend\classifier_model\*" "${Server}:${RemoteDir}/backend/classifier_model/"
@@ -105,4 +127,4 @@ try {
     Write-Warning "Public UI check failed: $($_.Exception.Message)"
 }
 
-Write-Host "`nDeploy complete. Server data under $RemoteDir (references, runs, uploads, etc.) is left in place unless you used -CleanRemote or -IncludeAssets." -ForegroundColor Green
+Write-Host "`nDeploy complete. Server data under $RemoteDir is preserved unless you used -CleanRemote -ConfirmFullRemoteWipe or -IncludeAssets -ReplaceReferencesOnServer." -ForegroundColor Green

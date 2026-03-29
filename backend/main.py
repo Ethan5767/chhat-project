@@ -221,7 +221,9 @@ def run_pipeline_job(job_id: str, csv_path: Path):
                 jobs[job_id]["error"] = err
 
 
-# ── RunPod GPU batch processing ──
+# ── RunPod GPU batch / DINO jobs ──
+# All SSH targets below are ephemeral RunPod pods under /workspace/... — not your production droplet.
+# (rm -rf / git clone on pods is scoped to that pod only.)
 
 RUNPOD_API_URL = "https://api.runpod.io/graphql"
 RUNPOD_GPU_ID = "NVIDIA A100 80GB PCIe"
@@ -651,6 +653,7 @@ def run_dinov2_finetune_gpu_job(
         )
         if "MISSING" in (chk.stdout or ""):
             _log_runpod("dino-gpu: repo missing on pod — clone + bootstrap (long)")
+            # Ephemeral RunPod pod only (not production server):
             br = _ssh_cmd(
                 ssh_host, ssh_port, ssh_key,
                 f"cd /workspace && rm -rf chhat-project && git clone {RUNPOD_REPO} chhat-project "
@@ -672,6 +675,7 @@ def run_dinov2_finetune_gpu_job(
         if up.returncode != 0:
             raise RuntimeError(f"SCP references to pod failed: {(up.stderr or '')[:400]}")
 
+        # Ephemeral RunPod pod filesystem only:
         un = _ssh_cmd(
             ssh_host, ssh_port, ssh_key,
             "cd /workspace/chhat-project/backend && rm -rf references && mkdir -p references && "
@@ -1233,7 +1237,10 @@ async def upload_coco(coco_file: UploadFile = File(...)):
 
 @app.post("/download-roboflow-coco")
 def download_roboflow_coco(url: str = Form(...), clean: bool = Form(False)):
-    """Download a Roboflow raw dataset URL and extract COCO files/images."""
+    """Download a Roboflow raw dataset URL and extract COCO files/images.
+
+    If clean=True, deletes the entire datasets/cigarette_packs directory first (destructive).
+    """
     from urllib.parse import parse_qs, urlparse
     import requests
     import shutil
