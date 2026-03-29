@@ -44,14 +44,16 @@ foreach ($name in @(
 }
 
 $listFile = Join-Path $env:TEMP "chhat_sync_files.txt"
-$files | Sort-Object -Unique | ForEach-Object { $_ -replace '\\', '/' } | Set-Content -Path $listFile -Encoding utf8
+# Paths relative to $Root; forward slashes; UTF-8 no BOM (tar on Windows chokes on BOM / bad lines)
+$files | Sort-Object -Unique | ForEach-Object { ($_ -replace '\\', '/').Trim() } | Where-Object { $_ -ne '' } | Set-Content -Path $listFile -Encoding ascii
 Write-Host "Files to sync: $($files.Count)"
 
 $tarOut = Join-Path $env:TEMP "chhat_code_sync.tar"
 if (Test-Path $tarOut) { Remove-Item $tarOut -Force }
 
 Step "Creating tarball"
-tar -cf $tarOut -T $listFile
+# -C so listed paths match; avoids "Couldn't visit directory" when cwd and -T disagree
+tar -cf $tarOut -C $Root -T $listFile
 if ($LASTEXITCODE -ne 0) { throw "tar failed" }
 $szMb = [math]::Round((Get-Item $tarOut).Length / 1MB, 2)
 Write-Host "Archive: $szMb MB"
