@@ -436,144 +436,119 @@ def _runpod_ssh_user(pod_id: str, pod_host_id: str) -> str:
     return f"{pod_id}-{pod_host_id}"
 
 
-def _paramiko_proxy_exec(pod_id: str, pod_host_id: str, key: str, command: str,
-                         timeout: int = 300) -> subprocess.CompletedProcess:
-    """Execute command on RunPod pod via Paramiko + ssh -W proxy tunnel.
+def _paramiko_connect(pod_id: str, pod_host_id: str, key: str, connect_timeout: int = 30):
+    """Connect to RunPod pod directly via Paramiko through ssh.runpod.io.
 
-    RunPod's ssh.runpod.io proxy requires PTY which subprocess can't provide.
-    Instead, use `ssh -W` to create a raw TCP tunnel (no PTY needed), then
-    Paramiko speaks SSH natively over that tunnel to the pod's sshd.
+    RunPod's proxy acts as a transparent relay -- Paramiko connects to it
+    with the pod username, and the proxy forwards to the pod's sshd.
+    No ssh -W or PTY needed.
     """
     import paramiko
 
     user = _runpod_ssh_user(pod_id, pod_host_id)
-    proxy_cmd = (
-        f"ssh -W localhost:22 "
-        f"-o StrictHostKeyChecking=no "
-        f"-o UserKnownHostsFile=/dev/null "
-        f"-o ConnectTimeout=30 "
-        f"-o LogLevel=ERROR "
-        f"-o IdentitiesOnly=yes "
-        f"-i {key} "
-        f"{user}@{RUNPOD_SSH_HOST}"
-    )
-
-    proxy = paramiko.ProxyCommand(proxy_cmd)
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+    client.connect(
+        hostname=RUNPOD_SSH_HOST,
+        port=22,
+        username=user,
+        key_filename=key,
+        timeout=connect_timeout,
+        allow_agent=False,
+        look_for_keys=False,
+    )
+    return client
 
+
+def _paramiko_proxy_exec(pod_id: str, pod_host_id: str, key: str, command: str,
+                         timeout: int = 300) -> subprocess.CompletedProcess:
+    """Execute command on RunPod pod via direct Paramiko connection to ssh.runpod.io."""
     try:
-        client.connect(
-            hostname="localhost",
-            port=22,
-            username="root",
-            key_filename=key,
-            sock=proxy,
-            timeout=30,
-        )
-        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
-        exit_code = stdout.channel.recv_exit_status()
-        out = stdout.read().decode("utf-8", errors="replace")
-        err = stderr.read().decode("utf-8", errors="replace")
-
+        client = _paramiko_connect(pod_id, pod_host_id, key)
+    except Exception as exc:
         return subprocess.CompletedProcess(
-            args=["paramiko-proxy", command],
-            returncode=exit_code,
-            stdout=out,
-            stderr=err,
+            args=["paramiko", command], returncode=255, stdout="", stderr=str(exc),
+        )
+    try:
+        # Request PTY before exec -- RunPod proxy may require it
+        channel = client.get_transport().open_session()
+        channel.get_pty()
+        channel.settimeout(timeout)
+        channel.exec_command(command)
+
+        out_chunks = []
+        err_chunks = []
+        while not channel.exit_status_ready():
+            if channel.recv_ready():
+                out_chunks.append(channel.recv(65536).decode("utf-8", errors="replace"))
+            if channel.recv_stderr_ready():
+                err_chunks.append(channel.recv_stderr(65536).decode("utf-8", errors="replace"))
+        # Drain remaining data
+        while channel.recv_ready():
+            out_chunks.append(channel.recv(65536).decode("utf-8", errors="replace"))
+        while channel.recv_stderr_ready():
+            err_chunks.append(channel.recv_stderr(65536).decode("utf-8", errors="replace"))
+
+        exit_code = channel.recv_exit_status()
+        channel.close()
+        return subprocess.CompletedProcess(
+            args=["paramiko", command], returncode=exit_code,
+            stdout="".join(out_chunks), stderr="".join(err_chunks),
         )
     except Exception as exc:
         return subprocess.CompletedProcess(
-            args=["paramiko-proxy", command],
-            returncode=255,
-            stdout="",
-            stderr=str(exc),
+            args=["paramiko", command], returncode=255, stdout="", stderr=str(exc),
         )
     finally:
         client.close()
-        proxy.close()
 
 
 def _paramiko_proxy_upload(pod_id: str, pod_host_id: str, key: str,
                            local: str, remote: str, timeout: int = 300) -> subprocess.CompletedProcess:
-    """Upload file to RunPod pod via Paramiko SFTP + ssh -W proxy tunnel."""
-    import paramiko
-
-    user = _runpod_ssh_user(pod_id, pod_host_id)
-    proxy_cmd = (
-        f"ssh -W localhost:22 "
-        f"-o StrictHostKeyChecking=no "
-        f"-o UserKnownHostsFile=/dev/null "
-        f"-o ConnectTimeout=30 "
-        f"-o LogLevel=ERROR "
-        f"-o IdentitiesOnly=yes "
-        f"-i {key} "
-        f"{user}@{RUNPOD_SSH_HOST}"
-    )
-
-    proxy = paramiko.ProxyCommand(proxy_cmd)
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
+    """Upload file to RunPod pod via Paramiko SFTP."""
     try:
-        client.connect(
-            hostname="localhost", port=22, username="root",
-            key_filename=key, sock=proxy, timeout=30,
+        client = _paramiko_connect(pod_id, pod_host_id, key)
+    except Exception as exc:
+        return subprocess.CompletedProcess(
+            args=["paramiko-put", local, remote], returncode=1, stdout="", stderr=str(exc),
         )
+    try:
         sftp = client.open_sftp()
         sftp.put(local, remote)
         sftp.close()
         return subprocess.CompletedProcess(
-            args=["paramiko-sftp-put", local, remote], returncode=0, stdout="", stderr="",
+            args=["paramiko-put", local, remote], returncode=0, stdout="", stderr="",
         )
     except Exception as exc:
         return subprocess.CompletedProcess(
-            args=["paramiko-sftp-put", local, remote], returncode=1, stdout="", stderr=str(exc),
+            args=["paramiko-put", local, remote], returncode=1, stdout="", stderr=str(exc),
         )
     finally:
         client.close()
-        proxy.close()
 
 
 def _paramiko_proxy_download(pod_id: str, pod_host_id: str, key: str,
                              remote: str, local: str, timeout: int = 300) -> subprocess.CompletedProcess:
-    """Download file from RunPod pod via Paramiko SFTP + ssh -W proxy tunnel."""
-    import paramiko
-
-    user = _runpod_ssh_user(pod_id, pod_host_id)
-    proxy_cmd = (
-        f"ssh -W localhost:22 "
-        f"-o StrictHostKeyChecking=no "
-        f"-o UserKnownHostsFile=/dev/null "
-        f"-o ConnectTimeout=30 "
-        f"-o LogLevel=ERROR "
-        f"-o IdentitiesOnly=yes "
-        f"-i {key} "
-        f"{user}@{RUNPOD_SSH_HOST}"
-    )
-
-    proxy = paramiko.ProxyCommand(proxy_cmd)
-    client = paramiko.SSHClient()
-    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-
+    """Download file from RunPod pod via Paramiko SFTP."""
     try:
-        client.connect(
-            hostname="localhost", port=22, username="root",
-            key_filename=key, sock=proxy, timeout=30,
+        client = _paramiko_connect(pod_id, pod_host_id, key)
+    except Exception as exc:
+        return subprocess.CompletedProcess(
+            args=["paramiko-get", remote, local], returncode=1, stdout="", stderr=str(exc),
         )
+    try:
         sftp = client.open_sftp()
         sftp.get(remote, local)
         sftp.close()
         return subprocess.CompletedProcess(
-            args=["paramiko-sftp-get", remote, local], returncode=0, stdout="", stderr="",
+            args=["paramiko-get", remote, local], returncode=0, stdout="", stderr="",
         )
     except Exception as exc:
         return subprocess.CompletedProcess(
-            args=["paramiko-sftp-get", remote, local], returncode=1, stdout="", stderr=str(exc),
+            args=["paramiko-get", remote, local], returncode=1, stdout="", stderr=str(exc),
         )
     finally:
         client.close()
-        proxy.close()
 
 
 def _ssh_cmd(host: str, port: int, key: str, command: str, timeout: int = 300,
