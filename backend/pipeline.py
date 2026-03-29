@@ -15,24 +15,11 @@ from PIL import Image
 from rapidfuzz import fuzz
 from transformers import AutoImageProcessor, AutoModel
 
-try:
-    from .paths import (
-        CLASSIFIER_BASE_DIR,
-        PROJECT_ROOT,
-        REFERENCES_DIR,
-        RFDETR_RUNS_DIR,
-    )
-except ImportError:
-    from paths import (
-        CLASSIFIER_BASE_DIR,
-        PROJECT_ROOT,
-        REFERENCES_DIR,
-        RFDETR_RUNS_DIR,
-    )
-
 BATCH_MODE: Optional[int] = None
 SAVE_INTERVAL = 50
-
+_BACKEND_ROOT = Path(__file__).resolve().parent
+REFERENCES_DIR = _BACKEND_ROOT / "references"
+CLASSIFIER_BASE_DIR = _BACKEND_ROOT / "classifier_model"
 PACKAGING_TYPES = ("pack", "box")
 
 # Per-type paths (backward compat aliases pointing to pack)
@@ -47,8 +34,8 @@ if not (CLASSIFIER_WEIGHTS.exists() and CLASS_MAPPING_JSON.exists()):
         CLASSIFIER_WEIGHTS = _legacy_w
         CLASS_MAPPING_JSON = _legacy_m
 DINO_MODEL_ID = "facebook/dinov2-base"
-_PROJECT_ROOT = PROJECT_ROOT
-_RFDETR_CHECKPOINT_DIR = RFDETR_RUNS_DIR
+_PROJECT_ROOT = _BACKEND_ROOT.parent
+_RFDETR_CHECKPOINT_DIR = _PROJECT_ROOT / "runs"
 
 DOWNLOAD_TIMEOUT = 15
 RFDETR_CONF_THRESHOLD = 0.15  # low threshold to catch packs in small shelf images

@@ -26,12 +26,8 @@ from torchvision import transforms
 from transformers import AutoImageProcessor, AutoModel
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-try:
-    from backend.paths import CLASSIFIER_BASE_DIR, REFERENCES_DIR
-except ImportError:
-    from paths import CLASSIFIER_BASE_DIR, REFERENCES_DIR
-
-OUTPUT_DIR = CLASSIFIER_BASE_DIR
+REFERENCES_DIR = PROJECT_ROOT / "backend" / "references"
+OUTPUT_DIR = PROJECT_ROOT / "backend" / "classifier_model"
 DINO_MODEL_ID = "facebook/dinov2-base"
 EMBED_DIM = 1536
 

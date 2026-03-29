@@ -9,10 +9,7 @@ Single source of truth for:
 from pathlib import Path
 from collections import Counter
 
-try:
-    from .paths import REFERENCES_DIR
-except ImportError:
-    from paths import REFERENCES_DIR
+REFERENCES_DIR = Path(__file__).resolve().parent / "references"
 PACKAGING_TYPES = ("pack", "box")
 
 # ─── Complete brand/product registry ───

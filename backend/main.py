@@ -12,33 +12,6 @@ from datetime import datetime, timezone
 from io import BytesIO
 from pathlib import Path
 
-try:
-    from .paths import (
-        BATCH_HISTORY_PATH as _BATCH_HISTORY_PATH,
-        CLASSIFIER_BASE_DIR,
-        DATA_ROOT,
-        PROJECT_ROOT,
-        REFERENCES_DIR as _REFERENCES_BASE_DIR,
-        RESULTS_DIR,
-        TRAINING_HISTORY_PATH as _TRAINING_HISTORY_PATH,
-        MODEL_REGISTRY_PATH as _MODEL_REGISTRY_PATH,
-        VERSION_STATE_PATH as _VERSION_STATE_PATH,
-        UPLOADS_DIR,
-    )
-except ImportError:
-    from paths import (
-        BATCH_HISTORY_PATH as _BATCH_HISTORY_PATH,
-        CLASSIFIER_BASE_DIR,
-        DATA_ROOT,
-        PROJECT_ROOT,
-        REFERENCES_DIR as _REFERENCES_BASE_DIR,
-        RESULTS_DIR,
-        TRAINING_HISTORY_PATH as _TRAINING_HISTORY_PATH,
-        MODEL_REGISTRY_PATH as _MODEL_REGISTRY_PATH,
-        VERSION_STATE_PATH as _VERSION_STATE_PATH,
-        UPLOADS_DIR,
-    )
-
 import requests as http_requests  # avoid clash with fastapi.requests
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
@@ -92,6 +65,13 @@ except ImportError:
     )
 
 app = FastAPI(title="Local Cigarette Brand Detector")
+
+_BACKEND_ROOT = Path(__file__).resolve().parent
+UPLOADS_DIR = _BACKEND_ROOT / "uploads"
+UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+RESULTS_DIR = UPLOADS_DIR / "results"
+RESULTS_DIR.mkdir(parents=True, exist_ok=True)
+_BATCH_HISTORY_PATH = _BACKEND_ROOT / "batch_history.json"
 
 jobs_lock = threading.Lock()
 jobs: dict[str, dict] = {}
@@ -268,7 +248,7 @@ def _get_runpod_api_key() -> str:
     key = os.environ.get("RUNPOD_API_KEY", "").strip()
     if key:
         return key
-    env_file = PROJECT_ROOT / ".env"
+    env_file = _BACKEND_ROOT.parent / ".env"
     if env_file.exists():
         # utf-8-sig strips BOM so the first line still matches RUNPOD_API_KEY=
         for line in env_file.read_text(encoding="utf-8-sig").splitlines():
@@ -584,9 +564,9 @@ def run_dinov2_finetune_gpu_job(
             })
         _update_model_registry(job_id, {"status": "running", "last_update": _now_iso()})
 
-        _log_runpod(f"dino-gpu: tarring references -> {refs_tar.name}")
+        _log_runpod(f"dino-gpu: tarring backend/references -> {refs_tar.name}")
         r_tar = subprocess.run(
-            ["tar", "czf", str(refs_tar), "-C", str(DATA_ROOT), "references"],
+            ["tar", "czf", str(refs_tar), "-C", str(_BACKEND_ROOT), "references"],
             capture_output=True,
             text=True,
             timeout=900,
@@ -759,7 +739,7 @@ def run_dinov2_finetune_gpu_job(
             raise RuntimeError(f"DINOv2 fine-tune on pod failed:\n{(r_ft.stdout or '')[-3500:]}")
         _log_runpod("dino-gpu: finetune subprocess on pod finished rc=0")
 
-        out_dir = CLASSIFIER_BASE_DIR
+        out_dir = _BACKEND_ROOT / "classifier_model"
         out_dir.mkdir(parents=True, exist_ok=True)
         for fname in ("dinov2_finetuned_head.pth", "dinov2_finetuned_full.pth"):
             remote_p = f"/workspace/chhat-project/backend/classifier_model/{fname}"
@@ -1151,7 +1131,7 @@ async def upload_coco(coco_file: UploadFile = File(...)):
     if not (lower.endswith(".json") or lower.endswith(".zip")):
         raise HTTPException(status_code=400, detail="Only .json or .zip COCO files accepted.")
 
-        DATASETS_DIR = PROJECT_ROOT / "datasets" / "cigarette_packs"
+    DATASETS_DIR = _BACKEND_ROOT.parent / "datasets" / "cigarette_packs"
     DATASETS_DIR.mkdir(parents=True, exist_ok=True)
 
     data = await coco_file.read()
@@ -1264,7 +1244,7 @@ def download_roboflow_coco(url: str = Form(...), clean: bool = Form(False)):
     if "key" not in parse_qs(parsed.query):
         raise HTTPException(status_code=400, detail="Roboflow URL must include ?key=...")
 
-        datasets_dir = PROJECT_ROOT / "datasets" / "cigarette_packs"
+    datasets_dir = _BACKEND_ROOT.parent / "datasets" / "cigarette_packs"
     datasets_dir.mkdir(parents=True, exist_ok=True)
 
     if clean and datasets_dir.exists():
@@ -1494,7 +1474,7 @@ async def add_reference(
     except Exception:
         raise HTTPException(status_code=400, detail="Could not open image.")
 
-        TYPE_DIR = _REFERENCES_BASE_DIR / packaging_type
+    TYPE_DIR = _BACKEND_ROOT / "references" / packaging_type
     TYPE_DIR.mkdir(parents=True, exist_ok=True)
 
     import re
@@ -1560,7 +1540,7 @@ def get_reference_image(packaging_type: str, filename: str):
     """Serve a reference image by packaging type and filename."""
     if packaging_type not in ("pack", "box"):
         raise HTTPException(status_code=400, detail="packaging_type must be 'pack' or 'box'")
-    REFERENCES_DIR = _REFERENCES_BASE_DIR / packaging_type
+    REFERENCES_DIR = _BACKEND_ROOT / "references" / packaging_type
     path = REFERENCES_DIR / filename
     if not path.exists() or not path.is_file():
         raise HTTPException(status_code=404, detail="Image not found")
@@ -1572,7 +1552,7 @@ def delete_reference_image(packaging_type: str, filename: str):
     """Delete a reference image by packaging type and filename."""
     if packaging_type not in ("pack", "box"):
         raise HTTPException(status_code=400, detail="packaging_type must be 'pack' or 'box'")
-    REFERENCES_DIR = _REFERENCES_BASE_DIR / packaging_type
+    REFERENCES_DIR = _BACKEND_ROOT / "references" / packaging_type
     path = REFERENCES_DIR / filename
     if not path.exists() or not path.is_file():
         raise HTTPException(status_code=404, detail="Image not found")
@@ -1587,7 +1567,7 @@ def list_reference_images(product_name: str, packaging_type: str = "pack"):
     """List all reference image filenames for a product in a packaging type subfolder."""
     if packaging_type not in ("pack", "box"):
         raise HTTPException(status_code=400, detail="packaging_type must be 'pack' or 'box'")
-    REFERENCES_DIR = _REFERENCES_BASE_DIR / packaging_type
+    REFERENCES_DIR = _BACKEND_ROOT / "references" / packaging_type
     files = sorted(REFERENCES_DIR.glob(f"{product_name}_*.*")) if REFERENCES_DIR.exists() else []
     return {
         "product": product_name,
@@ -1600,7 +1580,7 @@ def list_reference_images(product_name: str, packaging_type: str = "pack"):
 @app.get("/dataset-status")
 def dataset_status():
     """Check if COCO dataset splits exist for RF-DETR training."""
-    ds_root = PROJECT_ROOT / "datasets" / "cigarette_packs"
+    ds_root = _BACKEND_ROOT.parent / "datasets" / "cigarette_packs"
     splits = {}
     for split in ("train", "valid", "test"):
         ann = ds_root / split / "_annotations.coco.json"
@@ -1621,10 +1601,13 @@ def dataset_status():
     return {"ready": ready, "splits": splits}
 
 
-_TRAINING_PROGRESS_DIR = PROJECT_ROOT
+_TRAINING_PROGRESS_DIR = _BACKEND_ROOT.parent
 _training_jobs: dict[str, dict] = {}
 _training_processes: dict[str, object] = {}
 _training_lock = threading.Lock()
+_TRAINING_HISTORY_PATH = _BACKEND_ROOT / "training_history.json"
+_MODEL_REGISTRY_PATH = _BACKEND_ROOT / "model_registry.json"
+_VERSION_STATE_PATH = _BACKEND_ROOT / "training_version_state.json"
 DEFAULT_TRAINING_VERSION = "v1"
 
 
@@ -1761,9 +1744,9 @@ def _hash_dataset_dir(path: Path) -> str:
 
 def _dataset_hash_for_type(model_type: str) -> str:
     if model_type in ("classifier", "dinov2_finetune"):
-        return _hash_dataset_dir(_REFERENCES_BASE_DIR)
+        return _hash_dataset_dir(_BACKEND_ROOT / "references")
     if model_type == "rfdetr":
-        return _hash_dataset_dir(PROJECT_ROOT / "datasets" / "cigarette_packs")
+        return _hash_dataset_dir(_BACKEND_ROOT.parent / "datasets" / "cigarette_packs")
     return "unknown"
 
 
