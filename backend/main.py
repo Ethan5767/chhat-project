@@ -415,7 +415,7 @@ RUNPOD_SSH_HOST = "ssh.runpod.io"
 
 
 def _ssh_scp_common_opts(key: str) -> list:
-    """OpenSSH options for non-interactive access to ephemeral RunPod pods via ssh.runpod.io proxy."""
+    """OpenSSH options for non-interactive access to ephemeral RunPod pods."""
     return [
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
@@ -436,21 +436,152 @@ def _runpod_ssh_user(pod_id: str, pod_host_id: str) -> str:
     return f"{pod_id}-{pod_host_id}"
 
 
+def _paramiko_proxy_exec(pod_id: str, pod_host_id: str, key: str, command: str,
+                         timeout: int = 300) -> subprocess.CompletedProcess:
+    """Execute command on RunPod pod via Paramiko + ssh -W proxy tunnel.
+
+    RunPod's ssh.runpod.io proxy requires PTY which subprocess can't provide.
+    Instead, use `ssh -W` to create a raw TCP tunnel (no PTY needed), then
+    Paramiko speaks SSH natively over that tunnel to the pod's sshd.
+    """
+    import paramiko
+
+    user = _runpod_ssh_user(pod_id, pod_host_id)
+    proxy_cmd = (
+        f"ssh -W localhost:22 "
+        f"-o StrictHostKeyChecking=no "
+        f"-o UserKnownHostsFile=/dev/null "
+        f"-o ConnectTimeout=30 "
+        f"-o LogLevel=ERROR "
+        f"-o IdentitiesOnly=yes "
+        f"-i {key} "
+        f"{user}@{RUNPOD_SSH_HOST}"
+    )
+
+    proxy = paramiko.ProxyCommand(proxy_cmd)
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    try:
+        client.connect(
+            hostname="localhost",
+            port=22,
+            username="root",
+            key_filename=key,
+            sock=proxy,
+            timeout=30,
+        )
+        stdin, stdout, stderr = client.exec_command(command, timeout=timeout)
+        exit_code = stdout.channel.recv_exit_status()
+        out = stdout.read().decode("utf-8", errors="replace")
+        err = stderr.read().decode("utf-8", errors="replace")
+
+        return subprocess.CompletedProcess(
+            args=["paramiko-proxy", command],
+            returncode=exit_code,
+            stdout=out,
+            stderr=err,
+        )
+    except Exception as exc:
+        return subprocess.CompletedProcess(
+            args=["paramiko-proxy", command],
+            returncode=255,
+            stdout="",
+            stderr=str(exc),
+        )
+    finally:
+        client.close()
+        proxy.close()
+
+
+def _paramiko_proxy_upload(pod_id: str, pod_host_id: str, key: str,
+                           local: str, remote: str, timeout: int = 300) -> subprocess.CompletedProcess:
+    """Upload file to RunPod pod via Paramiko SFTP + ssh -W proxy tunnel."""
+    import paramiko
+
+    user = _runpod_ssh_user(pod_id, pod_host_id)
+    proxy_cmd = (
+        f"ssh -W localhost:22 "
+        f"-o StrictHostKeyChecking=no "
+        f"-o UserKnownHostsFile=/dev/null "
+        f"-o ConnectTimeout=30 "
+        f"-o LogLevel=ERROR "
+        f"-o IdentitiesOnly=yes "
+        f"-i {key} "
+        f"{user}@{RUNPOD_SSH_HOST}"
+    )
+
+    proxy = paramiko.ProxyCommand(proxy_cmd)
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    try:
+        client.connect(
+            hostname="localhost", port=22, username="root",
+            key_filename=key, sock=proxy, timeout=30,
+        )
+        sftp = client.open_sftp()
+        sftp.put(local, remote)
+        sftp.close()
+        return subprocess.CompletedProcess(
+            args=["paramiko-sftp-put", local, remote], returncode=0, stdout="", stderr="",
+        )
+    except Exception as exc:
+        return subprocess.CompletedProcess(
+            args=["paramiko-sftp-put", local, remote], returncode=1, stdout="", stderr=str(exc),
+        )
+    finally:
+        client.close()
+        proxy.close()
+
+
+def _paramiko_proxy_download(pod_id: str, pod_host_id: str, key: str,
+                             remote: str, local: str, timeout: int = 300) -> subprocess.CompletedProcess:
+    """Download file from RunPod pod via Paramiko SFTP + ssh -W proxy tunnel."""
+    import paramiko
+
+    user = _runpod_ssh_user(pod_id, pod_host_id)
+    proxy_cmd = (
+        f"ssh -W localhost:22 "
+        f"-o StrictHostKeyChecking=no "
+        f"-o UserKnownHostsFile=/dev/null "
+        f"-o ConnectTimeout=30 "
+        f"-o LogLevel=ERROR "
+        f"-o IdentitiesOnly=yes "
+        f"-i {key} "
+        f"{user}@{RUNPOD_SSH_HOST}"
+    )
+
+    proxy = paramiko.ProxyCommand(proxy_cmd)
+    client = paramiko.SSHClient()
+    client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+    try:
+        client.connect(
+            hostname="localhost", port=22, username="root",
+            key_filename=key, sock=proxy, timeout=30,
+        )
+        sftp = client.open_sftp()
+        sftp.get(remote, local)
+        sftp.close()
+        return subprocess.CompletedProcess(
+            args=["paramiko-sftp-get", remote, local], returncode=0, stdout="", stderr="",
+        )
+    except Exception as exc:
+        return subprocess.CompletedProcess(
+            args=["paramiko-sftp-get", remote, local], returncode=1, stdout="", stderr=str(exc),
+        )
+    finally:
+        client.close()
+        proxy.close()
+
+
 def _ssh_cmd(host: str, port: int, key: str, command: str, timeout: int = 300,
              pod_id: str = "", pod_host_id: str = "") -> subprocess.CompletedProcess:
-    """Run command on remote via SSH. Uses ssh.runpod.io proxy if pod_id/pod_host_id provided."""
-    opts = _ssh_scp_common_opts(key)
+    """Run command on remote via SSH. Uses Paramiko proxy if pod_id/pod_host_id provided."""
     if pod_id and pod_host_id:
-        user = _runpod_ssh_user(pod_id, pod_host_id)
-        # RunPod proxy requires PTY. Use -tt with stdin from /dev/null
-        # so subprocess doesn't hang waiting for terminal input.
-        return subprocess.run(
-            ["ssh", "-tt", *opts,
-             "-o", "ServerAliveInterval=30",
-             "-p", "22", f"{user}@{RUNPOD_SSH_HOST}", command],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, timeout=timeout,
-        )
+        return _paramiko_proxy_exec(pod_id, pod_host_id, key, command, timeout)
+    opts = _ssh_scp_common_opts(key)
     return subprocess.run(
         ["ssh", "-T", *opts,
          "-o", "ServerAliveInterval=30",
@@ -461,14 +592,10 @@ def _ssh_cmd(host: str, port: int, key: str, command: str, timeout: int = 300,
 
 def _scp_to(host: str, port: int, key: str, local: str, remote: str, timeout: int = 300,
             pod_id: str = "", pod_host_id: str = ""):
-    """Upload file to remote host via SCP. Uses ssh.runpod.io proxy if pod_id/pod_host_id provided."""
-    opts = _ssh_scp_common_opts(key)
+    """Upload file to remote host. Uses Paramiko SFTP proxy if pod_id/pod_host_id provided."""
     if pod_id and pod_host_id:
-        user = _runpod_ssh_user(pod_id, pod_host_id)
-        return subprocess.run(
-            ["scp", *opts, "-P", "22", local, f"{user}@{RUNPOD_SSH_HOST}:{remote}"],
-            capture_output=True, text=True, timeout=timeout,
-        )
+        return _paramiko_proxy_upload(pod_id, pod_host_id, key, local, remote, timeout)
+    opts = _ssh_scp_common_opts(key)
     return subprocess.run(
         ["scp", *opts, "-P", str(port), local, f"root@{host}:{remote}"],
         capture_output=True, text=True, timeout=timeout,
@@ -477,14 +604,10 @@ def _scp_to(host: str, port: int, key: str, local: str, remote: str, timeout: in
 
 def _scp_from(host: str, port: int, key: str, remote: str, local: str, timeout: int = 300,
               pod_id: str = "", pod_host_id: str = ""):
-    """Download file from remote host via SCP. Uses ssh.runpod.io proxy if pod_id/pod_host_id provided."""
-    opts = _ssh_scp_common_opts(key)
+    """Download file from remote host. Uses Paramiko SFTP proxy if pod_id/pod_host_id provided."""
     if pod_id and pod_host_id:
-        user = _runpod_ssh_user(pod_id, pod_host_id)
-        return subprocess.run(
-            ["scp", *opts, "-P", "22", f"{user}@{RUNPOD_SSH_HOST}:{remote}", local],
-            capture_output=True, text=True, timeout=timeout,
-        )
+        return _paramiko_proxy_download(pod_id, pod_host_id, key, remote, local, timeout)
+    opts = _ssh_scp_common_opts(key)
     return subprocess.run(
         ["scp", *opts, "-P", str(port), f"root@{host}:{remote}", local],
         capture_output=True, text=True, timeout=timeout,
