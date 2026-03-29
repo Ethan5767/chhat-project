@@ -462,7 +462,14 @@ def _paramiko_connect(pod_id: str, pod_host_id: str, key: str, connect_timeout: 
 
 def _paramiko_proxy_exec(pod_id: str, pod_host_id: str, key: str, command: str,
                          timeout: int = 300) -> subprocess.CompletedProcess:
-    """Execute command on RunPod pod via direct Paramiko connection to ssh.runpod.io."""
+    """Execute command on RunPod pod via interactive shell through ssh.runpod.io.
+
+    RunPod's proxy doesn't support exec_command -- only interactive shell.
+    We invoke_shell(), send the command + exit, and read all output.
+    We embed a unique marker to extract the exit code.
+    """
+    import time as _time
+
     try:
         client = _paramiko_connect(pod_id, pod_host_id, key)
     except Exception as exc:
@@ -471,30 +478,55 @@ def _paramiko_proxy_exec(pod_id: str, pod_host_id: str, key: str, command: str,
             stderr=f"paramiko connect failed: {exc}",
         )
     try:
-        # Use exec_command with PTY requested via get_pty on the channel
-        channel = client.get_transport().open_session()
-        channel.get_pty(term="xterm", width=200, height=50)
-        channel.settimeout(float(timeout))
-        channel.exec_command(command)
+        channel = client.invoke_shell(term="xterm", width=200, height=50)
+        channel.settimeout(5.0)
+
+        # Wait for shell prompt / banner to flush
+        _time.sleep(2)
+        banner = b""
+        while channel.recv_ready():
+            banner += channel.recv(65536)
+
+        # Send command with exit code marker, then exit shell
+        marker = "__PARAMIKO_EXIT_CODE__"
+        full_cmd = f"{command}\necho {marker}$?\nexit\n"
+        channel.sendall(full_cmd.encode())
 
         # Read all output until channel closes
         out_chunks = []
-        while True:
-            data = channel.recv(65536)
-            if not data:
-                break
-            out_chunks.append(data.decode("utf-8", errors="replace"))
+        deadline = _time.monotonic() + float(timeout)
+        while _time.monotonic() < deadline:
+            try:
+                data = channel.recv(65536)
+                if not data:
+                    break
+                out_chunks.append(data.decode("utf-8", errors="replace"))
+            except Exception:
+                if channel.closed:
+                    break
+                continue
 
-        exit_code = channel.recv_exit_status()
         channel.close()
+        full_output = "".join(out_chunks)
+
+        # Extract exit code from marker
+        exit_code = 0
+        for line in full_output.splitlines():
+            if line.strip().startswith(marker):
+                try:
+                    exit_code = int(line.strip().replace(marker, ""))
+                except ValueError:
+                    pass
+                break
+
         return subprocess.CompletedProcess(
             args=["paramiko", command], returncode=exit_code,
-            stdout="".join(out_chunks), stderr="",
+            stdout=full_output, stderr="",
         )
     except Exception as exc:
         return subprocess.CompletedProcess(
             args=["paramiko", command], returncode=255, stdout="",
-            stderr=f"paramiko exec failed: {exc}",
+            stderr=f"paramiko shell failed: {exc}",
         )
     finally:
         client.close()
