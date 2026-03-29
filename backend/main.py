@@ -442,14 +442,17 @@ def _ssh_cmd(host: str, port: int, key: str, command: str, timeout: int = 300,
     opts = _ssh_scp_common_opts(key)
     if pod_id and pod_host_id:
         user = _runpod_ssh_user(pod_id, pod_host_id)
+        # RunPod proxy requires PTY. Use -tt with stdin from /dev/null
+        # so subprocess doesn't hang waiting for terminal input.
         return subprocess.run(
             ["ssh", "-tt", *opts,
              "-o", "ServerAliveInterval=30",
              "-p", "22", f"{user}@{RUNPOD_SSH_HOST}", command],
-            capture_output=True, text=True, timeout=timeout,
+            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, timeout=timeout,
         )
     return subprocess.run(
-        ["ssh", "-tt", *opts,
+        ["ssh", "-T", *opts,
          "-o", "ServerAliveInterval=30",
          "-p", str(port), f"root@{host}", command],
         capture_output=True, text=True, timeout=timeout,
