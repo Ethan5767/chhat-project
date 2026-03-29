@@ -229,15 +229,32 @@ RUNPOD_TEMPLATE = "runpod-torch-v21"
 RUNPOD_REPO = "https://github.com/Ethan5767/chhat-project.git"
 
 
+def _log_runpod(msg: str) -> None:
+    """Console log for RunPod / GPU jobs (visible in journalctl for systemd)."""
+    print(f"[runpod] {msg}", flush=True)
+
+
+def _mask_secret_hint(value: str) -> str:
+    """Non-secret fingerprint for logs (length + tiny prefix/suffix)."""
+    if not value:
+        return "(empty)"
+    v = value.strip()
+    if len(v) <= 12:
+        return f"len={len(v)}"
+    return f"len={len(v)} prefix={v[:4]}… suffix=…{v[-3:]}"
+
+
 def _get_runpod_api_key() -> str:
-    key = os.environ.get("RUNPOD_API_KEY", "")
+    key = os.environ.get("RUNPOD_API_KEY", "").strip()
     if key:
         return key
     env_file = _BACKEND_ROOT.parent / ".env"
     if env_file.exists():
-        for line in env_file.read_text().splitlines():
-            if line.startswith("RUNPOD_API_KEY="):
-                return line.split("=", 1)[1].strip().strip('"').strip("'")
+        # utf-8-sig strips BOM so the first line still matches RUNPOD_API_KEY=
+        for line in env_file.read_text(encoding="utf-8-sig").splitlines():
+            stripped = line.strip()
+            if stripped.startswith("RUNPOD_API_KEY="):
+                return stripped.split("=", 1)[1].strip().strip('"').strip("'")
     return ""
 
 
@@ -249,33 +266,49 @@ def _runpod_gql(api_key: str, query: str, variables: dict = None) -> dict:
     resp.raise_for_status()
     data = resp.json()
     if "errors" in data:
-        raise RuntimeError(f"RunPod API: {data['errors'][0].get('message', data['errors'])}")
+        err_msg = data["errors"][0].get("message", data["errors"])
+        _log_runpod(f"GraphQL error: {err_msg}")
+        raise RuntimeError(f"RunPod API: {err_msg}")
     return data["data"]
 
 
+def _ssh_scp_common_opts(key: str) -> list:
+    """OpenSSH options for non-interactive access to ephemeral RunPod pods (direct IP:port, not ssh.runpod.io)."""
+    return [
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "UserKnownHostsFile=/dev/null",
+        "-o", "ConnectTimeout=15",
+        "-o", "IdentitiesOnly=yes",
+        "-o", "BatchMode=yes",
+        "-i", key,
+    ]
+
+
 def _ssh_cmd(host: str, port: int, key: str, command: str, timeout: int = 300) -> subprocess.CompletedProcess:
-    """Run command on remote host via SSH. Only works from Linux servers."""
+    """Run command on remote via SSH (root@pod public IP + mapped port from RunPod GraphQL)."""
+    opts = _ssh_scp_common_opts(key)
     return subprocess.run(
-        ["ssh", "-T", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=15",
-         "-o", "ServerAliveInterval=30", "-i", key, "-p", str(port), f"root@{host}", command],
+        ["ssh", "-T", *opts,
+         "-o", "ServerAliveInterval=30",
+         "-p", str(port), f"root@{host}", command],
         capture_output=True, text=True, timeout=timeout,
     )
 
 
 def _scp_to(host: str, port: int, key: str, local: str, remote: str, timeout: int = 300):
     """Upload file to remote host via SCP."""
+    opts = _ssh_scp_common_opts(key)
     return subprocess.run(
-        ["scp", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=15",
-         "-i", key, "-P", str(port), local, f"root@{host}:{remote}"],
+        ["scp", *opts, "-P", str(port), local, f"root@{host}:{remote}"],
         capture_output=True, text=True, timeout=timeout,
     )
 
 
 def _scp_from(host: str, port: int, key: str, remote: str, local: str, timeout: int = 300):
     """Download file from remote host via SCP."""
+    opts = _ssh_scp_common_opts(key)
     return subprocess.run(
-        ["scp", "-o", "StrictHostKeyChecking=no", "-o", "ConnectTimeout=15",
-         "-i", key, "-P", str(port), f"root@{host}:{remote}", local],
+        ["scp", *opts, "-P", str(port), f"root@{host}:{remote}", local],
         capture_output=True, text=True, timeout=timeout,
     )
 
@@ -287,6 +320,7 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
 
     api_key = _get_runpod_api_key()
     if not api_key:
+        _log_runpod("gpu-batch: RUNPOD_API_KEY missing — set in .env and restart chhat-backend")
         _append_batch_history({
             "job_id": job_id, "filename": csv_path.name, "status": "error",
             "start_time": datetime.now(timezone.utc).isoformat(), "end_time": datetime.now(timezone.utc).isoformat(),
@@ -297,6 +331,7 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
             jobs[job_id]["error"] = "RUNPOD_API_KEY not set"
         return
 
+    _log_runpod(f"gpu-batch job={job_id[:8]}… csv={csv_path.name} key={_mask_secret_hint(api_key)}")
     start_time = datetime.now(timezone.utc).isoformat()
     _append_batch_history({
         "job_id": job_id, "filename": csv_path.name, "status": "running_gpu",
@@ -324,6 +359,7 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
             }})["podFindAndDeployOnDemand"]
         pod_id = pod["id"]
         cost_hr = pod.get("costPerHr", 0)
+        _log_runpod(f"gpu-batch: pod created id={pod_id} ~${cost_hr}/hr template={RUNPOD_TEMPLATE} gpu={RUNPOD_GPU_ID}")
         update_progress(job_id, 5, 100, f"Pod created ({pod_id[:8]}..., ${cost_hr}/hr). Waiting for SSH...")
 
         # 2. Wait for SSH port
@@ -342,10 +378,13 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
                     ssh_port = ssh_ports[0]["publicPort"]
                     break
             _time.sleep(10)
+            if attempt % 3 == 0 and attempt > 0:
+                _log_runpod(f"gpu-batch: still waiting for SSH port (attempt {attempt}/30) pod={pod_id[:8]}…")
 
         if not ssh_host:
             raise RuntimeError("Pod SSH port not available after 5 minutes")
 
+        _log_runpod(f"gpu-batch: SSH endpoint root@{ssh_host}:{ssh_port}")
         update_progress(job_id, 10, 100, "Pod ready. Waiting for SSH daemon...")
         _time.sleep(45)
 
@@ -362,11 +401,17 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
         if not ssh_key:
             raise RuntimeError("No SSH key found on server. Add key to ~/.ssh/ or run runpodctl config.")
 
+        _log_runpod(f"gpu-batch: using SSH identity {ssh_key}")
+
         # 3. Test SSH connection
         for attempt in range(6):
             r = _ssh_cmd(ssh_host, ssh_port, ssh_key, "echo SSH_OK", timeout=20)
-            if "SSH_OK" in r.stdout:
+            if "SSH_OK" in (r.stdout or ""):
+                _log_runpod(f"gpu-batch: SSH OK (attempt {attempt + 1})")
                 break
+            out_h = (r.stdout or "").strip()[:100]
+            err_h = (r.stderr or "").strip()[:160]
+            _log_runpod(f"gpu-batch: SSH probe failed rc={r.returncode} out={out_h!r} err={err_h!r}")
             _time.sleep(10)
         else:
             raise RuntimeError(f"SSH connection failed after retries: {r.stderr[:200]}")
@@ -378,16 +423,20 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
                       f"ls /workspace/chhat-project/train.py 2>/dev/null && echo REPO_EXISTS || echo NEED_CLONE",
                       timeout=30)
         if "NEED_CLONE" in r.stdout:
+            _log_runpod("gpu-batch: cloning repo + bootstrap on pod (may take several minutes)")
             update_progress(job_id, 18, 100, "Cloning repository and installing dependencies...")
             r = _ssh_cmd(ssh_host, ssh_port, ssh_key,
                           f"cd /workspace && git clone {RUNPOD_REPO} && cd chhat-project && bash runpod/bootstrap_training_pod.sh",
                           timeout=600)
             if r.returncode != 0:
                 raise RuntimeError(f"Bootstrap failed: {r.stdout[-500:]}")
+            _log_runpod("gpu-batch: bootstrap finished")
         else:
+            _log_runpod("gpu-batch: repo exists on pod; git pull")
             _ssh_cmd(ssh_host, ssh_port, ssh_key, "cd /workspace/chhat-project && git pull", timeout=60)
 
         update_progress(job_id, 25, 100, "Uploading CSV...")
+        _log_runpod(f"gpu-batch: uploading CSV ({csv_path.name})")
 
         # 5. Upload CSV
         r = _scp_to(ssh_host, ssh_port, ssh_key, str(csv_path),
@@ -397,6 +446,7 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
 
         # 6. Run pipeline on pod
         update_progress(job_id, 30, 100, "Running detection pipeline on GPU...")
+        _log_runpod("gpu-batch: starting run_pipeline on pod (long-running; up to 2h timeout)")
         remote_csv = f"/workspace/chhat-project/backend/uploads/{csv_path.name}"
         remote_out = f"/workspace/chhat-project/backend/uploads/{csv_path.stem}_results.csv"
 
@@ -411,6 +461,7 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
 
         if r.returncode != 0:
             raise RuntimeError(f"Pipeline failed on GPU: {r.stdout[-500:]}")
+        _log_runpod(f"gpu-batch: remote pipeline finished rc=0 tail_stdout_chars={len(r.stdout or '')}")
 
         # Parse actual output path
         result_line = [l for l in r.stdout.splitlines() if "RESULT_PATH=" in l]
@@ -447,9 +498,11 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
             jobs[job_id]["result"] = str(job_out_path)
 
         update_progress(job_id, 100, 100, f"GPU processing complete! ({row_count or '?'} rows)")
+        _log_runpod(f"gpu-batch: complete job={job_id[:8]}… rows={row_count}")
 
     except Exception:
         err = traceback.format_exc()
+        _log_runpod(f"gpu-batch: ERROR job={job_id[:8]}… {err[:400]}")
         _update_batch_history(job_id, {
             "status": "error",
             "end_time": datetime.now(timezone.utc).isoformat(),
@@ -463,15 +516,300 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
         if pod_id:
             try:
                 _runpod_gql(api_key, f'mutation {{ podTerminate(input: {{ podId: "{pod_id}" }}) }}')
-                print(f"[gpu-batch] Pod {pod_id} terminated")
+                _log_runpod(f"gpu-batch: pod {pod_id} terminated")
             except Exception as exc:
-                print(f"[gpu-batch] WARNING: Failed to terminate pod {pod_id}: {exc}")
+                _log_runpod(f"gpu-batch: WARNING failed to terminate pod {pod_id}: {exc}")
+
+
+def run_dinov2_finetune_gpu_job(
+    job_id: str,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    unfreeze_layers: int,
+):
+    """Run finetune_dinov2.py on a RunPod GPU (uploads references, downloads weights)."""
+    import time as time_module
+
+    api_key = _get_runpod_api_key()
+    if not api_key:
+        err = "RUNPOD_API_KEY not set. Add it to .env on the server (same as batch GPU)."
+        _log_runpod(f"dino-gpu job={job_id[:8]}… FAILED: {err}")
+        with _training_lock:
+            _training_jobs[job_id]["status"] = "error"
+            _training_jobs[job_id]["error"] = err
+            _training_jobs[job_id]["end_time"] = _now_iso()
+        _update_training_history(job_id, {"status": "error", "error": err, "end_time": _now_iso()})
+        _update_model_registry(job_id, {"status": "error", "error": err, "end_time": _now_iso()})
+        return
+
+    _log_runpod(
+        f"dino-gpu job={job_id[:8]}… start epochs={epochs} batch={batch_size} lr={lr} "
+        f"unfreeze={unfreeze_layers} key={_mask_secret_hint(api_key)}",
+    )
+    refs_tar = Path(f"/tmp/references_dino_{job_id}.tar.gz")
+    pod_id = None
+    try:
+        with _training_lock:
+            _training_jobs[job_id].update({
+                "status": "running",
+                "progress": {
+                    "epoch": 0,
+                    "total_epochs": epochs,
+                    "status": "starting",
+                    "note": "Provisioning RunPod GPU for DINOv2 fine-tune",
+                },
+                "error": None,
+                "last_update": _now_iso(),
+            })
+        _update_model_registry(job_id, {"status": "running", "last_update": _now_iso()})
+
+        _log_runpod(f"dino-gpu: tarring backend/references -> {refs_tar.name}")
+        r_tar = subprocess.run(
+            ["tar", "czf", str(refs_tar), "-C", str(_BACKEND_ROOT), "references"],
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+        if r_tar.returncode != 0:
+            raise RuntimeError(f"Packaging references failed: {r_tar.stderr[:500]}")
+        sz = refs_tar.stat().st_size if refs_tar.exists() else 0
+        _log_runpod(f"dino-gpu: references archive OK size_bytes={sz}")
+
+        _log_runpod("dino-gpu: creating RunPod pod…")
+        pod = _runpod_gql(api_key, """
+            mutation CreatePod($input: PodFindAndDeployOnDemandInput!) {
+                podFindAndDeployOnDemand(input: $input) { id costPerHr machine { podHostId } }
+            }""", {"input": {
+                "name": f"dino-{job_id[:8]}",
+                "templateId": RUNPOD_TEMPLATE,
+                "gpuTypeId": RUNPOD_GPU_ID,
+                "cloudType": "COMMUNITY",
+                "containerDiskInGb": 20,
+                "volumeInGb": 50,
+                "volumeMountPath": "/workspace",
+                "gpuCount": 1,
+                "ports": "22/tcp",
+            }})["podFindAndDeployOnDemand"]
+        pod_id = pod["id"]
+        _log_runpod(f"dino-gpu: pod id={pod_id} cost~${pod.get('costPerHr', 0)}/hr")
+
+        ssh_host = None
+        ssh_port = None
+        for attempt in range(30):
+            d = _runpod_gql(api_key, f"""query {{
+                pod(input: {{ podId: "{pod_id}" }}) {{
+                    runtime {{ uptimeInSeconds ports {{ ip publicPort privatePort type }} }}
+                }}
+            }}""")
+            rt = d["pod"].get("runtime")
+            if rt and rt.get("ports"):
+                ssh_ports = [p for p in rt["ports"] if p["privatePort"] == 22]
+                if ssh_ports:
+                    ssh_host = ssh_ports[0]["ip"]
+                    ssh_port = ssh_ports[0]["publicPort"]
+                    break
+            time_module.sleep(10)
+            if attempt % 3 == 0 and attempt > 0:
+                _log_runpod(f"dino-gpu: waiting for SSH port ({attempt}/30) pod={pod_id[:8]}…")
+        if not ssh_host:
+            raise RuntimeError("RunPod SSH port not available after ~5 minutes")
+
+        _log_runpod(f"dino-gpu: SSH root@{ssh_host}:{ssh_port} (sleep 45s for sshd)")
+        time_module.sleep(45)
+
+        ssh_key = None
+        for key_path in (
+            os.path.expanduser("~/.runpod/ssh/RunPod-Key-Go"),
+            os.path.expanduser("~/.ssh/id_ed25519"),
+            os.path.expanduser("~/.ssh/id_rsa"),
+        ):
+            if os.path.exists(key_path):
+                ssh_key = key_path
+                break
+        if not ssh_key:
+            raise RuntimeError("No SSH private key found (~/.runpod/ssh/ or ~/.ssh/)")
+
+        _log_runpod(f"dino-gpu: SSH identity {ssh_key}")
+        last_chk = None
+        for attempt in range(8):
+            last_chk = _ssh_cmd(ssh_host, ssh_port, ssh_key, "echo SSH_OK", timeout=25)
+            if "SSH_OK" in (last_chk.stdout or ""):
+                _log_runpod(f"dino-gpu: SSH OK (attempt {attempt + 1})")
+                break
+            o = (last_chk.stdout or "").strip()[:100]
+            e = (last_chk.stderr or "").strip()[:160]
+            _log_runpod(f"dino-gpu: SSH probe rc={last_chk.returncode} out={o!r} err={e!r}")
+            time_module.sleep(10)
+        else:
+            raise RuntimeError(f"SSH to pod failed: {(last_chk.stderr or last_chk.stdout or '')[:300]}")
+
+        chk = _ssh_cmd(
+            ssh_host, ssh_port, ssh_key,
+            "test -f /workspace/chhat-project/finetune_dinov2.py && echo OK || echo MISSING",
+            timeout=40,
+        )
+        if "MISSING" in (chk.stdout or ""):
+            _log_runpod("dino-gpu: repo missing on pod — clone + bootstrap (long)")
+            br = _ssh_cmd(
+                ssh_host, ssh_port, ssh_key,
+                f"cd /workspace && rm -rf chhat-project && git clone {RUNPOD_REPO} chhat-project "
+                f"&& cd chhat-project && bash runpod/bootstrap_training_pod.sh",
+                timeout=900,
+            )
+            if br.returncode != 0:
+                raise RuntimeError(f"Pod bootstrap failed: {(br.stdout or '')[-800:]}")
+            _log_runpod("dino-gpu: bootstrap complete")
+        else:
+            _log_runpod("dino-gpu: repo present on pod")
+
+        _log_runpod("dino-gpu: SCP references archive to pod…")
+        up = _scp_to(
+            ssh_host, ssh_port, ssh_key, str(refs_tar),
+            "/workspace/chhat-project/backend/references_upload.tar.gz",
+            timeout=600,
+        )
+        if up.returncode != 0:
+            raise RuntimeError(f"SCP references to pod failed: {(up.stderr or '')[:400]}")
+
+        un = _ssh_cmd(
+            ssh_host, ssh_port, ssh_key,
+            "cd /workspace/chhat-project/backend && rm -rf references && mkdir -p references && "
+            "tar xzf references_upload.tar.gz && rm -f references_upload.tar.gz",
+            timeout=180,
+        )
+        if un.returncode != 0:
+            raise RuntimeError(f"Unpack references on pod failed: {(un.stdout or un.stderr or '')[-600:]}")
+        _log_runpod("dino-gpu: references unpacked on pod")
+
+        progress_remote = "/tmp/dino_progress.json"
+        ft_cmd = (
+            f"cd /workspace/chhat-project && source .venv/bin/activate && "
+            f"python finetune_dinov2.py --epochs {epochs} --batch-size {batch_size} --lr {lr} "
+            f"--unfreeze-layers {unfreeze_layers} --progress-file {progress_remote}"
+        )
+
+        stop_poll = threading.Event()
+        poll_state = {"last_epoch": -1}
+
+        def _poll_remote_progress():
+            while not stop_poll.wait(12):
+                try:
+                    pr = _ssh_cmd(
+                        ssh_host, ssh_port, ssh_key,
+                        f"cat {progress_remote} 2>/dev/null || true",
+                        timeout=25,
+                    )
+                    txt = (pr.stdout or "").strip()
+                    if txt.startswith("{"):
+                        data = json.loads(txt)
+                        with _training_lock:
+                            _training_jobs[job_id]["progress"] = data
+                            _training_jobs[job_id]["last_update"] = _now_iso()
+                        _update_model_registry(
+                            job_id,
+                            {
+                                "status": "running",
+                                "progress": data,
+                                "last_update": _now_iso(),
+                                **_metrics_from_progress(data),
+                            },
+                        )
+                        ep = int(data.get("epoch", 0) or 0)
+                        if ep != poll_state["last_epoch"]:
+                            poll_state["last_epoch"] = ep
+                            st = data.get("status", "")
+                            va = data.get("val_acc", 0)
+                            _log_runpod(
+                                f"dino-gpu: remote progress epoch={ep}/{epochs} status={st} val_acc={va}",
+                            )
+                except Exception:
+                    pass
+
+        poller = threading.Thread(target=_poll_remote_progress, daemon=True)
+        poller.start()
+
+        _log_runpod("dino-gpu: starting finetune_dinov2.py on pod (up to 8h) — progress polled every ~12s")
+        r_ft = _ssh_cmd(ssh_host, ssh_port, ssh_key, ft_cmd, timeout=8 * 3600)
+        stop_poll.set()
+        poller.join(timeout=8)
+
+        if r_ft.returncode != 0:
+            _log_runpod(f"dino-gpu: finetune exited rc={r_ft.returncode}")
+            raise RuntimeError(f"DINOv2 fine-tune on pod failed:\n{(r_ft.stdout or '')[-3500:]}")
+        _log_runpod("dino-gpu: finetune subprocess on pod finished rc=0")
+
+        out_dir = _BACKEND_ROOT / "classifier_model"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for fname in ("dinov2_finetuned_head.pth", "dinov2_finetuned_full.pth"):
+            remote_p = f"/workspace/chhat-project/backend/classifier_model/{fname}"
+            local_p = str(out_dir / fname)
+            _log_runpod(f"dino-gpu: downloading {fname} from pod…")
+            dl = _scp_from(ssh_host, ssh_port, ssh_key, remote_p, local_p, timeout=600)
+            if dl.returncode != 0:
+                raise RuntimeError(f"Download {fname} from pod failed: {(dl.stderr or '')[:400]}")
+            _log_runpod(f"dino-gpu: saved {local_p}")
+
+        with _training_lock:
+            completed_version = _training_jobs[job_id].get("version", DEFAULT_TRAINING_VERSION)
+            _training_jobs[job_id]["status"] = "done"
+            _training_jobs[job_id]["end_time"] = _now_iso()
+            _training_jobs[job_id]["progress"] = {
+                "epoch": epochs,
+                "total_epochs": epochs,
+                "status": "complete",
+                "note": "Weights saved under backend/classifier_model/",
+            }
+
+        try:
+            reload_dino()
+            reload_classifiers()
+            _log_runpod("dino-gpu: reload_dino + reload_classifiers OK")
+        except Exception as exc:
+            _log_runpod(f"dino-gpu: WARNING reload after fine-tune: {exc}")
+
+        next_version = _mark_training_completed(str(completed_version))
+        _update_training_history(job_id, {
+            "status": "done",
+            "end_time": _now_iso(),
+            "next_version": next_version,
+        })
+        _update_model_registry(job_id, {
+            "status": "done",
+            "end_time": _now_iso(),
+            "next_version": next_version,
+            **_metrics_from_progress(_training_jobs[job_id].get("progress", {})),
+        })
+        _log_runpod(f"dino-gpu: job DONE job={job_id[:8]}… next_version={next_version}")
+
+    except Exception:
+        err = traceback.format_exc()
+        _log_runpod(f"dino-gpu: ERROR job={job_id[:8]}…\n{err[:800]}")
+        with _training_lock:
+            _training_jobs[job_id]["status"] = "error"
+            _training_jobs[job_id]["error"] = err
+            _training_jobs[job_id]["end_time"] = _now_iso()
+        _update_training_history(job_id, {"status": "error", "error": err, "end_time": _now_iso()})
+        _update_model_registry(job_id, {"status": "error", "error": err, "end_time": _now_iso()})
+    finally:
+        refs_tar.unlink(missing_ok=True)
+        if pod_id:
+            try:
+                _runpod_gql(api_key, f'mutation {{ podTerminate(input: {{ podId: "{pod_id}" }}) }}')
+                _log_runpod(f"dino-gpu: pod terminated id={pod_id}")
+            except Exception as exc:
+                _log_runpod(f"dino-gpu: WARNING pod terminate failed id={pod_id}: {exc}")
 
 
 @app.on_event("startup")
 def startup_event():
     device = get_device()
     print(f"[startup] device={device}")
+    rp = _get_runpod_api_key()
+    if rp:
+        _log_runpod(f"startup: RUNPOD_API_KEY available ({_mask_secret_hint(rp)}) — GPU batch + RunPod DINO enabled")
+    else:
+        _log_runpod("startup: RUNPOD_API_KEY not set — GPU batch and RunPod DINO will error until .env is configured")
     if not CLASSIFIER_WEIGHTS.exists() or not CLASS_MAPPING_JSON.exists():
         print("[startup] classifier not found -- run 'python brand_classifier.py' first")
         return
@@ -1461,14 +1799,14 @@ def _run_training_job(job_id: str, script: str, args: list[str]):
     import sys
     import time
 
-    progress_file = _TRAINING_PROGRESS_DIR / f".training_progress_{job_id}.json"
-    script_path = _TRAINING_PROGRESS_DIR / script
-    if not script_path.exists():
-        raise FileNotFoundError(f"Training script not found: {script_path}")
-    full_args = [sys.executable, str(script_path),
-                 "--progress-file", str(progress_file)] + args
-
     try:
+        progress_file = _TRAINING_PROGRESS_DIR / f".training_progress_{job_id}.json"
+        script_path = _TRAINING_PROGRESS_DIR / script
+        if not script_path.exists():
+            raise FileNotFoundError(f"Training script not found: {script_path}")
+        full_args = [sys.executable, str(script_path),
+                     "--progress-file", str(progress_file)] + args
+
         with _training_lock:
             _training_jobs[job_id].update({
                 "status": "running",
@@ -1478,14 +1816,29 @@ def _run_training_job(job_id: str, script: str, args: list[str]):
             })
         _update_model_registry(job_id, {"status": "running", "last_update": _now_iso()})
 
-        process = subprocess.Popen(
-            full_args, cwd=str(_TRAINING_PROGRESS_DIR),
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-        )
+        # Log to file — avoids PIPE deadlock when training prints more than the pipe buffer.
+        log_path = _TRAINING_PROGRESS_DIR / f".training_log_{job_id}.log"
+        log_f = open(log_path, "w", encoding="utf-8", errors="replace")
+        try:
+            process = subprocess.Popen(
+                full_args, cwd=str(_TRAINING_PROGRESS_DIR),
+                stdout=log_f, stderr=subprocess.STDOUT, text=True,
+            )
+        except Exception:
+            log_f.close()
+            raise
         with _training_lock:
             _training_processes[job_id] = process
             _training_jobs[job_id]["pid"] = process.pid
 
+        jt = _training_jobs.get(job_id, {}).get("type", "?")
+        print(
+            f"[train-local] job={job_id[:8]}… type={jt} pid={process.pid} script={script} "
+            f"log={log_path.name}",
+            flush=True,
+        )
+
+        last_logged_epoch = -1
         # Poll progress file while process runs
         while process.poll() is None:
             time.sleep(2)
@@ -1515,6 +1868,14 @@ def _run_training_job(job_id: str, script: str, args: list[str]):
                         "last_update": _now_iso(),
                         **_metrics_from_progress(progress),
                     })
+                    ep = int(progress.get("epoch", 0) or 0)
+                    if ep != last_logged_epoch:
+                        last_logged_epoch = ep
+                        print(
+                            f"[train-local] job={job_id[:8]}… epoch={ep}/{progress.get('total_epochs', '?')} "
+                            f"val_acc={progress.get('val_acc', 'n/a')}",
+                            flush=True,
+                        )
                 except Exception:
                     pass
 
@@ -1538,7 +1899,22 @@ def _run_training_job(job_id: str, script: str, args: list[str]):
                 pass
             progress_file.unlink(missing_ok=True)
 
-        stdout = process.stdout.read() if process.stdout else ""
+        try:
+            log_f.close()
+        except Exception:
+            pass
+        stdout = ""
+        if log_path.exists():
+            try:
+                stdout = log_path.read_text(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+        print(
+            f"[train-local] job={job_id[:8]}… subprocess finished rc={process.returncode} "
+            f"log_file={log_path}",
+            flush=True,
+        )
 
         if process.returncode == 0:
             with _training_lock:
@@ -1800,14 +2176,16 @@ def finetune_dinov2_endpoint(
     unfreeze_layers: int = 4,
     version: str = "",
     force: bool = False,
+    use_runpod: bool = False,
 ):
-    """Fine-tune DINOv2 backbone. Requires 16GB+ VRAM (RunPod recommended)."""
+    """Fine-tune DINOv2. Default: runs on this machine (CPU/GPU). Set use_runpod=true for RunPod GPU."""
     version = (version or _get_current_training_version()).strip() or DEFAULT_TRAINING_VERSION
     params = {
         "epochs": epochs,
         "batch_size": batch_size,
         "lr": lr,
         "unfreeze_layers": unfreeze_layers,
+        "use_runpod": use_runpod,
     }
     dataset_hash = _dataset_hash_for_type("dinov2_finetune")
     hp_sig = _hparam_signature("dinov2_finetune", version, params)
@@ -1849,12 +2227,31 @@ def finetune_dinov2_endpoint(
         snapshot = dict(_training_jobs[job_id])
     _append_training_history(snapshot)
     _append_model_registry(snapshot)
-    threading.Thread(
-        target=_run_training_job,
-        args=(job_id, "finetune_dinov2.py", args),
-        daemon=True,
-    ).start()
-    return {"job_id": job_id, "type": "dinov2_finetune", "epochs": epochs, "version": version, "skipped": False}
+    print(
+        f"[finetune-dinov2] queued job_id={job_id} use_runpod={use_runpod} "
+        f"epochs={epochs} batch_size={batch_size} lr={lr} version={version}",
+        flush=True,
+    )
+    if use_runpod:
+        threading.Thread(
+            target=run_dinov2_finetune_gpu_job,
+            args=(job_id, epochs, batch_size, lr, unfreeze_layers),
+            daemon=True,
+        ).start()
+    else:
+        threading.Thread(
+            target=_run_training_job,
+            args=(job_id, "finetune_dinov2.py", args),
+            daemon=True,
+        ).start()
+    return {
+        "job_id": job_id,
+        "type": "dinov2_finetune",
+        "epochs": epochs,
+        "version": version,
+        "skipped": False,
+        "use_runpod": use_runpod,
+    }
 
 
 @app.get("/training-status/{job_id}")
