@@ -3,7 +3,9 @@ import hashlib
 import json
 import os
 import queue
+import shutil
 import subprocess
+import tempfile
 import threading
 import traceback
 import uuid
@@ -75,6 +77,7 @@ _BATCH_HISTORY_PATH = _BACKEND_ROOT / "batch_history.json"
 
 jobs_lock = threading.Lock()
 jobs: dict[str, dict] = {}
+_batch_history_lock = threading.Lock()
 
 
 def _result_meta_path(job_id: str) -> Path:
@@ -111,17 +114,19 @@ def _load_batch_history() -> list[dict]:
 
 
 def _append_batch_history(entry: dict) -> None:
-    rows = _load_batch_history()
-    rows.append(entry)
-    _BATCH_HISTORY_PATH.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    with _batch_history_lock:
+        rows = _load_batch_history()
+        rows.append(entry)
+        _BATCH_HISTORY_PATH.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def _update_batch_history(job_id: str, updates: dict) -> None:
-    rows = _load_batch_history()
-    for row in rows:
-        if row.get("job_id") == job_id:
-            row.update(updates)
-    _BATCH_HISTORY_PATH.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
+    with _batch_history_lock:
+        rows = _load_batch_history()
+        for row in rows:
+            if row.get("job_id") == job_id:
+                row.update(updates)
+        _BATCH_HISTORY_PATH.write_text(json.dumps(rows, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def create_job() -> str:
@@ -140,8 +145,8 @@ def update_progress(job_id: str, current: int, total: int, message: str):
     pct = int((current / total) * 100) if total > 0 else 0
     with jobs_lock:
         job = jobs.get(job_id)
-    if job:
-        job["queue"].put((pct, message))
+        if job:
+            job["queue"].put((pct, message))
 
 
 def run_build_index_job(job_id: str):
@@ -231,9 +236,141 @@ RUNPOD_TEMPLATE = "runpod-torch-v21"
 RUNPOD_REPO = "https://github.com/Ethan5767/chhat-project.git"
 
 
+CLASSIFIER_GPU_FALLBACK_CHAIN = [
+    "NVIDIA GeForce RTX 4090",
+    "NVIDIA RTX A4000",
+    "NVIDIA RTX A5000",
+    "NVIDIA L4",
+    "NVIDIA GeForce RTX 3090",
+    "NVIDIA GeForce RTX 4080",
+    "NVIDIA RTX A4500",
+    "NVIDIA Tesla T4",
+    "NVIDIA GeForce RTX 3070",
+    "NVIDIA GeForce RTX 3060",
+]
+
+
+def _classifier_gpu_candidates():
+    """Preferred GPU first (RUNPOD_CLASSIFIER_GPU_ID), then fallbacks — avoids a single busy type failing the job."""
+    preferred = (os.environ.get("RUNPOD_CLASSIFIER_GPU_ID") or "").strip()
+    out = []
+    if preferred:
+        out.append(preferred)
+    for g in CLASSIFIER_GPU_FALLBACK_CHAIN:
+        if g not in out:
+            out.append(g)
+    return out
+
+
+def _classifier_cloud_types():
+    """RunPod cloudType values to try in order.
+
+    Default SECURE then COMMUNITY — fewer 'no resources' failures (SECURE is usually easier to place).
+    Cheaper-first: RUNPOD_CLASSIFIER_CLOUD_TYPE=COMMUNITY,SECURE
+    """
+    raw = (os.environ.get("RUNPOD_CLASSIFIER_CLOUD_TYPE") or "").strip()
+    if raw:
+        return [x.strip() for x in raw.split(",") if x.strip()]
+    return ["SECURE", "COMMUNITY"]
+
+
+def _classifier_volume_gb() -> int:
+    """Workspace volume size for classifier pods (smaller can be easier to schedule)."""
+    try:
+        v = int((os.environ.get("RUNPOD_CLASSIFIER_VOLUME_GB") or "50").strip())
+    except ValueError:
+        v = 50
+    return max(10, min(v, 200))
+
+
+def _classifier_deploy_retry_settings():
+    """(rounds, seconds_between_rounds) — full GPU×cloud matrix retried when everything is busy."""
+    try:
+        rounds = int((os.environ.get("RUNPOD_CLASSIFIER_DEPLOY_RETRIES") or "5").strip())
+    except ValueError:
+        rounds = 5
+    try:
+        pause = int((os.environ.get("RUNPOD_CLASSIFIER_DEPLOY_RETRY_SECS") or "40").strip())
+    except ValueError:
+        pause = 40
+    return max(1, min(rounds, 20)), max(15, min(pause, 300))
+
+
+def _get_runpod_classifier_gpu_id() -> str:
+    """Log label / default GPU id for classifier RunPod jobs."""
+    c = _classifier_gpu_candidates()
+    return c[0] if c else CLASSIFIER_GPU_FALLBACK_CHAIN[0]
+
+
 def _log_runpod(msg: str) -> None:
     """Console log for RunPod / GPU jobs (visible in journalctl for systemd)."""
     print(f"[runpod] {msg}", flush=True)
+
+
+def _tar_backend_references_for_runpod(refs_tar: Path) -> subprocess.CompletedProcess:
+    """Tar backend/references for upload to a RunPod pod.
+
+    Copies to a temp directory first (rsync or shutil.copytree) so the archive is taken from a
+    stable snapshot — avoids tar exit 1 from concurrent writes under the live references tree.
+    """
+    src = _BACKEND_ROOT / "references"
+    if not src.is_dir():
+        return subprocess.CompletedProcess(
+            args=("_tar_backend_references_for_runpod",),
+            returncode=1,
+            stdout="",
+            stderr=f"references directory missing: {src}",
+        )
+
+    staging_root = Path(tempfile.mkdtemp(prefix="refs_tar_stage_", dir="/tmp"))
+    staging_refs = staging_root / "references"
+    try:
+        rsync_bin = shutil.which("rsync")
+        if rsync_bin:
+            r0 = subprocess.run(
+                [rsync_bin, "-a", "--", f"{str(src)}/", f"{str(staging_refs)}/"],
+                capture_output=True,
+                text=True,
+                timeout=3600,
+            )
+        else:
+            _log_runpod("refs: rsync not found, using shutil.copytree (slower)")
+            try:
+                shutil.copytree(src, staging_refs)
+            except Exception as exc:
+                return subprocess.CompletedProcess(
+                    args=("copytree",),
+                    returncode=1,
+                    stdout="",
+                    stderr=str(exc),
+                )
+            r0 = subprocess.CompletedProcess(
+                args=("copytree",), returncode=0, stdout="", stderr="",
+            )
+
+        if r0.returncode != 0:
+            return r0
+
+        return subprocess.run(
+            ["tar", "-czf", str(refs_tar), "-C", str(staging_root), "references"],
+            capture_output=True,
+            text=True,
+            timeout=900,
+        )
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
+
+
+def _fmt_subprocess_fail(proc: subprocess.CompletedProcess, label: str) -> str:
+    """Human-readable snippet for failed tar/rsync (stderr is often empty)."""
+    parts = [f"{label} rc={proc.returncode}"]
+    if proc.stderr and proc.stderr.strip():
+        parts.append(f"stderr={proc.stderr.strip()[:800]}")
+    if proc.stdout and proc.stdout.strip():
+        parts.append(f"stdout={proc.stdout.strip()[:800]}")
+    if len(parts) == 1:
+        parts.append("(no stderr/stdout captured)")
+    return " | ".join(parts)
 
 
 def _mask_secret_hint(value: str) -> str:
@@ -274,41 +411,71 @@ def _runpod_gql(api_key: str, query: str, variables: dict = None) -> dict:
     return data["data"]
 
 
+RUNPOD_SSH_HOST = "ssh.runpod.io"
+
+
 def _ssh_scp_common_opts(key: str) -> list:
-    """OpenSSH options for non-interactive access to ephemeral RunPod pods (direct IP:port, not ssh.runpod.io)."""
+    """OpenSSH options for non-interactive access to ephemeral RunPod pods via ssh.runpod.io proxy."""
     return [
         "-o", "StrictHostKeyChecking=no",
         "-o", "UserKnownHostsFile=/dev/null",
-        "-o", "ConnectTimeout=15",
+        "-o", "ConnectTimeout=30",
         "-o", "IdentitiesOnly=yes",
-        "-o", "BatchMode=yes",
         "-i", key,
     ]
 
 
-def _ssh_cmd(host: str, port: int, key: str, command: str, timeout: int = 300) -> subprocess.CompletedProcess:
-    """Run command on remote via SSH (root@pod public IP + mapped port from RunPod GraphQL)."""
+def _runpod_ssh_user(pod_id: str, pod_host_id: str) -> str:
+    """Build the SSH username for RunPod proxy: {pod_id}-{podHostId}@ssh.runpod.io."""
+    return f"{pod_id}-{pod_host_id}"
+
+
+def _ssh_cmd(host: str, port: int, key: str, command: str, timeout: int = 300,
+             pod_id: str = "", pod_host_id: str = "") -> subprocess.CompletedProcess:
+    """Run command on remote via SSH. Uses ssh.runpod.io proxy if pod_id/pod_host_id provided."""
     opts = _ssh_scp_common_opts(key)
+    if pod_id and pod_host_id:
+        user = _runpod_ssh_user(pod_id, pod_host_id)
+        return subprocess.run(
+            ["ssh", "-tt", *opts,
+             "-o", "ServerAliveInterval=30",
+             "-p", "22", f"{user}@{RUNPOD_SSH_HOST}", command],
+            capture_output=True, text=True, timeout=timeout,
+        )
     return subprocess.run(
-        ["ssh", "-T", *opts,
+        ["ssh", "-tt", *opts,
          "-o", "ServerAliveInterval=30",
          "-p", str(port), f"root@{host}", command],
         capture_output=True, text=True, timeout=timeout,
     )
 
 
-def _scp_to(host: str, port: int, key: str, local: str, remote: str, timeout: int = 300):
-    """Upload file to remote host via SCP."""
+def _scp_to(host: str, port: int, key: str, local: str, remote: str, timeout: int = 300,
+            pod_id: str = "", pod_host_id: str = ""):
+    """Upload file to remote host via SCP. Uses ssh.runpod.io proxy if pod_id/pod_host_id provided."""
     opts = _ssh_scp_common_opts(key)
+    if pod_id and pod_host_id:
+        user = _runpod_ssh_user(pod_id, pod_host_id)
+        return subprocess.run(
+            ["scp", *opts, "-P", "22", local, f"{user}@{RUNPOD_SSH_HOST}:{remote}"],
+            capture_output=True, text=True, timeout=timeout,
+        )
     return subprocess.run(
         ["scp", *opts, "-P", str(port), local, f"root@{host}:{remote}"],
         capture_output=True, text=True, timeout=timeout,
     )
 
 
-def _scp_from(host: str, port: int, key: str, remote: str, local: str, timeout: int = 300):
-    """Download file from remote host via SCP."""
+def _scp_from(host: str, port: int, key: str, remote: str, local: str, timeout: int = 300,
+              pod_id: str = "", pod_host_id: str = ""):
+    """Download file from remote host via SCP. Uses ssh.runpod.io proxy if pod_id/pod_host_id provided."""
     opts = _ssh_scp_common_opts(key)
+    if pod_id and pod_host_id:
+        user = _runpod_ssh_user(pod_id, pod_host_id)
+        return subprocess.run(
+            ["scp", *opts, "-P", "22", f"{user}@{RUNPOD_SSH_HOST}:{remote}", local],
+            capture_output=True, text=True, timeout=timeout,
+        )
     return subprocess.run(
         ["scp", *opts, "-P", str(port), f"root@{host}:{remote}", local],
         capture_output=True, text=True, timeout=timeout,
@@ -360,8 +527,9 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
                 "ports": "22/tcp",
             }})["podFindAndDeployOnDemand"]
         pod_id = pod["id"]
+        pod_host_id = (pod.get("machine") or {}).get("podHostId", "")
         cost_hr = pod.get("costPerHr", 0)
-        _log_runpod(f"gpu-batch: pod created id={pod_id} ~${cost_hr}/hr template={RUNPOD_TEMPLATE} gpu={RUNPOD_GPU_ID}")
+        _log_runpod(f"gpu-batch: pod created id={pod_id} host={pod_host_id} ~${cost_hr}/hr template={RUNPOD_TEMPLATE} gpu={RUNPOD_GPU_ID}")
         update_progress(job_id, 5, 100, f"Pod created ({pod_id[:8]}..., ${cost_hr}/hr). Waiting for SSH...")
 
         # 2. Wait for SSH port
@@ -392,22 +560,23 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
 
         # Find SSH key on server
         ssh_key = None
-        for key_path in [
+        for key_path in (
+            os.path.expanduser("~/.ssh/runpod_ed25519"),
             os.path.expanduser("~/.runpod/ssh/RunPod-Key-Go"),
             os.path.expanduser("~/.ssh/id_ed25519"),
             os.path.expanduser("~/.ssh/id_rsa"),
-        ]:
+        ):
             if os.path.exists(key_path):
                 ssh_key = key_path
                 break
         if not ssh_key:
-            raise RuntimeError("No SSH key found on server. Add key to ~/.ssh/ or run runpodctl config.")
+            raise RuntimeError("No SSH key found (~/.ssh/runpod_ed25519, ~/.runpod/ssh/ or ~/.ssh/)")
 
         _log_runpod(f"gpu-batch: using SSH identity {ssh_key}")
 
         # 3. Test SSH connection
         for attempt in range(6):
-            r = _ssh_cmd(ssh_host, ssh_port, ssh_key, "echo SSH_OK", timeout=20)
+            r = _ssh_cmd(ssh_host, ssh_port, ssh_key, "echo SSH_OK", timeout=20, pod_id=pod_id, pod_host_id=pod_host_id)
             if "SSH_OK" in (r.stdout or ""):
                 _log_runpod(f"gpu-batch: SSH OK (attempt {attempt + 1})")
                 break
@@ -423,26 +592,26 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
         # 4. Clone repo and bootstrap
         r = _ssh_cmd(ssh_host, ssh_port, ssh_key,
                       f"ls /workspace/chhat-project/train.py 2>/dev/null && echo REPO_EXISTS || echo NEED_CLONE",
-                      timeout=30)
+                      timeout=30, pod_id=pod_id, pod_host_id=pod_host_id)
         if "NEED_CLONE" in r.stdout:
             _log_runpod("gpu-batch: cloning repo + bootstrap on pod (may take several minutes)")
             update_progress(job_id, 18, 100, "Cloning repository and installing dependencies...")
             r = _ssh_cmd(ssh_host, ssh_port, ssh_key,
                           f"cd /workspace && git clone {RUNPOD_REPO} && cd chhat-project && bash runpod/bootstrap_training_pod.sh",
-                          timeout=600)
+                          timeout=600, pod_id=pod_id, pod_host_id=pod_host_id)
             if r.returncode != 0:
                 raise RuntimeError(f"Bootstrap failed: {r.stdout[-500:]}")
             _log_runpod("gpu-batch: bootstrap finished")
         else:
             _log_runpod("gpu-batch: repo exists on pod; git pull")
-            _ssh_cmd(ssh_host, ssh_port, ssh_key, "cd /workspace/chhat-project && git pull", timeout=60)
+            _ssh_cmd(ssh_host, ssh_port, ssh_key, "cd /workspace/chhat-project && git pull", timeout=60, pod_id=pod_id, pod_host_id=pod_host_id)
 
         update_progress(job_id, 25, 100, "Uploading CSV...")
         _log_runpod(f"gpu-batch: uploading CSV ({csv_path.name})")
 
         # 5. Upload CSV
         r = _scp_to(ssh_host, ssh_port, ssh_key, str(csv_path),
-                     "/workspace/chhat-project/backend/uploads/", timeout=120)
+                     "/workspace/chhat-project/backend/uploads/", timeout=120, pod_id=pod_id, pod_host_id=pod_host_id)
         if r.returncode != 0:
             raise RuntimeError(f"CSV upload failed: {r.stderr[:200]}")
 
@@ -459,7 +628,7 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
                       f"out = run_pipeline('{remote_csv}'); "
                       f"print(f'RESULT_PATH={{out}}')"
                       f"\"",
-                      timeout=7200)  # 2 hour timeout for large batches
+                      timeout=7200, pod_id=pod_id, pod_host_id=pod_host_id)  # 2 hour timeout for large batches
 
         if r.returncode != 0:
             raise RuntimeError(f"Pipeline failed on GPU: {r.stdout[-500:]}")
@@ -476,7 +645,7 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
 
         # 7. Download results
         job_out_path = RESULTS_DIR / f"{job_id}_{csv_path.stem}_results.csv"
-        r = _scp_from(ssh_host, ssh_port, ssh_key, remote_result, str(job_out_path), timeout=120)
+        r = _scp_from(ssh_host, ssh_port, ssh_key, remote_result, str(job_out_path), timeout=120, pod_id=pod_id, pod_host_id=pod_host_id)
         if r.returncode != 0:
             raise RuntimeError(f"Result download failed: {r.stderr[:200]}")
 
@@ -567,14 +736,9 @@ def run_dinov2_finetune_gpu_job(
         _update_model_registry(job_id, {"status": "running", "last_update": _now_iso()})
 
         _log_runpod(f"dino-gpu: tarring backend/references -> {refs_tar.name}")
-        r_tar = subprocess.run(
-            ["tar", "czf", str(refs_tar), "-C", str(_BACKEND_ROOT), "references"],
-            capture_output=True,
-            text=True,
-            timeout=900,
-        )
+        r_tar = _tar_backend_references_for_runpod(refs_tar)
         if r_tar.returncode != 0:
-            raise RuntimeError(f"Packaging references failed: {r_tar.stderr[:500]}")
+            raise RuntimeError(_fmt_subprocess_fail(r_tar, "Packaging references failed"))
         sz = refs_tar.stat().st_size if refs_tar.exists() else 0
         _log_runpod(f"dino-gpu: references archive OK size_bytes={sz}")
 
@@ -594,6 +758,7 @@ def run_dinov2_finetune_gpu_job(
                 "ports": "22/tcp",
             }})["podFindAndDeployOnDemand"]
         pod_id = pod["id"]
+        pod_host_id = (pod.get("machine") or {}).get("podHostId", "")
         _log_runpod(f"dino-gpu: pod id={pod_id} cost~${pod.get('costPerHr', 0)}/hr")
 
         ssh_host = None
@@ -622,6 +787,7 @@ def run_dinov2_finetune_gpu_job(
 
         ssh_key = None
         for key_path in (
+            os.path.expanduser("~/.ssh/runpod_ed25519"),
             os.path.expanduser("~/.runpod/ssh/RunPod-Key-Go"),
             os.path.expanduser("~/.ssh/id_ed25519"),
             os.path.expanduser("~/.ssh/id_rsa"),
@@ -630,12 +796,12 @@ def run_dinov2_finetune_gpu_job(
                 ssh_key = key_path
                 break
         if not ssh_key:
-            raise RuntimeError("No SSH private key found (~/.runpod/ssh/ or ~/.ssh/)")
+            raise RuntimeError("No SSH private key found (~/.ssh/runpod_ed25519, ~/.runpod/ssh/ or ~/.ssh/)")
 
         _log_runpod(f"dino-gpu: SSH identity {ssh_key}")
         last_chk = None
         for attempt in range(8):
-            last_chk = _ssh_cmd(ssh_host, ssh_port, ssh_key, "echo SSH_OK", timeout=25)
+            last_chk = _ssh_cmd(ssh_host, ssh_port, ssh_key, "echo SSH_OK", timeout=25, pod_id=pod_id, pod_host_id=pod_host_id)
             if "SSH_OK" in (last_chk.stdout or ""):
                 _log_runpod(f"dino-gpu: SSH OK (attempt {attempt + 1})")
                 break
@@ -649,7 +815,7 @@ def run_dinov2_finetune_gpu_job(
         chk = _ssh_cmd(
             ssh_host, ssh_port, ssh_key,
             "test -f /workspace/chhat-project/finetune_dinov2.py && echo OK || echo MISSING",
-            timeout=40,
+            timeout=40, pod_id=pod_id, pod_host_id=pod_host_id,
         )
         if "MISSING" in (chk.stdout or ""):
             _log_runpod("dino-gpu: repo missing on pod — clone + bootstrap (long)")
@@ -658,7 +824,7 @@ def run_dinov2_finetune_gpu_job(
                 ssh_host, ssh_port, ssh_key,
                 f"cd /workspace && rm -rf chhat-project && git clone {RUNPOD_REPO} chhat-project "
                 f"&& cd chhat-project && bash runpod/bootstrap_training_pod.sh",
-                timeout=900,
+                timeout=900, pod_id=pod_id, pod_host_id=pod_host_id,
             )
             if br.returncode != 0:
                 raise RuntimeError(f"Pod bootstrap failed: {(br.stdout or '')[-800:]}")
@@ -670,7 +836,7 @@ def run_dinov2_finetune_gpu_job(
         up = _scp_to(
             ssh_host, ssh_port, ssh_key, str(refs_tar),
             "/workspace/chhat-project/backend/references_upload.tar.gz",
-            timeout=600,
+            timeout=600, pod_id=pod_id, pod_host_id=pod_host_id,
         )
         if up.returncode != 0:
             raise RuntimeError(f"SCP references to pod failed: {(up.stderr or '')[:400]}")
@@ -680,7 +846,7 @@ def run_dinov2_finetune_gpu_job(
             ssh_host, ssh_port, ssh_key,
             "cd /workspace/chhat-project/backend && rm -rf references && mkdir -p references && "
             "tar xzf references_upload.tar.gz && rm -f references_upload.tar.gz",
-            timeout=180,
+            timeout=180, pod_id=pod_id, pod_host_id=pod_host_id,
         )
         if un.returncode != 0:
             raise RuntimeError(f"Unpack references on pod failed: {(un.stdout or un.stderr or '')[-600:]}")
@@ -702,7 +868,7 @@ def run_dinov2_finetune_gpu_job(
                     pr = _ssh_cmd(
                         ssh_host, ssh_port, ssh_key,
                         f"cat {progress_remote} 2>/dev/null || true",
-                        timeout=25,
+                        timeout=25, pod_id=pod_id, pod_host_id=pod_host_id,
                     )
                     txt = (pr.stdout or "").strip()
                     if txt.startswith("{"):
@@ -734,7 +900,7 @@ def run_dinov2_finetune_gpu_job(
         poller.start()
 
         _log_runpod("dino-gpu: starting finetune_dinov2.py on pod (up to 8h) — progress polled every ~12s")
-        r_ft = _ssh_cmd(ssh_host, ssh_port, ssh_key, ft_cmd, timeout=8 * 3600)
+        r_ft = _ssh_cmd(ssh_host, ssh_port, ssh_key, ft_cmd, timeout=8 * 3600, pod_id=pod_id, pod_host_id=pod_host_id)
         stop_poll.set()
         poller.join(timeout=8)
 
@@ -749,7 +915,7 @@ def run_dinov2_finetune_gpu_job(
             remote_p = f"/workspace/chhat-project/backend/classifier_model/{fname}"
             local_p = str(out_dir / fname)
             _log_runpod(f"dino-gpu: downloading {fname} from pod…")
-            dl = _scp_from(ssh_host, ssh_port, ssh_key, remote_p, local_p, timeout=600)
+            dl = _scp_from(ssh_host, ssh_port, ssh_key, remote_p, local_p, timeout=600, pod_id=pod_id, pod_host_id=pod_host_id)
             if dl.returncode != 0:
                 raise RuntimeError(f"Download {fname} from pod failed: {(dl.stderr or '')[:400]}")
             _log_runpod(f"dino-gpu: saved {local_p}")
@@ -805,13 +971,373 @@ def run_dinov2_finetune_gpu_job(
                 _log_runpod(f"dino-gpu: WARNING pod terminate failed id={pod_id}: {exc}")
 
 
+def run_classifier_training_runpod_job(
+    job_id: str,
+    epochs: int,
+    batch_size: int,
+    embed_batch_size: int,
+    lr: float,
+    packaging_type: str,
+):
+    """Run brand_classifier.py on a RunPod GPU (uploads references, downloads weights for one packaging type)."""
+    import time as time_module
+
+    api_key = _get_runpod_api_key()
+    if not api_key:
+        err = "RUNPOD_API_KEY not set. Add it to .env on the server."
+        _log_runpod(f"classifier-gpu job={job_id[:8]}… FAILED: {err}")
+        with _training_lock:
+            _training_jobs[job_id]["status"] = "error"
+            _training_jobs[job_id]["error"] = err
+            _training_jobs[job_id]["end_time"] = _now_iso()
+        _update_training_history(job_id, {"status": "error", "error": err, "end_time": _now_iso()})
+        _update_model_registry(job_id, {"status": "error", "error": err, "end_time": _now_iso()})
+        return
+
+    gpu_id = _get_runpod_classifier_gpu_id()
+    _log_runpod(
+        f"classifier-gpu job={job_id[:8]}… start epochs={epochs} batch={batch_size} "
+        f"embed_batch={embed_batch_size} lr={lr} packaging={packaging_type} gpu={gpu_id} "
+        f"key={_mask_secret_hint(api_key)}",
+    )
+    refs_tar = Path(f"/tmp/references_classifier_{job_id}.tar.gz")
+    pod_id = None
+    try:
+        with _training_lock:
+            _training_jobs[job_id].update({
+                "status": "running",
+                "progress": {
+                    "epoch": 0,
+                    "total_epochs": epochs,
+                    "status": "starting",
+                    "note": "Provisioning RunPod GPU for brand classifier",
+                },
+                "error": None,
+                "last_update": _now_iso(),
+            })
+        _update_model_registry(job_id, {"status": "running", "last_update": _now_iso()})
+
+        _log_runpod(f"classifier-gpu: tarring backend/references -> {refs_tar.name}")
+        r_tar = _tar_backend_references_for_runpod(refs_tar)
+        if r_tar.returncode != 0:
+            raise RuntimeError(_fmt_subprocess_fail(r_tar, "Packaging references failed"))
+        sz = refs_tar.stat().st_size if refs_tar.exists() else 0
+        _log_runpod(f"classifier-gpu: references archive OK size_bytes={sz}")
+
+        _log_runpod("classifier-gpu: creating RunPod pod…")
+        gpu_candidates = _classifier_gpu_candidates()
+        cloud_types = _classifier_cloud_types()
+        vol_gb = _classifier_volume_gb()
+        deploy_rounds, deploy_pause = _classifier_deploy_retry_settings()
+        pod = None
+        used_cloud = None
+        for round_idx in range(deploy_rounds):
+            if round_idx > 0:
+                _log_runpod(
+                    f"classifier-gpu: capacity retry {round_idx + 1}/{deploy_rounds} "
+                    f"(waiting {deploy_pause}s, then retry all cloud×GPU combos)…",
+                )
+                time_module.sleep(deploy_pause)
+            for try_cloud in cloud_types:
+                for try_gpu in gpu_candidates:
+                    try:
+                        _log_runpod(
+                            f"classifier-gpu: try round={round_idx + 1} cloud={try_cloud} "
+                            f"gpu={try_gpu} volume={vol_gb}Gi…",
+                        )
+                        pod = _runpod_gql(api_key, """
+                            mutation CreatePod($input: PodFindAndDeployOnDemandInput!) {
+                                podFindAndDeployOnDemand(input: $input) { id costPerHr machine { podHostId } }
+                            }""", {"input": {
+                                "name": f"cls-{job_id[:8]}",
+                                "templateId": RUNPOD_TEMPLATE,
+                                "gpuTypeId": try_gpu,
+                                "cloudType": try_cloud,
+                                "containerDiskInGb": 20,
+                                "volumeInGb": vol_gb,
+                                "volumeMountPath": "/workspace",
+                                "gpuCount": 1,
+                                "ports": "22/tcp",
+                            }})["podFindAndDeployOnDemand"]
+                        gpu_id = try_gpu
+                        used_cloud = try_cloud
+                        break
+                    except RuntimeError as exc:
+                        _log_runpod(f"classifier-gpu: cloud={try_cloud} gpu={try_gpu} failed: {exc}")
+                        continue
+                if pod is not None:
+                    break
+            if pod is not None:
+                break
+        if pod is None:
+            raise RuntimeError(
+                f"No RunPod capacity for classifier after {deploy_rounds} round(s) × "
+                f"clouds={cloud_types} gpus={len(gpu_candidates)} types volume={vol_gb}Gi. "
+                "Try later, reduce RUNPOD_CLASSIFIER_VOLUME_GB, set RUNPOD_CLASSIFIER_CLOUD_TYPE=SECURE, "
+                "or set RUNPOD_CLASSIFIER_GPU_ID to a type shown available in the RunPod UI.",
+            )
+        if used_cloud:
+            _log_runpod(f"classifier-gpu: using cloud={used_cloud} gpu={gpu_id} volume={vol_gb}Gi")
+        pod_id = pod["id"]
+        pod_host_id = (pod.get("machine") or {}).get("podHostId", "")
+        with _training_lock:
+            _training_jobs[job_id]["runpod_pod_id"] = pod_id
+        _log_runpod(
+            f"classifier-gpu: pod id={pod_id} cost~${pod.get('costPerHr', 0)}/hr "
+            f"gpu={gpu_id}",
+        )
+
+        ssh_host = None
+        ssh_port = None
+        for attempt in range(30):
+            d = _runpod_gql(api_key, f"""query {{
+                pod(input: {{ podId: "{pod_id}" }}) {{
+                    runtime {{ uptimeInSeconds ports {{ ip publicPort privatePort type }} }}
+                }}
+            }}""")
+            rt = d["pod"].get("runtime")
+            if rt and rt.get("ports"):
+                ssh_ports = [p for p in rt["ports"] if p["privatePort"] == 22]
+                if ssh_ports:
+                    ssh_host = ssh_ports[0]["ip"]
+                    ssh_port = ssh_ports[0]["publicPort"]
+                    break
+            time_module.sleep(10)
+            if attempt % 3 == 0 and attempt > 0:
+                _log_runpod(f"classifier-gpu: waiting for SSH port ({attempt}/30) pod={pod_id[:8]}…")
+        if not ssh_host:
+            raise RuntimeError("RunPod SSH port not available after ~5 minutes")
+
+        _log_runpod(f"classifier-gpu: SSH root@{ssh_host}:{ssh_port} (sleep 60s for sshd)")
+        time_module.sleep(60)
+
+        ssh_key = None
+        for key_path in (
+            os.path.expanduser("~/.ssh/runpod_ed25519"),
+            os.path.expanduser("~/.runpod/ssh/RunPod-Key-Go"),
+            os.path.expanduser("~/.ssh/id_ed25519"),
+            os.path.expanduser("~/.ssh/id_rsa"),
+        ):
+            if os.path.exists(key_path):
+                ssh_key = key_path
+                break
+        if not ssh_key:
+            raise RuntimeError("No SSH private key found (~/.ssh/runpod_ed25519, ~/.runpod/ssh/ or ~/.ssh/)")
+
+        _log_runpod(f"classifier-gpu: SSH identity {ssh_key}")
+        last_chk = None
+        for attempt in range(20):
+            last_chk = _ssh_cmd(ssh_host, ssh_port, ssh_key, "echo SSH_OK", timeout=25, pod_id=pod_id, pod_host_id=pod_host_id)
+            if "SSH_OK" in (last_chk.stdout or ""):
+                _log_runpod(f"classifier-gpu: SSH OK (attempt {attempt + 1})")
+                break
+            o = (last_chk.stdout or "").strip()[:100]
+            e = (last_chk.stderr or "").strip()[:160]
+            _log_runpod(f"classifier-gpu: SSH probe rc={last_chk.returncode} out={o!r} err={e!r}")
+            time_module.sleep(15)
+        else:
+            raise RuntimeError(f"SSH to pod failed after 20 attempts (~5min): {(last_chk.stderr or last_chk.stdout or '')[:300]}")
+
+        chk = _ssh_cmd(
+            ssh_host, ssh_port, ssh_key,
+            "test -f /workspace/chhat-project/brand_classifier.py && echo OK || echo MISSING",
+            timeout=40, pod_id=pod_id, pod_host_id=pod_host_id,
+        )
+        if "MISSING" in (chk.stdout or ""):
+            _log_runpod("classifier-gpu: repo missing on pod — clone + bootstrap (long)")
+            br = _ssh_cmd(
+                ssh_host, ssh_port, ssh_key,
+                f"cd /workspace && rm -rf chhat-project && git clone {RUNPOD_REPO} chhat-project "
+                f"&& cd chhat-project && bash runpod/bootstrap_training_pod.sh",
+                timeout=900, pod_id=pod_id, pod_host_id=pod_host_id,
+            )
+            if br.returncode != 0:
+                raise RuntimeError(f"Pod bootstrap failed: {(br.stdout or '')[-800:]}")
+            _log_runpod("classifier-gpu: bootstrap complete")
+        else:
+            _log_runpod("classifier-gpu: repo present on pod")
+
+        _log_runpod("classifier-gpu: SCP references archive to pod…")
+        up = _scp_to(
+            ssh_host, ssh_port, ssh_key, str(refs_tar),
+            "/workspace/chhat-project/backend/references_upload.tar.gz",
+            timeout=600, pod_id=pod_id, pod_host_id=pod_host_id,
+        )
+        if up.returncode != 0:
+            raise RuntimeError(f"SCP references to pod failed: {(up.stderr or '')[:400]}")
+
+        un = _ssh_cmd(
+            ssh_host, ssh_port, ssh_key,
+            "cd /workspace/chhat-project/backend && rm -rf references && mkdir -p references && "
+            "tar xzf references_upload.tar.gz && rm -f references_upload.tar.gz",
+            timeout=180, pod_id=pod_id, pod_host_id=pod_host_id,
+        )
+        if un.returncode != 0:
+            raise RuntimeError(f"Unpack references on pod failed: {(un.stdout or un.stderr or '')[-600:]}")
+        _log_runpod("classifier-gpu: references unpacked on pod")
+
+        progress_remote = f"/tmp/classifier_progress_{job_id}.json"
+        bc_cmd = (
+            f"cd /workspace/chhat-project && source .venv/bin/activate && "
+            f"python brand_classifier.py --epochs {epochs} --batch-size {batch_size} "
+            f"--embed-batch-size {embed_batch_size} --lr {lr} "
+            f"--packaging-type {packaging_type} --progress-file {progress_remote}"
+        )
+
+        stop_poll = threading.Event()
+        poll_state = {"last_epoch": -1}
+
+        def _poll_remote_progress():
+            while not stop_poll.wait(12):
+                try:
+                    pr = _ssh_cmd(
+                        ssh_host, ssh_port, ssh_key,
+                        f"cat {progress_remote} 2>/dev/null || true",
+                        timeout=25, pod_id=pod_id, pod_host_id=pod_host_id,
+                    )
+                    txt = (pr.stdout or "").strip()
+                    if txt.startswith("{"):
+                        data = json.loads(txt)
+                        with _training_lock:
+                            _training_jobs[job_id]["progress"] = data
+                            _training_jobs[job_id]["last_update"] = _now_iso()
+                        _update_model_registry(
+                            job_id,
+                            {
+                                "status": "running",
+                                "progress": data,
+                                "last_update": _now_iso(),
+                                **_metrics_from_progress(data),
+                            },
+                        )
+                        ep = int(data.get("epoch", 0) or 0)
+                        if ep != poll_state["last_epoch"]:
+                            poll_state["last_epoch"] = ep
+                            st = data.get("status", "")
+                            va = data.get("val_acc", 0)
+                            _log_runpod(
+                                f"classifier-gpu: remote progress epoch={ep}/{epochs} status={st} val_acc={va}",
+                            )
+                except Exception:
+                    pass
+
+        poller = threading.Thread(target=_poll_remote_progress, daemon=True)
+        poller.start()
+
+        _log_runpod("classifier-gpu: starting brand_classifier.py on pod (up to 8h) — progress polled ~12s")
+        r_bc = _ssh_cmd(ssh_host, ssh_port, ssh_key, bc_cmd, timeout=8 * 3600, pod_id=pod_id, pod_host_id=pod_host_id)
+        stop_poll.set()
+        poller.join(timeout=8)
+
+        if r_bc.returncode != 0:
+            with _training_lock:
+                if _training_jobs.get(job_id, {}).get("stop_requested"):
+                    _training_jobs[job_id]["status"] = "stopped"
+                    _training_jobs[job_id]["error"] = None
+                    _training_jobs[job_id]["end_time"] = _now_iso()
+                    _training_jobs[job_id]["progress"] = {
+                        "status": "stopped",
+                        "note": "Training stopped (RunPod pod terminated)",
+                    }
+            with _training_lock:
+                if _training_jobs.get(job_id, {}).get("status") == "stopped":
+                    _update_training_history(job_id, {"status": "stopped", "end_time": _now_iso()})
+                    _update_model_registry(job_id, {"status": "stopped", "end_time": _now_iso()})
+                    _log_runpod(f"classifier-gpu: stopped job={job_id[:8]}…")
+                    return
+            _log_runpod(f"classifier-gpu: brand_classifier exited rc={r_bc.returncode}")
+            raise RuntimeError(f"Brand classifier on pod failed:\n{(r_bc.stdout or '')[-3500:]}")
+
+        out_sub = _BACKEND_ROOT / "classifier_model" / packaging_type
+        out_sub.mkdir(parents=True, exist_ok=True)
+        for fname in ("best_classifier.pth", "classifier.pth", "class_mapping.json"):
+            remote_p = f"/workspace/chhat-project/backend/classifier_model/{packaging_type}/{fname}"
+            local_p = str(out_sub / fname)
+            _log_runpod(f"classifier-gpu: downloading {packaging_type}/{fname} from pod…")
+            dl = _scp_from(ssh_host, ssh_port, ssh_key, remote_p, local_p, timeout=600, pod_id=pod_id, pod_host_id=pod_host_id)
+            if dl.returncode != 0:
+                raise RuntimeError(f"Download {fname} from pod failed: {(dl.stderr or '')[:400]}")
+            _log_runpod(f"classifier-gpu: saved {local_p}")
+
+        with _training_lock:
+            completed_version = _training_jobs[job_id].get("version", DEFAULT_TRAINING_VERSION)
+            _training_jobs[job_id]["status"] = "done"
+            _training_jobs[job_id]["end_time"] = _now_iso()
+            _training_jobs[job_id]["progress"] = {
+                "epoch": epochs,
+                "total_epochs": epochs,
+                "status": "complete",
+                "note": f"Weights saved under backend/classifier_model/{packaging_type}/",
+            }
+
+        try:
+            reload_classifiers()
+            _log_runpod("classifier-gpu: reload_classifiers OK")
+        except Exception as exc:
+            _log_runpod(f"classifier-gpu: WARNING reload after classifier train: {exc}")
+
+        next_version = _mark_training_completed(str(completed_version))
+        with _training_lock:
+            prog = dict(_training_jobs[job_id].get("progress", {}))
+        _update_training_history(job_id, {
+            "status": "done",
+            "end_time": _now_iso(),
+            "next_version": next_version,
+        })
+        _update_model_registry(job_id, {
+            "status": "done",
+            "end_time": _now_iso(),
+            "next_version": next_version,
+            **_metrics_from_progress(prog),
+        })
+        _log_runpod(f"classifier-gpu: job DONE job={job_id[:8]}… next_version={next_version}")
+
+    except Exception:
+        err = traceback.format_exc()
+        with _training_lock:
+            if _training_jobs.get(job_id, {}).get("stop_requested"):
+                _training_jobs[job_id]["status"] = "stopped"
+                _training_jobs[job_id]["error"] = None
+                _training_jobs[job_id]["end_time"] = _now_iso()
+                _training_jobs[job_id]["progress"] = {
+                    "status": "stopped",
+                    "note": "Training stopped (RunPod pod terminated)",
+                }
+            else:
+                _training_jobs[job_id]["status"] = "error"
+                _training_jobs[job_id]["error"] = err
+                _training_jobs[job_id]["end_time"] = _now_iso()
+        with _training_lock:
+            st = _training_jobs.get(job_id, {}).get("status")
+        if st == "stopped":
+            _update_training_history(job_id, {"status": "stopped", "end_time": _now_iso()})
+            _update_model_registry(job_id, {"status": "stopped", "end_time": _now_iso()})
+        else:
+            _update_training_history(job_id, {"status": "error", "error": err, "end_time": _now_iso()})
+            _update_model_registry(job_id, {"status": "error", "error": err, "end_time": _now_iso()})
+            _log_runpod(f"classifier-gpu: ERROR job={job_id[:8]}…\n{err[:800]}")
+    finally:
+        refs_tar.unlink(missing_ok=True)
+        if pod_id:
+            try:
+                _runpod_gql(api_key, f'mutation {{ podTerminate(input: {{ podId: "{pod_id}" }}) }}')
+                _log_runpod(f"classifier-gpu: pod terminated id={pod_id}")
+            except Exception as exc:
+                _log_runpod(f"classifier-gpu: WARNING pod terminate failed id={pod_id}: {exc}")
+        with _training_lock:
+            _training_jobs[job_id].pop("runpod_pod_id", None)
+
+
 @app.on_event("startup")
 def startup_event():
     device = get_device()
     print(f"[startup] device={device}")
     rp = _get_runpod_api_key()
     if rp:
-        _log_runpod(f"startup: RUNPOD_API_KEY available ({_mask_secret_hint(rp)}) — GPU batch + RunPod DINO enabled")
+        _log_runpod(
+            f"startup: RUNPOD_API_KEY available ({_mask_secret_hint(rp)}) — "
+            f"GPU batch + RunPod DINO + classifier (gpu={_get_runpod_classifier_gpu_id()})",
+        )
     else:
         _log_runpod("startup: RUNPOD_API_KEY not set — GPU batch and RunPod DINO will error until .env is configured")
     if not CLASSIFIER_WEIGHTS.exists() or not CLASS_MAPPING_JSON.exists():
@@ -1139,6 +1665,9 @@ async def upload_coco(coco_file: UploadFile = File(...)):
     DATASETS_DIR.mkdir(parents=True, exist_ok=True)
 
     data = await coco_file.read()
+    MAX_UPLOAD_SIZE = 1024 * 1024 * 1024  # 1 GB
+    if len(data) > MAX_UPLOAD_SIZE:
+        raise HTTPException(status_code=413, detail="File too large (max 1 GB)")
     if lower.endswith(".json"):
         try:
             coco_data = json.loads(data)
@@ -1147,7 +1676,7 @@ async def upload_coco(coco_file: UploadFile = File(...)):
 
         n_images = len(coco_data.get("images", []))
         n_annotations = len(coco_data.get("annotations", []))
-        save_path = DATASETS_DIR / filename
+        save_path = DATASETS_DIR / Path(filename).name
         save_path.write_bytes(data)
         return {
             "status": "uploaded",
@@ -2041,14 +2570,16 @@ def train_classifier_endpoint(
     packaging_type: str = "pack",
     version: str = "",
     force: bool = False,
+    use_runpod: bool = False,
 ):
-    """Train the brand classifier (frozen DINOv2 + MLP head). Works on CPU."""
+    """Train the brand classifier (frozen DINOv2 + MLP head). Default: this machine (CPU/GPU). Set use_runpod=true for RunPod GPU (see RUNPOD_CLASSIFIER_GPU_ID)."""
     version = (version or _get_current_training_version()).strip() or DEFAULT_TRAINING_VERSION
     params = {
         "epochs": epochs,
         "batch_size": batch_size,
         "embed_batch_size": embed_batch_size,
         "lr": lr,
+        "use_runpod": use_runpod,
     }
     dataset_hash = _dataset_hash_for_type("classifier")
     hp_sig = _hparam_signature("classifier", version, params)
@@ -2091,12 +2622,31 @@ def train_classifier_endpoint(
         snapshot = dict(_training_jobs[job_id])
     _append_training_history(snapshot)
     _append_model_registry(snapshot)
-    threading.Thread(
-        target=_run_training_job,
-        args=(job_id, "brand_classifier.py", args),
-        daemon=True,
-    ).start()
-    return {"job_id": job_id, "type": "classifier", "epochs": epochs, "version": version, "skipped": False}
+    print(
+        f"[train-classifier] queued job_id={job_id} use_runpod={use_runpod} "
+        f"epochs={epochs} packaging={packaging_type} version={version}",
+        flush=True,
+    )
+    if use_runpod:
+        threading.Thread(
+            target=run_classifier_training_runpod_job,
+            args=(job_id, epochs, batch_size, embed_batch_size, lr, packaging_type),
+            daemon=True,
+        ).start()
+    else:
+        threading.Thread(
+            target=_run_training_job,
+            args=(job_id, "brand_classifier.py", args),
+            daemon=True,
+        ).start()
+    return {
+        "job_id": job_id,
+        "type": "classifier",
+        "epochs": epochs,
+        "version": version,
+        "skipped": False,
+        "use_runpod": use_runpod,
+    }
 
 
 @app.post("/train-rfdetr")
@@ -2272,7 +2822,7 @@ def training_status(job_id: str):
 
 @app.post("/training-stop/{job_id}")
 def training_stop(job_id: str):
-    """Stop a running training job by terminating its subprocess."""
+    """Stop a running training job by terminating its subprocess or RunPod pod."""
     with _training_lock:
         job = _training_jobs.get(job_id)
         process = _training_processes.get(job_id)
@@ -2284,6 +2834,17 @@ def training_stop(job_id: str):
         job["stop_requested"] = True
         job["status"] = "stopping"
         job["last_update"] = _now_iso()
+        runpod_pod_id = job.get("runpod_pod_id")
+
+    if process is None and runpod_pod_id and status == "running":
+        api_key = _get_runpod_api_key()
+        if api_key:
+            try:
+                _runpod_gql(api_key, f'mutation {{ podTerminate(input: {{ podId: "{runpod_pod_id}" }}) }}')
+                _log_runpod(f"training-stop: terminated RunPod pod {runpod_pod_id} for job {job_id[:8]}…")
+            except Exception as exc:
+                _log_runpod(f"training-stop: RunPod pod terminate failed {runpod_pod_id}: {exc}")
+        return {"job_id": job_id, "status": "stopping", "message": "RunPod pod termination requested."}
 
     if process is None:
         with _training_lock:

@@ -100,10 +100,10 @@ def compute_class_centroids(processor, model, device: str) -> dict[str, np.ndarr
         vecs = []
         for p in paths[:20]:  # Cap at 20 images per class for speed
             try:
-                img = Image.open(p).convert("RGB")
-                vec = embed_single(img, processor, model, device)
-                vecs.append(vec)
-                img.close()
+                with Image.open(p) as img:
+                    img_rgb = img.convert("RGB")
+                    vec = embed_single(img_rgb, processor, model, device)
+                    vecs.append(vec)
             except Exception:
                 continue
         if vecs:
@@ -158,6 +158,7 @@ def process_glass_view():
     saved = 0
     skipped_no_sku = 0
     skipped_no_det = 0
+    skipped_error = 0
     skipped_size = 0
     skipped_aspect = 0
     skipped_similarity = 0
@@ -171,7 +172,7 @@ def process_glass_view():
         try:
             pil_img = Image.open(img_path).convert("RGB")
         except Exception:
-            skipped_no_det += 1
+            skipped_error += 1
             continue
 
         # Detect
@@ -264,6 +265,7 @@ def process_glass_view():
     print(f"  Saved:              {saved}")
     print(f"  Skipped (no SKU):   {skipped_no_sku}")
     print(f"  Skipped (no det):   {skipped_no_det}")
+    print(f"  Skipped (error):    {skipped_error}")
     print(f"  Skipped (too small):{skipped_size}")
     print(f"  Skipped (aspect):   {skipped_aspect}")
     print(f"  Skipped (low sim):  {skipped_similarity}")

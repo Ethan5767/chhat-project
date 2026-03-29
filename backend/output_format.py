@@ -121,50 +121,114 @@ product_TO_Q12B = {v: k for k, v in Q12B_productS.items()}
 # Pipeline uses: mevius_original, esse_change, 555_sphere2_velvet, etc.
 # Display uses: MEVIUS ORIGINAL, ESSE CHANGE, 555 SPHERE2 VELVETY, etc.
 INTERNAL_TO_product = {
-    "mevius_original": "MEVIUS ORIGINAL",
-    "mevius_sky_blue": "MEVIUS SKY BLUE",
-    "mevius_option_purple": "MEVIUS OPTION PURPLE",
-    "mevius_freezy_dew": "MEVIUS FREEZY DEW",
-    "mevius_kimavi": "MEVIUS KIWAMI",
-    "mevius_mint_flow": "MEVIUS MINT FLOW",
-    "winston_night_blue": "WINSTON NIGHT BLUE",
-    "winston_option_purple": "WINSTON OPTION PURPLE",
-    "winston_option_blue": "WINSTON OPTION BLUE",
-    "esse_change": "ESSE CHANGE",
-    "esse_light": "ESSE LIGHTS",
-    "esse_menthol": "ESSE MENTHOL",
-    "esse_double_change": "ESSE OTHERS",
-    "fine_red_hard_pack": "FINE RED HARD PACK",
-    "fine_other": "FINE OTHERS",
-    "555_sphere2_velvet": "555 SPHERE2 VELVETY",
-    "555_original": "555 ORIGINAL",
-    "555_other": "555 OTHERS",
-    "ara_red": "ARA RED",
-    "ara_gold": "ARA GOLD",
-    "ara_menthol": "ARA MENTHOL",
-    "ara_other": "ARA OTHERS",
-    "luxury_other": "LUXURY FULL FLAVOUR",
-    "luxury_menthol": "LUXURY MENTHOL",
-    "gold_sea": "GOLD SEAL MENTHOL COMPACT",
-    "malboro_red": "MARLBORO RED",
-    "malboro_gold": "MARLBORO GOLD",
-    "malboro_other": "MARLBORO OTHERS",
-    "cambo": "CAMBO FF",
-    "iza_other": "IZA FF",
-    "iza_menthol": "IZA MENTHOL",
-    "hero": "HERO HARD PACK",
-    "cow_boy_bluberry_mint": "COW BOY BLUEBERRY MINT",
-    "cow_boy_other": "COW BOY HARD PACK",
-    "cow_boy_menthol": "COW BOY MENTHOL",
-    "oris_pulse_blue": "ORIS PULSE BLUE",
-    "oris_ice_plus": "ORIS ICE PLUS",
-    "oris_sliver": "ORIS SILVER",
-    "modern": "MODERN",
-    "mond": "MOND",
-    "chunghwa": "CHUNGHWA",
-    "galaxy": "OTHERS",
-    "other": "OTHERS",
-    "other_4": "OTHERS",
+    # MEVIUS
+    "mevius_original":                  "MEVIUS ORIGINAL",
+    "mevius_sky_blue":                  "MEVIUS SKY BLUE",
+    "mevius_option_purple":             "MEVIUS OPTION PURPLE",
+    "mevius_freezy_dew":                "MEVIUS FREEZY DEW",
+    "mevius_option_purple_super_slims": "MEVIUS OPTION PURPLE SUPER SLIMS",
+    "mevius_kimavi":                    "MEVIUS KIWAMI",
+    "mevius_e_series_blue":             "MEVIUS E-SERIES BLUE",
+    "mevius_mint_flow":                 "MEVIUS MINT FLOW",
+    # WINSTON
+    "winston_night_blue":               "WINSTON NIGHT BLUE",
+    "winston_option_purple":            "WINSTON OPTION PURPLE",
+    "winston_option_blue":              "WINSTON OPTION BLUE",
+    # ESSE
+    "esse_change":                      "ESSE CHANGE",
+    "esse_light":                       "ESSE LIGHTS",
+    "esse_menthol":                     "ESSE MENTHOL",
+    "esse_gold":                        "ESSE GOLD",
+    "esse_other":                       "ESSE OTHERS",
+    # FINE
+    "fine_red_hard_pack":               "FINE RED HARD PACK",
+    "fine_other":                       "FINE OTHERS",
+    # 555
+    "555_sphere2_velvet":               "555 SPHERE2 VELVETY",
+    "555_original":                     "555 ORIGINAL",
+    "555_gold":                         "555 GOLD",
+    "555_other":                        "555 OTHERS",
+    # ARA
+    "ara_red":                          "ARA RED",
+    "ara_gold":                         "ARA GOLD",
+    "ara_menthol":                      "ARA MENTHOL",
+    "ara_other":                        "ARA OTHERS",
+    # LUXURY
+    "luxury_full_flavour":              "LUXURY FULL FLAVOUR",
+    "luxury_menthol":                   "LUXURY MENTHOL",
+    "luxury_other":                     "LUXURY OTHERS",
+    # GOLD SEAL
+    "gold_seal_menthol_compact":        "GOLD SEAL MENTHOL COMPACT",
+    "gold_seal_menthol_kingsize":       "GOLD SEAL MENTHOL KINGSIZE",
+    "gold_seal_other":                  "GOLD SEAL OTHERS",
+    # MARLBORO
+    "marlboro_red":                     "MARLBORO RED",
+    "marlboro_gold":                    "MARLBORO GOLD",
+    "marlboro_other":                   "MARLBORO OTHERS",
+    # CAMBO
+    "cambo_classical":                  "CAMBO CLASSICAL",
+    "cambo_ff":                         "CAMBO FF",
+    "cambo_menthol":                    "CAMBO MENTHOL",
+    # IZA
+    "iza_ff":                           "IZA FF",
+    "iza_menthol":                      "IZA MENTHOL",
+    "iza_other":                        "IZA OTHERS",
+    # HERO
+    "hero":                             "HERO HARD PACK",
+    # COW BOY
+    "cow_boy_blueberry_mint":           "COW BOY BLUEBERRY MINT",
+    "cow_boy_hard_pack":                "COW BOY HARD PACK",
+    "cow_boy_menthol":                  "COW BOY MENTHOL",
+    "cow_boy_other":                    "COW BOY OTHERS",
+    # COCO PALM
+    "coco_palm_hard_pack":              "COCO PALM HARD PACK",
+    "coco_palm_menthol":                "COCO PALM MENTHOL",
+    "coco_palm_other":                  "COCO PALM OTHERS",
+    # CROWN
+    "crown":                            "CROWN",
+    # LAPIN
+    "lapin_ff":                         "LAPIN FF",
+    "lapin_menthol":                    "LAPIN MENTHOL",
+    # ORIS
+    "oris_pulse_blue":                  "ORIS PULSE BLUE",
+    "oris_ice_plus":                    "ORIS ICE PLUS",
+    "oris_silver":                      "ORIS SILVER",
+    "oris_other":                       "ORIS OTHERS",
+    # JET
+    "jet":                              "JET",
+    # L&M
+    "l_and_m":                          "L&M",
+    # DJARUM
+    "djarum":                           "DJARUM",
+    # LIBERATION
+    "liberation":                       "LIBERATION",
+    # MODERN
+    "modern":                           "MODERN",
+    # MOND
+    "mond":                             "MOND",
+    # NATIONAL
+    "national":                         "NATIONAL",
+    # CHUNGHWA
+    "chunghwa":                         "CHUNGHWA",
+    # SHUANGXI
+    "shuangxi":                         "SHUANGXI",
+    # YUN YAN
+    "yun_yan":                          "YUN YAN",
+    # CHINESE BRAND
+    "chinese_brand":                    "CHINESE BRANDS",
+    # OTHERS
+    "other":                            "OTHERS",
+    # Legacy aliases (old/misspelled names — kept for backward compatibility)
+    "malboro_red":                      "MARLBORO RED",
+    "malboro_gold":                     "MARLBORO GOLD",
+    "malboro_other":                    "MARLBORO OTHERS",
+    "gold_sea":                         "GOLD SEAL MENTHOL COMPACT",
+    "oris_sliver":                      "ORIS SILVER",
+    "cow_boy_bluberry_mint":            "COW BOY BLUEBERRY MINT",
+    "esse_double_change":               "ESSE OTHERS",
+    "other_4":                          "OTHERS",
+    "galaxy":                           "OTHERS",
+    "cambo":                            "CAMBO FF",
 }
 
 # Map product name to parent brand

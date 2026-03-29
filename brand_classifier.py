@@ -56,23 +56,32 @@ def pad_to_square(img: Image.Image) -> Image.Image:
     return padded
 
 
-def compute_embeddings(image_paths: list[Path], processor, model, device: str, batch_size: int = 16) -> np.ndarray:
-    """Pre-compute DINOv2 embeddings for all images. No gradient needed."""
+def compute_embeddings(image_paths: list[Path], processor, model, device: str, batch_size: int = 16) -> tuple[np.ndarray, list[Path]]:
+    """Pre-compute DINOv2 embeddings for all images. No gradient needed.
+
+    Returns a tuple of (embeddings, valid_paths) where valid_paths contains only
+    the paths that were successfully loaded. Corrupt or unreadable images are
+    skipped so that embeddings and paths stay aligned.
+    """
     all_vecs = []
+    valid_paths: list[Path] = []
     model.eval()
     model.to(device)
 
     for i in range(0, len(image_paths), batch_size):
         batch_paths = image_paths[i:i + batch_size]
         imgs = []
+        batch_valid_paths: list[Path] = []
         for p in batch_paths:
             try:
                 img = pad_to_square(Image.open(p).convert("RGB"))
                 imgs.append(img)
+                batch_valid_paths.append(p)
             except Exception as exc:
-                print(f"  Warning: could not open {p}: {exc}")
-                # Use a blank image as placeholder
-                imgs.append(Image.new("RGB", (224, 224), (128, 128, 128)))
+                print(f"  Warning: skipping corrupt image {p}: {exc}")
+
+        if not imgs:
+            continue
 
         with torch.no_grad():
             inputs = processor(images=imgs, return_tensors="pt")
@@ -88,11 +97,12 @@ def compute_embeddings(image_paths: list[Path], processor, model, device: str, b
         norms = np.where(norms == 0, 1.0, norms)
         vecs = vecs / norms
         all_vecs.append(vecs)
+        valid_paths.extend(batch_valid_paths)
 
-        print(f"  Embedded {min(i + batch_size, len(image_paths))}/{len(image_paths)} images", end="\r")
+        print(f"  Embedded {len(valid_paths)}/{len(image_paths)} images", end="\r")
 
     print()
-    return np.vstack(all_vecs)
+    return np.vstack(all_vecs), valid_paths
 
 
 class BrandClassifier(nn.Module):
@@ -139,9 +149,9 @@ def train_classifier(args):
     labels_int = [label_to_idx[l] for l in labels_str]
 
     num_classes = len(unique_labels)
-    print(f"Found {len(image_paths)} images across {num_classes} classes")
+    print(f"Found {len(image_paths)} images across {num_classes} classes (pre-filtering)")
 
-    # Show class distribution
+    # Show class distribution (before corrupt-image filtering)
     from collections import Counter
     dist = Counter(labels_str)
     print("\nClass distribution:")
@@ -156,7 +166,18 @@ def train_classifier(args):
     dino_model = AutoModel.from_pretrained(DINO_MODEL_ID)
     dino_model.eval()
 
-    embeddings = compute_embeddings(image_paths, processor, dino_model, device, batch_size=args.embed_batch_size)
+    embeddings, valid_paths = compute_embeddings(image_paths, processor, dino_model, device, batch_size=args.embed_batch_size)
+
+    skipped = len(image_paths) - len(valid_paths)
+    if skipped > 0:
+        print(f"  Skipped {skipped} corrupt/unreadable image(s); training on {len(valid_paths)} images")
+
+    # Re-derive labels from the paths that were actually loaded (parallel with embeddings)
+    valid_labels_str = [label_from_filename(p.name) for p in valid_paths]
+    unique_labels = sorted(set(valid_labels_str))
+    label_to_idx = {label: idx for idx, label in enumerate(unique_labels)}
+    labels_int = [label_to_idx[l] for l in valid_labels_str]
+    num_classes = len(unique_labels)
 
     # Free DINOv2 from GPU
     del dino_model

@@ -156,7 +156,7 @@ LEGACY_ALIASES = {
     "oris_sliver": "oris_silver",
     "cow_boy_bluberry_mint": "cow_boy_blueberry_mint",
     "esse_double_change": "esse_other",
-    "mevius_kimavi": "mevius_kimavi",  # KIWAMI in Excel, KIMAVI in references — same product
+    # mevius_kimavi: canonical name (KIWAMI in Excel, KIMAVI in reference filenames)
     "other_4": "other",
     "galaxy": "other",
 }

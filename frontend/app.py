@@ -1,4 +1,3 @@
-import base64
 import json
 import os
 import time
@@ -28,8 +27,13 @@ def _single_detection_iframe_height(img_w: int, img_h: int) -> int:
 
 def stream_progress(job_id: str) -> Generator[tuple[int, str], None, None]:
     url = f"{BACKEND_URL}/progress/{job_id}"
-    with requests.get(url, stream=True, timeout=60) as response:
+    try:
+        response = requests.get(url, stream=True, timeout=60)
         response.raise_for_status()
+    except requests.RequestException as exc:
+        yield 0, f"Connection error: {exc}"
+        return
+    with response:
         for raw_line in response.iter_lines(decode_unicode=True):
             if not raw_line:
                 continue
@@ -523,9 +527,10 @@ with tab_batch:
             with st.expander(f"Preview ({len(preview_df)} rows)", expanded=True):
                 st.dataframe(preview_df.head(10), width="stretch")
             st.caption(f"Batch mode: **{BATCH_MODE_LABEL}**")
-            uploaded.seek(0)
         except Exception as exc:
             st.error(f"Could not preview CSV: {exc}")
+        finally:
+            uploaded.seek(0)
 
     run_disabled = uploaded is None or not index_exists
     run_col1, run_col2 = st.columns(2)
@@ -1351,6 +1356,7 @@ with tab_label:
                                 st.success(f"Added as {selected_type}/{result['filename']} ({result['total_for_product']} total for {selected_product} [{selected_type}])")
                                 _fetch_reference_listing.clear()
                                 _fetch_brand_hierarchy.clear()
+                                _fetch_reference_image_bytes.clear()
                             except Exception as exc:
                                 st.error(f"Failed: {exc}")
 
@@ -1428,19 +1434,20 @@ with tab_train:
         _tr_resp = requests.get(f"{BACKEND_URL}/brand-registry", timeout=5)
         if _tr_resp.status_code == 200:
             _train_reg_data = _tr_resp.json()
-            for _brand, _prods in _train_reg_data.get("brands", {}).items():
-                for _p in _prods:
-                    _train_pack_total += _p.get("pack_count", 0)
-                    _train_box_total += _p.get("box_count", 0)
-                    if _p.get("reference_count", 0) > 0:
-                        _train_products_with_refs += 1
+            # Use per-type totals from disk (references/pack, references/box). Summing
+            # per-product pack_count only counts filenames that match BRAND_REGISTRY; unregistered
+            # labels still train in brand_classifier.py but would show 0 here otherwise.
+            _per_type = _train_reg_data.get("per_type") or {}
+            _train_pack_total = int(_per_type.get("pack", 0) or 0)
+            _train_box_total = int(_per_type.get("box", 0) or 0)
+            _train_products_with_refs = int(_train_reg_data.get("products_with_refs", 0) or 0)
     except Exception:
         pass
 
     # --- Brand Classifier (frozen DINOv2 + MLP) ---
     with train_col1:
         st.markdown("##### Brand Classifier")
-        st.caption("Frozen DINOv2 + MLP head. Fast, works on CPU.")
+        st.caption("Frozen DINOv2 + MLP head. Fast on CPU; **Run on RunPod** uses a GPU (default RTX 4090, set `RUNPOD_CLASSIFIER_GPU_ID` on the API server to change).")
         st.caption("Recommended: epochs=100, lr=0.001, batch=64, embed_batch=8")
 
         # Dataset summary
@@ -1459,9 +1466,15 @@ with tab_train:
         cls_lr = st.number_input("Learning rate", value=0.001, format="%.4f", key="cls_lr")
         cls_batch = st.number_input("Batch size", value=64, min_value=8, max_value=256, key="cls_batch")
         cls_embed_batch = st.number_input("Embed batch size", value=8, min_value=1, max_value=64, key="cls_embed_batch")
+        cls_use_runpod = st.checkbox(
+            "Run on RunPod GPU (faster; needs RUNPOD_API_KEY + SSH key on API server)",
+            value=False,
+            key="cls_use_runpod",
+        )
 
         if st.button("Train Classifier", type="primary", key="btn_train_cls", disabled=_train_pack_total == 0):
             try:
+                rp = "true" if cls_use_runpod else "false"
                 resp = requests.post(
                     f"{BACKEND_URL}/train-classifier",
                     params={
@@ -1470,6 +1483,7 @@ with tab_train:
                         "batch_size": cls_batch,
                         "embed_batch_size": cls_embed_batch,
                         "version": training_version,
+                        "use_runpod": rp,
                     },
                     timeout=120,
                 )

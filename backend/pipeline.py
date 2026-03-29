@@ -34,6 +34,8 @@ if not (CLASSIFIER_WEIGHTS.exists() and CLASS_MAPPING_JSON.exists()):
         CLASSIFIER_WEIGHTS = _legacy_w
         CLASS_MAPPING_JSON = _legacy_m
 DINO_MODEL_ID = "facebook/dinov2-base"
+# Written by finetune_dinov2.py; backbone weights only (dino.*), shared across pack/box brand classifiers.
+DINO_FINETUNED_FULL_PATH = CLASSIFIER_BASE_DIR / "dinov2_finetuned_full.pth"
 _PROJECT_ROOT = _BACKEND_ROOT.parent
 _RFDETR_CHECKPOINT_DIR = _PROJECT_ROOT / "runs"
 
@@ -136,12 +138,42 @@ def get_device() -> str:
     return "cpu"
 
 
+def _apply_finetuned_dino_backbone(model: torch.nn.Module) -> bool:
+    """Load ViT backbone from finetune_dinov2.py full checkpoint (keys prefixed with 'dino.')."""
+    path = DINO_FINETUNED_FULL_PATH
+    if not path.is_file():
+        return False
+    try:
+        try:
+            state = torch.load(path, map_location="cpu", weights_only=True)
+        except TypeError:
+            state = torch.load(path, map_location="cpu")
+    except Exception as exc:
+        logger.warning("Could not read finetuned DINO checkpoint %s: %s — using base weights", path, exc)
+        return False
+    prefix = "dino."
+    dino_state = {k[len(prefix) :]: v for k, v in state.items() if k.startswith(prefix)}
+    if not dino_state:
+        logger.warning("Finetuned checkpoint %s has no %s* keys — using base weights", path, prefix)
+        return False
+    incomp = model.load_state_dict(dino_state, strict=False)
+    logger.info(
+        "Loaded DINOv2 backbone from %s (missing_keys=%d unexpected_keys=%d)",
+        path,
+        len(incomp.missing_keys),
+        len(incomp.unexpected_keys),
+    )
+    return True
+
+
 def load_dino(device: str):
     global _dino_processor, _dino_model
     if _dino_processor is None or _dino_model is None:
         _dino_processor = AutoImageProcessor.from_pretrained(DINO_MODEL_ID)
         _dino_model = AutoModel.from_pretrained(DINO_MODEL_ID)
         _dino_model.eval()
+        if not _apply_finetuned_dino_backbone(_dino_model):
+            logger.info("DINOv2: using Hugging Face base weights (no finetuned checkpoint at %s)", DINO_FINETUNED_FULL_PATH)
     _dino_model.to(device)
     return _dino_processor, _dino_model
 
@@ -290,7 +322,7 @@ def build_index(device: str, progress_cb: Optional[Callable[[int, int, str], Non
         if not type_dir.exists():
             continue
         # Check if there are any images
-        has_images = any(type_dir.glob("*.jpg")) or any(type_dir.glob("*.png"))
+        has_images = any(type_dir.glob("*.[jJ][pP][gG]")) or any(type_dir.glob("*.[jJ][pP][eE][gG]")) or any(type_dir.glob("*.[pP][nN][gG]"))
         if not has_images:
             if progress_cb:
                 progress_cb(
@@ -414,7 +446,8 @@ def classify_embeddings(
         topk_vals, topk_idxs = torch.topk(probs[i], min(top_k, probs.shape[1]))
         sample_results = []
         for val, idx in zip(topk_vals, topk_idxs):
-            label = idx_to_label[str(idx.item())]
+            label_key = str(idx.item())
+            label = idx_to_label.get(label_key, f"unknown_{label_key}")
             sample_results.append((label, float(val.item())))
         results.append(sample_results)
 
@@ -532,8 +565,11 @@ def _ocr_brand_scores_from_items(ocr_items: list, label_profiles: list[dict]) ->
     for item in ocr_items:
         if len(item) < 3:
             continue
-        text = str(item[1]).strip()
-        text_conf = float(item[2])
+        try:
+            text = str(item[1]).strip()
+            text_conf = float(item[2])
+        except (IndexError, TypeError, ValueError):
+            continue
         norm_text = _normalize_text(text)
         if not norm_text or len(norm_text) < 2:
             continue
