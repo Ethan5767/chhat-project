@@ -436,7 +436,7 @@ def _runpod_ssh_user(pod_id: str, pod_host_id: str) -> str:
     return f"{pod_id}-{pod_host_id}"
 
 
-def _paramiko_connect(pod_id: str, pod_host_id: str, key: str, connect_timeout: int = 30):
+def _paramiko_connect(pod_id: str, pod_host_id: str, key: str, connect_timeout: int = 45):
     """Connect to RunPod pod directly via Paramiko through ssh.runpod.io.
 
     RunPod's proxy acts as a transparent relay -- Paramiko connects to it
@@ -463,57 +463,38 @@ def _paramiko_connect(pod_id: str, pod_host_id: str, key: str, connect_timeout: 
 def _paramiko_proxy_exec(pod_id: str, pod_host_id: str, key: str, command: str,
                          timeout: int = 300) -> subprocess.CompletedProcess:
     """Execute command on RunPod pod via direct Paramiko connection to ssh.runpod.io."""
-    import socket
-    import time as _time
-
     try:
         client = _paramiko_connect(pod_id, pod_host_id, key)
     except Exception as exc:
         return subprocess.CompletedProcess(
-            args=["paramiko", command], returncode=255, stdout="", stderr=str(exc),
+            args=["paramiko", command], returncode=255, stdout="",
+            stderr=f"paramiko connect failed: {exc}",
         )
     try:
-        # Request PTY before exec -- RunPod proxy may require it
+        # Use exec_command with PTY requested via get_pty on the channel
         channel = client.get_transport().open_session()
-        channel.get_pty()
-        channel.settimeout(1.0)
+        channel.get_pty(term="xterm", width=200, height=50)
+        channel.settimeout(float(timeout))
         channel.exec_command(command)
 
+        # Read all output until channel closes
         out_chunks = []
-        err_chunks = []
-        deadline = _time.monotonic() + float(timeout)
         while True:
-            if _time.monotonic() > deadline:
-                return subprocess.CompletedProcess(
-                    args=["paramiko", command], returncode=255, stdout="", stderr="paramiko exec timed out",
-                )
-            if channel.recv_ready():
-                out_chunks.append(channel.recv(65536).decode("utf-8", errors="replace"))
-            if channel.recv_stderr_ready():
-                err_chunks.append(channel.recv_stderr(65536).decode("utf-8", errors="replace"))
-            if channel.exit_status_ready():
+            data = channel.recv(65536)
+            if not data:
                 break
-            # Drive protocol / avoid busy-wait: recv may unblock exit_status
-            try:
-                data = channel.recv(65536)
-                if data:
-                    out_chunks.append(data.decode("utf-8", errors="replace"))
-            except socket.timeout:
-                pass
-        while channel.recv_ready():
-            out_chunks.append(channel.recv(65536).decode("utf-8", errors="replace"))
-        while channel.recv_stderr_ready():
-            err_chunks.append(channel.recv_stderr(65536).decode("utf-8", errors="replace"))
+            out_chunks.append(data.decode("utf-8", errors="replace"))
 
         exit_code = channel.recv_exit_status()
         channel.close()
         return subprocess.CompletedProcess(
             args=["paramiko", command], returncode=exit_code,
-            stdout="".join(out_chunks), stderr="".join(err_chunks),
+            stdout="".join(out_chunks), stderr="",
         )
     except Exception as exc:
         return subprocess.CompletedProcess(
-            args=["paramiko", command], returncode=255, stdout="", stderr=str(exc),
+            args=["paramiko", command], returncode=255, stdout="",
+            stderr=f"paramiko exec failed: {exc}",
         )
     finally:
         client.close()
@@ -701,7 +682,7 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
 
         # 3. Test SSH connection
         for attempt in range(6):
-            r = _ssh_cmd(ssh_host, ssh_port, ssh_key, "echo SSH_OK", timeout=20, pod_id=pod_id, pod_host_id=pod_host_id)
+            r = _ssh_cmd(ssh_host, ssh_port, ssh_key, "echo SSH_OK", timeout=60, pod_id=pod_id, pod_host_id=pod_host_id)
             if "SSH_OK" in (r.stdout or ""):
                 _log_runpod(f"gpu-batch: SSH OK (attempt {attempt + 1})")
                 break
@@ -928,7 +909,7 @@ def run_dinov2_finetune_gpu_job(
         _log_runpod(f"dino-gpu: SSH identity {ssh_key}")
         last_chk = None
         for attempt in range(8):
-            last_chk = _ssh_cmd(ssh_host, ssh_port, ssh_key, "echo SSH_OK", timeout=25, pod_id=pod_id, pod_host_id=pod_host_id)
+            last_chk = _ssh_cmd(ssh_host, ssh_port, ssh_key, "echo SSH_OK", timeout=60, pod_id=pod_id, pod_host_id=pod_host_id)
             if "SSH_OK" in (last_chk.stdout or ""):
                 _log_runpod(f"dino-gpu: SSH OK (attempt {attempt + 1})")
                 break
@@ -1256,7 +1237,7 @@ def run_classifier_training_runpod_job(
         _log_runpod(f"classifier-gpu: SSH identity {ssh_key}")
         last_chk = None
         for attempt in range(20):
-            last_chk = _ssh_cmd(ssh_host, ssh_port, ssh_key, "echo SSH_OK", timeout=25, pod_id=pod_id, pod_host_id=pod_host_id)
+            last_chk = _ssh_cmd(ssh_host, ssh_port, ssh_key, "echo SSH_OK", timeout=60, pod_id=pod_id, pod_host_id=pod_host_id)
             if "SSH_OK" in (last_chk.stdout or ""):
                 _log_runpod(f"classifier-gpu: SSH OK (attempt {attempt + 1})")
                 break
