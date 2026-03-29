@@ -532,52 +532,109 @@ def _paramiko_proxy_exec(pod_id: str, pod_host_id: str, key: str, command: str,
         client.close()
 
 
+def _do_spaces_client():
+    """Create a boto3 S3 client for DigitalOcean Spaces."""
+    import boto3
+    return boto3.client(
+        "s3",
+        region_name=os.environ.get("DO_SPACES_REGION", "sgp1"),
+        endpoint_url=os.environ.get("DO_SPACES_ENDPOINT", "https://sgp1.digitaloceanspaces.com"),
+        aws_access_key_id=os.environ.get("DO_SPACES_KEY", ""),
+        aws_secret_access_key=os.environ.get("DO_SPACES_SECRET", ""),
+    )
+
+
+def _do_spaces_bucket() -> str:
+    return os.environ.get("DO_SPACES_BUCKET", "chhat")
+
+
 def _paramiko_proxy_upload(pod_id: str, pod_host_id: str, key: str,
                            local: str, remote: str, timeout: int = 300) -> subprocess.CompletedProcess:
-    """Upload file to RunPod pod via Paramiko SFTP."""
+    """Upload file to RunPod pod via DO Spaces.
+
+    SFTP doesn't work through RunPod's ssh.runpod.io proxy.
+    Flow: server -> DO Spaces (pre-signed URL) -> pod wget.
+    """
+    import uuid as _uuid
+    s3_key = f"runpod-xfer/{_uuid.uuid4().hex}/{Path(local).name}"
+    bucket = _do_spaces_bucket()
     try:
-        client = _paramiko_connect(pod_id, pod_host_id, key)
+        s3 = _do_spaces_client()
+        file_size = Path(local).stat().st_size
+        _log_runpod(f"  DO Spaces: uploading {Path(local).name} ({file_size / 1e6:.1f} MB)…")
+        s3.upload_file(local, bucket, s3_key)
+        url = s3.generate_presigned_url(
+            "get_object", Params={"Bucket": bucket, "Key": s3_key}, ExpiresIn=3600,
+        )
+        _log_runpod(f"  DO Spaces: upload done, pod wget…")
+        r = _paramiko_proxy_exec(
+            pod_id, pod_host_id, key,
+            f'wget -q -O "{remote}" "{url}"',
+            timeout=timeout,
+        )
+        if r.returncode != 0:
+            return subprocess.CompletedProcess(
+                args=["do-spaces-upload", local, remote], returncode=1,
+                stdout=r.stdout, stderr=f"pod wget failed: {r.stderr}",
+            )
+        _log_runpod(f"  DO Spaces: pod wget done")
+        return subprocess.CompletedProcess(
+            args=["do-spaces-upload", local, remote], returncode=0, stdout="", stderr="",
+        )
     except Exception as exc:
         return subprocess.CompletedProcess(
-            args=["paramiko-put", local, remote], returncode=1, stdout="", stderr=str(exc),
-        )
-    try:
-        sftp = client.open_sftp()
-        sftp.put(local, remote)
-        sftp.close()
-        return subprocess.CompletedProcess(
-            args=["paramiko-put", local, remote], returncode=0, stdout="", stderr="",
-        )
-    except Exception as exc:
-        return subprocess.CompletedProcess(
-            args=["paramiko-put", local, remote], returncode=1, stdout="", stderr=str(exc),
+            args=["do-spaces-upload", local, remote], returncode=1,
+            stdout="", stderr=f"DO Spaces upload failed: {exc}",
         )
     finally:
-        client.close()
+        try:
+            _do_spaces_client().delete_object(Bucket=bucket, Key=s3_key)
+        except Exception:
+            pass
 
 
 def _paramiko_proxy_download(pod_id: str, pod_host_id: str, key: str,
                              remote: str, local: str, timeout: int = 300) -> subprocess.CompletedProcess:
-    """Download file from RunPod pod via Paramiko SFTP."""
+    """Download file from RunPod pod via DO Spaces.
+
+    SFTP doesn't work through RunPod's ssh.runpod.io proxy.
+    Flow: pod curl PUT -> DO Spaces (pre-signed URL) -> server download.
+    """
+    import uuid as _uuid
+    s3_key = f"runpod-xfer/{_uuid.uuid4().hex}/{Path(remote).name}"
+    bucket = _do_spaces_bucket()
     try:
-        client = _paramiko_connect(pod_id, pod_host_id, key)
+        s3 = _do_spaces_client()
+        put_url = s3.generate_presigned_url(
+            "put_object", Params={"Bucket": bucket, "Key": s3_key}, ExpiresIn=3600,
+        )
+        _log_runpod(f"  DO Spaces: pod uploading {Path(remote).name}…")
+        r = _paramiko_proxy_exec(
+            pod_id, pod_host_id, key,
+            f'curl -s -X PUT -T "{remote}" "{put_url}"',
+            timeout=timeout,
+        )
+        if r.returncode != 0:
+            return subprocess.CompletedProcess(
+                args=["do-spaces-download", remote, local], returncode=1,
+                stdout=r.stdout, stderr=f"pod curl upload failed: {r.stderr}",
+            )
+        _log_runpod(f"  DO Spaces: downloading {Path(remote).name} to server…")
+        s3.download_file(bucket, s3_key, local)
+        _log_runpod(f"  DO Spaces: download done")
+        return subprocess.CompletedProcess(
+            args=["do-spaces-download", remote, local], returncode=0, stdout="", stderr="",
+        )
     except Exception as exc:
         return subprocess.CompletedProcess(
-            args=["paramiko-get", remote, local], returncode=1, stdout="", stderr=str(exc),
-        )
-    try:
-        sftp = client.open_sftp()
-        sftp.get(remote, local)
-        sftp.close()
-        return subprocess.CompletedProcess(
-            args=["paramiko-get", remote, local], returncode=0, stdout="", stderr="",
-        )
-    except Exception as exc:
-        return subprocess.CompletedProcess(
-            args=["paramiko-get", remote, local], returncode=1, stdout="", stderr=str(exc),
+            args=["do-spaces-download", remote, local], returncode=1,
+            stdout="", stderr=f"DO Spaces download failed: {exc}",
         )
     finally:
-        client.close()
+        try:
+            _do_spaces_client().delete_object(Bucket=bucket, Key=s3_key)
+        except Exception:
+            pass
 
 
 def _ssh_cmd(host: str, port: int, key: str, command: str, timeout: int = 300,
@@ -596,7 +653,7 @@ def _ssh_cmd(host: str, port: int, key: str, command: str, timeout: int = 300,
 
 def _scp_to(host: str, port: int, key: str, local: str, remote: str, timeout: int = 300,
             pod_id: str = "", pod_host_id: str = ""):
-    """Upload file to remote host. Uses Paramiko SFTP proxy if pod_id/pod_host_id provided."""
+    """Upload file to remote host. Uses DO Spaces transfer if pod_id/pod_host_id provided."""
     if pod_id and pod_host_id:
         return _paramiko_proxy_upload(pod_id, pod_host_id, key, local, remote, timeout)
     opts = _ssh_scp_common_opts(key)
@@ -608,7 +665,7 @@ def _scp_to(host: str, port: int, key: str, local: str, remote: str, timeout: in
 
 def _scp_from(host: str, port: int, key: str, remote: str, local: str, timeout: int = 300,
               pod_id: str = "", pod_host_id: str = ""):
-    """Download file from remote host. Uses Paramiko SFTP proxy if pod_id/pod_host_id provided."""
+    """Download file from remote host. Uses DO Spaces transfer if pod_id/pod_host_id provided."""
     if pod_id and pod_host_id:
         return _paramiko_proxy_download(pod_id, pod_host_id, key, remote, local, timeout)
     opts = _ssh_scp_common_opts(key)
@@ -972,14 +1029,14 @@ def run_dinov2_finetune_gpu_job(
         else:
             _log_runpod("dino-gpu: repo present on pod")
 
-        _log_runpod("dino-gpu: SCP references archive to pod…")
+        _log_runpod("dino-gpu: upload references archive to pod…")
         up = _scp_to(
             ssh_host, ssh_port, ssh_key, str(refs_tar),
             "/workspace/chhat-project/backend/references_upload.tar.gz",
             timeout=600, pod_id=pod_id, pod_host_id=pod_host_id,
         )
         if up.returncode != 0:
-            raise RuntimeError(f"SCP references to pod failed: {(up.stderr or '')[:400]}")
+            raise RuntimeError(f"references upload to pod failed: {(up.stderr or '')[:400]}")
 
         # Ephemeral RunPod pod filesystem only:
         un = _ssh_cmd(
@@ -990,7 +1047,7 @@ def run_dinov2_finetune_gpu_job(
         )
         if un.returncode != 0:
             raise RuntimeError(f"Unpack references on pod failed: {(un.stdout or un.stderr or '')[-600:]}")
-        _log_runpod("dino-gpu: references unpacked on pod")
+        _log_runpod("dino-gpu: references uploaded + extracted OK")
 
         progress_remote = "/tmp/dino_progress.json"
         ft_cmd = (
@@ -1299,14 +1356,14 @@ def run_classifier_training_runpod_job(
         else:
             _log_runpod("classifier-gpu: repo present on pod")
 
-        _log_runpod("classifier-gpu: SCP references archive to pod…")
+        _log_runpod("classifier-gpu: upload references archive to pod…")
         up = _scp_to(
             ssh_host, ssh_port, ssh_key, str(refs_tar),
             "/workspace/chhat-project/backend/references_upload.tar.gz",
             timeout=600, pod_id=pod_id, pod_host_id=pod_host_id,
         )
         if up.returncode != 0:
-            raise RuntimeError(f"SCP references to pod failed: {(up.stderr or '')[:400]}")
+            raise RuntimeError(f"references upload to pod failed: {(up.stderr or '')[:400]}")
 
         un = _ssh_cmd(
             ssh_host, ssh_port, ssh_key,
@@ -1316,7 +1373,7 @@ def run_classifier_training_runpod_job(
         )
         if un.returncode != 0:
             raise RuntimeError(f"Unpack references on pod failed: {(un.stdout or un.stderr or '')[-600:]}")
-        _log_runpod("classifier-gpu: references unpacked on pod")
+        _log_runpod("classifier-gpu: references uploaded + extracted OK")
 
         progress_remote = f"/tmp/classifier_progress_{job_id}.json"
         bc_cmd = (
