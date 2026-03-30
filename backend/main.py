@@ -232,7 +232,7 @@ def run_pipeline_job(job_id: str, csv_path: Path):
 
 RUNPOD_API_URL = "https://api.runpod.io/graphql"
 RUNPOD_GPU_ID = "NVIDIA A100 80GB PCIe"
-RUNPOD_TEMPLATE = "runpod-torch-v21"
+RUNPOD_TEMPLATE = "runpod-torch-v240"
 RUNPOD_REPO = "https://github.com/Ethan5767/chhat-project.git"
 
 
@@ -751,7 +751,7 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
 
         _log_runpod(f"gpu-batch: SSH endpoint root@{ssh_host}:{ssh_port}")
         update_progress(job_id, 10, 100, "Pod ready. Waiting for SSH daemon...")
-        _time.sleep(45)
+        _time.sleep(60)
 
         # Find SSH key on server
         ssh_key = None
@@ -770,7 +770,7 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
         _log_runpod(f"gpu-batch: using SSH identity {ssh_key}")
 
         # 3. Test SSH connection
-        for attempt in range(6):
+        for attempt in range(20):
             r = _ssh_cmd(ssh_host, ssh_port, ssh_key, "echo SSH_OK", timeout=60, pod_id=pod_id, pod_host_id=pod_host_id)
             if "SSH_OK" in (r.stdout or ""):
                 _log_runpod(f"gpu-batch: SSH OK (attempt {attempt + 1})")
@@ -778,9 +778,9 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
             out_h = (r.stdout or "").strip()[:100]
             err_h = (r.stderr or "").strip()[:160]
             _log_runpod(f"gpu-batch: SSH probe failed rc={r.returncode} out={out_h!r} err={err_h!r}")
-            _time.sleep(10)
+            _time.sleep(15)
         else:
-            raise RuntimeError(f"SSH connection failed after retries: {r.stderr[:200]}")
+            raise RuntimeError(f"SSH connection failed after 20 attempts: {r.stderr[:200]}")
 
         update_progress(job_id, 15, 100, "SSH connected. Setting up environment...")
 
@@ -793,7 +793,7 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
             update_progress(job_id, 18, 100, "Cloning repository and installing dependencies...")
             r = _ssh_cmd(ssh_host, ssh_port, ssh_key,
                           f"cd /workspace && git clone --depth 1 {RUNPOD_REPO} && cd chhat-project && bash runpod/bootstrap_training_pod.sh",
-                          timeout=600, pod_id=pod_id, pod_host_id=pod_host_id)
+                          timeout=1200, pod_id=pod_id, pod_host_id=pod_host_id)
             if r.returncode != 0:
                 raise RuntimeError(f"Bootstrap failed: {r.stdout[-500:]}")
             _log_runpod("gpu-batch: bootstrap finished")
@@ -938,25 +938,60 @@ def run_dinov2_finetune_gpu_job(
         _log_runpod(f"dino-gpu: references archive OK size_bytes={sz}")
 
         _log_runpod("dino-gpu: creating RunPod pod…")
-        pod = _runpod_gql(api_key, """
-            mutation CreatePod($input: PodFindAndDeployOnDemandInput!) {
-                podFindAndDeployOnDemand(input: $input) { id costPerHr machine { podHostId } }
-            }""", {"input": {
-                "name": f"dino-{job_id[:8]}",
-                "templateId": RUNPOD_TEMPLATE,
-                "gpuTypeId": RUNPOD_GPU_ID,
-                "cloudType": "COMMUNITY",
-                "containerDiskInGb": 20,
-                "volumeInGb": 50,
-                "volumeMountPath": "/workspace",
-                "gpuCount": 1,
-                "ports": "22/tcp",
-            }})["podFindAndDeployOnDemand"]
+        gpu_candidates = _classifier_gpu_candidates()
+        cloud_types = _classifier_cloud_types()
+        vol_gb = _classifier_volume_gb()
+        deploy_rounds, deploy_pause = _classifier_deploy_retry_settings()
+        pod = None
+        gpu_id = gpu_candidates[0] if gpu_candidates else RUNPOD_GPU_ID
+        used_cloud = None
+        for round_idx in range(deploy_rounds):
+            if round_idx > 0:
+                _log_runpod(
+                    f"dino-gpu: capacity retry {round_idx + 1}/{deploy_rounds} "
+                    f"(waiting {deploy_pause}s)…",
+                )
+                time_module.sleep(deploy_pause)
+            for try_cloud in cloud_types:
+                for try_gpu in gpu_candidates:
+                    try:
+                        _log_runpod(f"dino-gpu: try round={round_idx + 1} cloud={try_cloud} gpu={try_gpu}…")
+                        pod = _runpod_gql(api_key, """
+                            mutation CreatePod($input: PodFindAndDeployOnDemandInput!) {
+                                podFindAndDeployOnDemand(input: $input) { id costPerHr machine { podHostId } }
+                            }""", {"input": {
+                                "name": f"dino-{job_id[:8]}",
+                                "templateId": RUNPOD_TEMPLATE,
+                                "gpuTypeId": try_gpu,
+                                "cloudType": try_cloud,
+                                "containerDiskInGb": 20,
+                                "volumeInGb": vol_gb,
+                                "volumeMountPath": "/workspace",
+                                "gpuCount": 1,
+                                "ports": "22/tcp",
+                            }})["podFindAndDeployOnDemand"]
+                        gpu_id = try_gpu
+                        used_cloud = try_cloud
+                        break
+                    except RuntimeError as exc:
+                        _log_runpod(f"dino-gpu: cloud={try_cloud} gpu={try_gpu} failed: {exc}")
+                        continue
+                if pod is not None:
+                    break
+            if pod is not None:
+                break
+        if pod is None:
+            raise RuntimeError(
+                f"No RunPod capacity for DINOv2 after {deploy_rounds} round(s). "
+                "Try later or set RUNPOD_CLASSIFIER_GPU_ID to an available GPU.",
+            )
+        if used_cloud:
+            _log_runpod(f"dino-gpu: using cloud={used_cloud} gpu={gpu_id}")
         pod_id = pod["id"]
         pod_host_id = (pod.get("machine") or {}).get("podHostId", "")
         if not pod_host_id:
             _log_runpod("dino-gpu: WARNING podHostId empty -- SSH proxy disabled, falling back to direct IP")
-        _log_runpod(f"dino-gpu: pod id={pod_id} host={pod_host_id} cost~=${pod.get('costPerHr', 0)}/hr")
+        _log_runpod(f"dino-gpu: pod id={pod_id} host={pod_host_id} cost~=${pod.get('costPerHr', 0)}/hr gpu={gpu_id}")
 
         ssh_host = None
         ssh_port = None
@@ -979,8 +1014,8 @@ def run_dinov2_finetune_gpu_job(
         if not ssh_host:
             raise RuntimeError("RunPod SSH port not available after ~5 minutes")
 
-        _log_runpod(f"dino-gpu: SSH root@{ssh_host}:{ssh_port} (sleep 45s for sshd)")
-        time_module.sleep(45)
+        _log_runpod(f"dino-gpu: SSH root@{ssh_host}:{ssh_port} (sleep 60s for sshd)")
+        time_module.sleep(60)
 
         ssh_key = None
         for key_path in (
@@ -997,7 +1032,7 @@ def run_dinov2_finetune_gpu_job(
 
         _log_runpod(f"dino-gpu: SSH identity {ssh_key}")
         last_chk = None
-        for attempt in range(8):
+        for attempt in range(20):
             last_chk = _ssh_cmd(ssh_host, ssh_port, ssh_key, "echo SSH_OK", timeout=60, pod_id=pod_id, pod_host_id=pod_host_id)
             if "SSH_OK" in (last_chk.stdout or ""):
                 _log_runpod(f"dino-gpu: SSH OK (attempt {attempt + 1})")
@@ -1005,9 +1040,9 @@ def run_dinov2_finetune_gpu_job(
             o = (last_chk.stdout or "").strip()[:100]
             e = (last_chk.stderr or "").strip()[:160]
             _log_runpod(f"dino-gpu: SSH probe rc={last_chk.returncode} out={o!r} err={e!r}")
-            time_module.sleep(10)
+            time_module.sleep(15)
         else:
-            raise RuntimeError(f"SSH to pod failed: {(last_chk.stderr or last_chk.stdout or '')[:300]}")
+            raise RuntimeError(f"SSH to pod failed after 20 attempts: {(last_chk.stderr or last_chk.stdout or '')[:300]}")
 
         chk = _ssh_cmd(
             ssh_host, ssh_port, ssh_key,
