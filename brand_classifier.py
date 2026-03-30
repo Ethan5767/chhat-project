@@ -161,6 +161,9 @@ def train_classifier(args):
 
     # 2. Pre-compute DINOv2 embeddings
     device = "cuda" if torch.cuda.is_available() else "cpu"
+    if device == "cpu":
+        print("ERROR: CUDA not available. Training on CPU is not supported (too slow). Exiting.")
+        sys.exit(1)
     print(f"Computing DINOv2 embeddings on {device}...")
     processor = AutoImageProcessor.from_pretrained(DINO_MODEL_ID)
     dino_model = AutoModel.from_pretrained(DINO_MODEL_ID)

@@ -179,7 +179,9 @@ def train(args):
     print(f"Device: {device}")
 
     if device == "cpu":
-        print("WARNING: Fine-tuning DINOv2 on CPU will be very slow. Use a GPU (RunPod A6000 recommended).")
+        print("ERROR: CUDA not available. Fine-tuning DINOv2 on CPU is not supported (too slow).")
+        print("Use a GPU (RunPod A6000/4090 recommended). Exiting.")
+        sys.exit(1)
 
     processor = AutoImageProcessor.from_pretrained(DINO_MODEL_ID)
     dino_model = AutoModel.from_pretrained(DINO_MODEL_ID)

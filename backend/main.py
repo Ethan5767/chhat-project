@@ -69,11 +69,14 @@ except ImportError:
 app = FastAPI(title="Local Cigarette Brand Detector")
 
 _BACKEND_ROOT = Path(__file__).resolve().parent
-UPLOADS_DIR = _BACKEND_ROOT / "uploads"
+# Persistent data root -- survives code deploys. Default: /opt/chhat-data (server) or backend/ (local dev).
+_DATA_ROOT = Path(os.environ.get("CHHAT_DATA_ROOT", str(_BACKEND_ROOT)))
+_DATA_ROOT.mkdir(parents=True, exist_ok=True)
+UPLOADS_DIR = _DATA_ROOT / "uploads"
 UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
 RESULTS_DIR = UPLOADS_DIR / "results"
 RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-_BATCH_HISTORY_PATH = _BACKEND_ROOT / "batch_history.json"
+_BATCH_HISTORY_PATH = _DATA_ROOT / "batch_history.json"
 
 jobs_lock = threading.Lock()
 jobs: dict[str, dict] = {}
@@ -313,7 +316,7 @@ def _tar_backend_references_for_runpod(refs_tar: Path) -> subprocess.CompletedPr
     Copies to a temp directory first (rsync or shutil.copytree) so the archive is taken from a
     stable snapshot — avoids tar exit 1 from concurrent writes under the live references tree.
     """
-    src = _BACKEND_ROOT / "references"
+    src = _DATA_ROOT / "references"
     if not src.is_dir():
         return subprocess.CompletedProcess(
             args=("_tar_backend_references_for_runpod",),
@@ -810,7 +813,28 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
         if r.returncode != 0:
             raise RuntimeError(f"CSV upload failed: {r.stderr[:200]}")
 
-        # 6. Run pipeline on pod
+        # 6. Kill zombie GPU processes and verify CUDA before pipeline
+        _log_runpod("gpu-batch: clearing zombie GPU processes and verifying CUDA…")
+        _ssh_cmd(
+            ssh_host, ssh_port, ssh_key,
+            "nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | "
+            "xargs -r -I{} sh -c 'ps -p {} >/dev/null 2>&1 || kill -9 {} 2>/dev/null'; "
+            "sleep 2; nvidia-smi",
+            timeout=30, pod_id=pod_id, pod_host_id=pod_host_id,
+        )
+        cuda_chk = _ssh_cmd(
+            ssh_host, ssh_port, ssh_key,
+            "cd /workspace/chhat-project && source .venv/bin/activate && "
+            "python -c \"import torch; assert torch.cuda.is_available(), 'CUDA not available'; "
+            "print(f'CUDA OK device={torch.cuda.get_device_name(0)}')\"",
+            timeout=60, pod_id=pod_id, pod_host_id=pod_host_id,
+        )
+        if "CUDA OK" not in (cuda_chk.stdout or ""):
+            _log_runpod(f"gpu-batch: WARNING CUDA check failed: {(cuda_chk.stdout or cuda_chk.stderr or '')[:300]}")
+            raise RuntimeError("CUDA not available on pod — aborting to avoid CPU pipeline")
+        _log_runpod(f"gpu-batch: {(cuda_chk.stdout or '').strip()}")
+
+        # Run pipeline on pod
         update_progress(job_id, 30, 100, "Running detection pipeline on GPU...")
         _log_runpod("gpu-batch: starting run_pipeline on pod (long-running; up to 2h timeout)")
         remote_csv = f"/workspace/chhat-project/backend/uploads/{csv_path.name}"
@@ -818,6 +842,7 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
 
         r = _ssh_cmd(ssh_host, ssh_port, ssh_key,
                       f"cd /workspace/chhat-project && source .venv/bin/activate && "
+                      f"CUDA_VISIBLE_DEVICES=0 "
                       f"python -c \""
                       f"from backend.pipeline import run_pipeline; "
                       f"out = run_pipeline('{remote_csv}'); "
@@ -1084,9 +1109,31 @@ def run_dinov2_finetune_gpu_job(
             raise RuntimeError(f"Unpack references on pod failed: {(un.stdout or un.stderr or '')[-600:]}")
         _log_runpod("dino-gpu: references uploaded + extracted OK")
 
+        # Kill zombie GPU processes and verify CUDA before training
+        _log_runpod("dino-gpu: clearing zombie GPU processes and verifying CUDA…")
+        _ssh_cmd(
+            ssh_host, ssh_port, ssh_key,
+            "nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | "
+            "xargs -r -I{} sh -c 'ps -p {} >/dev/null 2>&1 || kill -9 {} 2>/dev/null'; "
+            "sleep 2; nvidia-smi",
+            timeout=30, pod_id=pod_id, pod_host_id=pod_host_id,
+        )
+        cuda_chk = _ssh_cmd(
+            ssh_host, ssh_port, ssh_key,
+            "cd /workspace/chhat-project && source .venv/bin/activate && "
+            "python -c \"import torch; assert torch.cuda.is_available(), 'CUDA not available'; "
+            "print(f'CUDA OK device={torch.cuda.get_device_name(0)}')\"",
+            timeout=60, pod_id=pod_id, pod_host_id=pod_host_id,
+        )
+        if "CUDA OK" not in (cuda_chk.stdout or ""):
+            _log_runpod(f"dino-gpu: WARNING CUDA check failed: {(cuda_chk.stdout or cuda_chk.stderr or '')[:300]}")
+            raise RuntimeError("CUDA not available on pod — aborting to avoid CPU training")
+        _log_runpod(f"dino-gpu: {(cuda_chk.stdout or '').strip()}")
+
         progress_remote = "/tmp/dino_progress.json"
         ft_cmd = (
             f"cd /workspace/chhat-project && source .venv/bin/activate && "
+            f"CUDA_VISIBLE_DEVICES=0 "
             f"python finetune_dinov2.py --epochs {epochs} --batch-size {batch_size} --lr {lr} "
             f"--unfreeze-layers {unfreeze_layers} --progress-file {progress_remote}"
         )
@@ -1141,9 +1188,9 @@ def run_dinov2_finetune_gpu_job(
             raise RuntimeError(f"DINOv2 fine-tune on pod failed:\n{(r_ft.stdout or '')[-3500:]}")
         _log_runpod("dino-gpu: finetune subprocess on pod finished rc=0")
 
-        out_dir = _BACKEND_ROOT / "classifier_model"
+        out_dir = _DATA_ROOT / "classifier_model"
         out_dir.mkdir(parents=True, exist_ok=True)
-        for fname in ("dinov2_finetuned_head.pth", "dinov2_finetuned_full.pth"):
+        for fname in ("dinov2_finetuned_head.pth", "dinov2_finetuned_full.pth", "class_mapping.json"):
             remote_p = f"/workspace/chhat-project/backend/classifier_model/{fname}"
             local_p = str(out_dir / fname)
             _log_runpod(f"dino-gpu: downloading {fname} from pod…")
@@ -1410,9 +1457,31 @@ def run_classifier_training_runpod_job(
             raise RuntimeError(f"Unpack references on pod failed: {(un.stdout or un.stderr or '')[-600:]}")
         _log_runpod("classifier-gpu: references uploaded + extracted OK")
 
+        # Kill zombie GPU processes and verify CUDA before training
+        _log_runpod("classifier-gpu: clearing zombie GPU processes and verifying CUDA…")
+        _ssh_cmd(
+            ssh_host, ssh_port, ssh_key,
+            "nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | "
+            "xargs -r -I{} sh -c 'ps -p {} >/dev/null 2>&1 || kill -9 {} 2>/dev/null'; "
+            "sleep 2; nvidia-smi",
+            timeout=30, pod_id=pod_id, pod_host_id=pod_host_id,
+        )
+        cuda_chk = _ssh_cmd(
+            ssh_host, ssh_port, ssh_key,
+            "cd /workspace/chhat-project && source .venv/bin/activate && "
+            "python -c \"import torch; assert torch.cuda.is_available(), 'CUDA not available'; "
+            "print(f'CUDA OK device={torch.cuda.get_device_name(0)}')\"",
+            timeout=60, pod_id=pod_id, pod_host_id=pod_host_id,
+        )
+        if "CUDA OK" not in (cuda_chk.stdout or ""):
+            _log_runpod(f"classifier-gpu: WARNING CUDA check failed: {(cuda_chk.stdout or cuda_chk.stderr or '')[:300]}")
+            raise RuntimeError("CUDA not available on pod — aborting to avoid CPU training")
+        _log_runpod(f"classifier-gpu: {(cuda_chk.stdout or '').strip()}")
+
         progress_remote = f"/tmp/classifier_progress_{job_id}.json"
         bc_cmd = (
             f"cd /workspace/chhat-project && source .venv/bin/activate && "
+            f"CUDA_VISIBLE_DEVICES=0 "
             f"python brand_classifier.py --epochs {epochs} --batch-size {batch_size} "
             f"--embed-batch-size {embed_batch_size} --lr {lr} "
             f"--packaging-type {packaging_type} --progress-file {progress_remote}"
@@ -1482,7 +1551,7 @@ def run_classifier_training_runpod_job(
             _log_runpod(f"classifier-gpu: brand_classifier exited rc={r_bc.returncode}")
             raise RuntimeError(f"Brand classifier on pod failed:\n{(r_bc.stdout or '')[-3500:]}")
 
-        out_sub = _BACKEND_ROOT / "classifier_model" / packaging_type
+        out_sub = _DATA_ROOT / "classifier_model" / packaging_type
         out_sub.mkdir(parents=True, exist_ok=True)
         for fname in ("best_classifier.pth", "classifier.pth", "class_mapping.json"):
             remote_p = f"/workspace/chhat-project/backend/classifier_model/{packaging_type}/{fname}"
@@ -2244,7 +2313,7 @@ async def add_reference(
     except Exception:
         raise HTTPException(status_code=400, detail="Could not open image.")
 
-    TYPE_DIR = _BACKEND_ROOT / "references" / packaging_type
+    TYPE_DIR = _DATA_ROOT / "references" / packaging_type
     TYPE_DIR.mkdir(parents=True, exist_ok=True)
 
     import re
@@ -2310,7 +2379,7 @@ def get_reference_image(packaging_type: str, filename: str):
     """Serve a reference image by packaging type and filename."""
     if packaging_type not in ("pack", "box"):
         raise HTTPException(status_code=400, detail="packaging_type must be 'pack' or 'box'")
-    REFERENCES_DIR = _BACKEND_ROOT / "references" / packaging_type
+    REFERENCES_DIR = _DATA_ROOT / "references" / packaging_type
     path = REFERENCES_DIR / filename
     if not path.exists() or not path.is_file():
         raise HTTPException(status_code=404, detail="Image not found")
@@ -2322,7 +2391,7 @@ def delete_reference_image(packaging_type: str, filename: str):
     """Delete a reference image by packaging type and filename."""
     if packaging_type not in ("pack", "box"):
         raise HTTPException(status_code=400, detail="packaging_type must be 'pack' or 'box'")
-    REFERENCES_DIR = _BACKEND_ROOT / "references" / packaging_type
+    REFERENCES_DIR = _DATA_ROOT / "references" / packaging_type
     path = REFERENCES_DIR / filename
     if not path.exists() or not path.is_file():
         raise HTTPException(status_code=404, detail="Image not found")
@@ -2337,7 +2406,7 @@ def list_reference_images(product_name: str, packaging_type: str = "pack"):
     """List all reference image filenames for a product in a packaging type subfolder."""
     if packaging_type not in ("pack", "box"):
         raise HTTPException(status_code=400, detail="packaging_type must be 'pack' or 'box'")
-    REFERENCES_DIR = _BACKEND_ROOT / "references" / packaging_type
+    REFERENCES_DIR = _DATA_ROOT / "references" / packaging_type
     files = sorted(REFERENCES_DIR.glob(f"{product_name}_*.*")) if REFERENCES_DIR.exists() else []
     return {
         "product": product_name,
@@ -2375,9 +2444,9 @@ _TRAINING_PROGRESS_DIR = _BACKEND_ROOT.parent
 _training_jobs: dict[str, dict] = {}
 _training_processes: dict[str, object] = {}
 _training_lock = threading.Lock()
-_TRAINING_HISTORY_PATH = _BACKEND_ROOT / "training_history.json"
-_MODEL_REGISTRY_PATH = _BACKEND_ROOT / "model_registry.json"
-_VERSION_STATE_PATH = _BACKEND_ROOT / "training_version_state.json"
+_TRAINING_HISTORY_PATH = _DATA_ROOT / "training_history.json"
+_MODEL_REGISTRY_PATH = _DATA_ROOT / "model_registry.json"
+_VERSION_STATE_PATH = _DATA_ROOT / "training_version_state.json"
 DEFAULT_TRAINING_VERSION = "v1"
 
 
@@ -2514,7 +2583,7 @@ def _hash_dataset_dir(path: Path) -> str:
 
 def _dataset_hash_for_type(model_type: str) -> str:
     if model_type in ("classifier", "dinov2_finetune"):
-        return _hash_dataset_dir(_BACKEND_ROOT / "references")
+        return _hash_dataset_dir(_DATA_ROOT / "references")
     if model_type == "rfdetr":
         return _hash_dataset_dir(_BACKEND_ROOT.parent / "datasets" / "cigarette_packs")
     return "unknown"
