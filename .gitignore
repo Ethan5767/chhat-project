@@ -49,3 +49,4 @@ backend/uploads/
 
 # Claude Code config
 .claude/
+CLAUDE.md
