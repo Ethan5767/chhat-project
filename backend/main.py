@@ -1695,6 +1695,365 @@ def run_classifier_training_runpod_job(
             _training_jobs[job_id].pop("runpod_pod_id", None)
 
 
+def _tar_dataset_for_runpod(tar_path: Path) -> subprocess.CompletedProcess:
+    """Tar datasets/cigarette_packs for upload to a RunPod pod."""
+    src = _PROJECT_ROOT / "datasets" / "cigarette_packs"
+    if not src.is_dir():
+        return subprocess.CompletedProcess(
+            args=("_tar_dataset_for_runpod",), returncode=1, stdout="",
+            stderr=f"dataset directory missing: {src}",
+        )
+    staging = Path(tempfile.mkdtemp()) / "cigarette_packs"
+    try:
+        rsync_bin = shutil.which("rsync")
+        if rsync_bin:
+            subprocess.run([rsync_bin, "-a", "--", f"{str(src)}/", f"{str(staging)}/"],
+                           capture_output=True, check=True)
+        else:
+            shutil.copytree(src, staging, dirs_exist_ok=True)
+        r = subprocess.run(
+            ["tar", "czf", str(tar_path), "-C", str(staging.parent), "cigarette_packs"],
+            capture_output=True, text=True,
+        )
+        return r
+    finally:
+        shutil.rmtree(staging.parent, ignore_errors=True)
+
+
+def run_rfdetr_training_runpod_job(
+    job_id: str,
+    epochs: int = 50,
+    batch_size: int = 4,
+    lr: float = 1e-4,
+    grad_accum_steps: int = 4,
+    patience: int = 10,
+):
+    """Train RF-DETR on a RunPod GPU pod. Uploads dataset, runs train.py, downloads checkpoints."""
+    import time as time_module
+
+    api_key = _get_runpod_api_key()
+    if not api_key:
+        with _training_lock:
+            _training_jobs[job_id]["status"] = "error"
+            _training_jobs[job_id]["error"] = "RUNPOD_API_KEY not set"
+            _training_jobs[job_id]["end_time"] = _now_iso()
+        return
+
+    gpu_candidates = _classifier_gpu_candidates()
+    cloud_types = _classifier_cloud_types()
+    deploy_rounds, deploy_pause = _classifier_deploy_retry_settings()
+
+    _log_runpod(
+        f"rfdetr-gpu job={job_id[:8]}… start epochs={epochs} batch={batch_size} "
+        f"lr={lr} grad_accum={grad_accum_steps} patience={patience} "
+        f"gpu={gpu_candidates[0] if gpu_candidates else '?'}"
+    )
+
+    pod_id = ""
+    pod_host_id = ""
+    ssh_host = ""
+    ssh_port = 22
+    ssh_key = ""
+
+    try:
+        with _training_lock:
+            _training_jobs[job_id]["status"] = "running"
+            _training_jobs[job_id]["progress"] = {
+                "epoch": 0, "total_epochs": epochs,
+                "status": "starting", "note": "Provisioning RunPod GPU for RF-DETR",
+            }
+
+        # 1. Tar dataset
+        dataset_tar = Path(tempfile.gettempdir()) / f"dataset_rfdetr_{job_id}.tar.gz"
+        _log_runpod("rfdetr-gpu: tarring datasets/cigarette_packs")
+        tar_r = _tar_dataset_for_runpod(dataset_tar)
+        if tar_r.returncode != 0:
+            raise RuntimeError(f"Dataset tar failed: {tar_r.stderr}")
+        _log_runpod(f"rfdetr-gpu: dataset archive OK size_bytes={dataset_tar.stat().st_size}")
+
+        # 2. Provision pod
+        _log_runpod("rfdetr-gpu: creating RunPod pod…")
+        for round_idx in range(deploy_rounds):
+            if round_idx > 0:
+                _log_runpod(
+                    f"rfdetr-gpu: capacity retry {round_idx + 1}/{deploy_rounds} "
+                    f"(waiting {deploy_pause}s)…",
+                )
+                time_module.sleep(deploy_pause)
+
+            for gpu_id in gpu_candidates:
+                for cloud in cloud_types:
+                    _log_runpod(f"rfdetr-gpu: try round={round_idx+1} cloud={cloud} gpu={gpu_id} volume=50Gi…")
+                    try:
+                        pod = _runpod_gql(api_key, """
+                            mutation CreatePod($input: PodFindAndDeployOnDemandInput!) {
+                                podFindAndDeployOnDemand(input: $input) { id costPerHr machine { podHostId } }
+                            }""", {"input": {
+                                "name": f"rfdetr-{job_id[:8]}",
+                                "templateId": RUNPOD_TEMPLATE,
+                                "gpuTypeId": gpu_id,
+                                "cloudType": cloud,
+                                "volumeInGb": 50,
+                                "containerDiskInGb": 20,
+                                "gpuCount": 1,
+                            }})["podFindAndDeployOnDemand"]
+                        pod_id = pod["id"]
+                        pod_host_id = pod.get("machine", {}).get("podHostId", "")
+                        cost_hr = pod.get("costPerHr", "?")
+                        _log_runpod(f"rfdetr-gpu: using cloud={cloud} gpu={gpu_id} volume=50Gi")
+                        _log_runpod(f"rfdetr-gpu: pod id={pod_id} cost~${cost_hr}/hr gpu={gpu_id}")
+                        with _training_lock:
+                            _training_jobs[job_id]["runpod_pod_id"] = pod_id
+                        break
+                    except Exception as exc:
+                        _log_runpod(f"rfdetr-gpu: cloud={cloud} gpu={gpu_id} failed: {exc}")
+                        continue
+                if pod_id:
+                    break
+            if pod_id:
+                break
+
+        if not pod_id:
+            raise RuntimeError(f"No RunPod capacity for RF-DETR after {deploy_rounds} round(s)")
+
+        # 3. Wait for SSH
+        ssh_key = _find_runpod_ssh_key()
+        if not ssh_key:
+            raise RuntimeError("No SSH private key found (~/.ssh/runpod_ed25519, ~/.runpod/ssh/ or ~/.ssh/)")
+
+        for attempt in range(30):
+            ports = _runpod_gql(api_key, f"""
+                query {{ pod(input: {{ podId: "{pod_id}" }}) {{
+                    runtime {{ ports {{ ip privatePort publicPort type }} }}
+                }} }}""").get("pod", {}).get("runtime", {}).get("ports", [])
+            tcp = [p for p in ports if p.get("type") == "tcp" and p.get("privatePort") == 22]
+            if tcp:
+                ssh_host = tcp[0]["ip"]
+                ssh_port = int(tcp[0]["publicPort"])
+                break
+            if attempt > 2:
+                _log_runpod(f"rfdetr-gpu: waiting for SSH port ({attempt+1}/30) pod={pod_id[:8]}…")
+            time_module.sleep(10)
+
+        if not ssh_host:
+            raise RuntimeError("SSH port never became available")
+
+        _log_runpod(f"rfdetr-gpu: SSH root@{ssh_host}:{ssh_port} (sleep 60s for sshd)")
+        time_module.sleep(60)
+        _log_runpod(f"rfdetr-gpu: SSH identity {ssh_key}")
+
+        for attempt in range(5):
+            r = _ssh_cmd(ssh_host, ssh_port, ssh_key, "echo ok",
+                         timeout=45, pod_id=pod_id, pod_host_id=pod_host_id)
+            if "ok" in (r.stdout or ""):
+                _log_runpod(f"rfdetr-gpu: SSH OK (attempt {attempt + 1})")
+                break
+            _log_runpod(f"rfdetr-gpu: SSH probe failed rc={r.returncode}")
+            time_module.sleep(15)
+        else:
+            raise RuntimeError("SSH connection to pod failed after 5 attempts")
+
+        # 4. Bootstrap
+        r = _ssh_cmd(ssh_host, ssh_port, ssh_key,
+                     f"test -d /workspace/chhat-project/.venv",
+                     timeout=10, pod_id=pod_id, pod_host_id=pod_host_id)
+        if r.returncode != 0:
+            _log_runpod("rfdetr-gpu: repo missing on pod — clone + bootstrap (long)")
+            _ssh_cmd(ssh_host, ssh_port, ssh_key,
+                     f"cd /workspace && git clone --depth 1 {RUNPOD_REPO} chhat-project "
+                     f"&& cd chhat-project && bash runpod/bootstrap_training_pod.sh",
+                     timeout=1200, pod_id=pod_id, pod_host_id=pod_host_id)
+            _log_runpod("rfdetr-gpu: bootstrap complete")
+        else:
+            _log_runpod("rfdetr-gpu: repo present on pod")
+
+        # 5. Upload dataset
+        _log_runpod("rfdetr-gpu: upload dataset archive to pod…")
+        up = _scp_to(
+            ssh_host, ssh_port, ssh_key, str(dataset_tar),
+            "/workspace/chhat-project/dataset_upload.tar.gz",
+            timeout=600, pod_id=pod_id, pod_host_id=pod_host_id,
+        )
+        if up.returncode != 0:
+            raise RuntimeError(f"dataset upload to pod failed: {(up.stderr or '')[:400]}")
+
+        un = _ssh_cmd(
+            ssh_host, ssh_port, ssh_key,
+            "cd /workspace/chhat-project && rm -rf datasets/cigarette_packs && mkdir -p datasets && "
+            "tar xzf dataset_upload.tar.gz -C datasets && rm -f dataset_upload.tar.gz",
+            timeout=180, pod_id=pod_id, pod_host_id=pod_host_id,
+        )
+        if un.returncode != 0:
+            raise RuntimeError(f"Unpack dataset on pod failed: {(un.stdout or un.stderr or '')[-600:]}")
+        _log_runpod("rfdetr-gpu: dataset uploaded + extracted OK")
+
+        # 6. Verify CUDA
+        _log_runpod("rfdetr-gpu: clearing zombie GPU processes and verifying CUDA…")
+        _ssh_cmd(
+            ssh_host, ssh_port, ssh_key,
+            "nvidia-smi --query-compute-apps=pid --format=csv,noheader 2>/dev/null | "
+            "xargs -r -I{} sh -c 'ps -p {} >/dev/null 2>&1 || kill -9 {} 2>/dev/null'; "
+            "sleep 2; nvidia-smi",
+            timeout=30, pod_id=pod_id, pod_host_id=pod_host_id,
+        )
+        cuda_chk = _ssh_cmd(
+            ssh_host, ssh_port, ssh_key,
+            "cd /workspace/chhat-project && source .venv/bin/activate && "
+            "python -c \"import torch; assert torch.cuda.is_available(), 'CUDA not available'; "
+            "print(f'CUDA OK device={torch.cuda.get_device_name(0)}')\"",
+            timeout=60, pod_id=pod_id, pod_host_id=pod_host_id,
+        )
+        if "CUDA OK" not in _strip_ansi(cuda_chk.stdout or ""):
+            raise RuntimeError("CUDA not available on pod — aborting to avoid CPU training")
+        _log_runpod(f"rfdetr-gpu: {_strip_ansi(cuda_chk.stdout or '').strip()}")
+
+        # 7. Install rfdetr training extras
+        _log_runpod("rfdetr-gpu: installing rfdetr training extras…")
+        install_r = _ssh_cmd(
+            ssh_host, ssh_port, ssh_key,
+            "cd /workspace/chhat-project && source .venv/bin/activate && "
+            "pip install 'rfdetr[train,loggers]' -q",
+            timeout=300, pod_id=pod_id, pod_host_id=pod_host_id,
+        )
+        if install_r.returncode != 0:
+            _log_runpod(f"rfdetr-gpu: WARNING pip install failed rc={install_r.returncode}")
+            raise RuntimeError(f"rfdetr[train,loggers] install failed: {(install_r.stderr or install_r.stdout or '')[-400:]}")
+        _log_runpod("rfdetr-gpu: rfdetr extras installed")
+
+        # 8. Run training
+        progress_remote = f"/tmp/rfdetr_progress_{job_id}.json"
+        train_cmd = (
+            f"cd /workspace/chhat-project && source .venv/bin/activate && "
+            f"CUDA_VISIBLE_DEVICES=0 "
+            f"python train.py --epochs {epochs} --batch-size {batch_size} "
+            f"--lr {lr} --grad-accum-steps {grad_accum_steps} --patience {patience} "
+            f"--progress-file {progress_remote}"
+        )
+
+        _log_runpod(f"rfdetr-gpu: starting train.py on pod (up to 8h) — progress polled ~30s")
+
+        stop_poll = threading.Event()
+        poll_state = {"last_epoch": -1}
+
+        def _poll_remote_progress():
+            while not stop_poll.wait(30):
+                try:
+                    pr = _ssh_cmd(
+                        ssh_host, ssh_port, ssh_key,
+                        f"cat {progress_remote} 2>/dev/null || true",
+                        timeout=25, pod_id=pod_id, pod_host_id=pod_host_id,
+                    )
+                    raw = _strip_ansi(pr.stdout or "")
+                    json_match = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
+                    if json_match:
+                        data = json.loads(json_match.group())
+                        with _training_lock:
+                            _training_jobs[job_id]["progress"] = data
+                            _training_jobs[job_id]["last_update"] = _now_iso()
+                        _update_model_registry(
+                            job_id,
+                            {
+                                "status": "running",
+                                "progress": data,
+                                "last_update": _now_iso(),
+                                **_metrics_from_progress(data),
+                            },
+                        )
+                        ep = int(data.get("epoch", 0) or 0)
+                        if ep != poll_state["last_epoch"]:
+                            poll_state["last_epoch"] = ep
+                            st = data.get("status", "")
+                            _log_runpod(
+                                f"rfdetr-gpu: remote progress epoch={ep}/{epochs} status={st}",
+                            )
+                except Exception:
+                    pass
+
+        poll_thread = threading.Thread(target=_poll_remote_progress, daemon=True)
+        poll_thread.start()
+
+        try:
+            r = _ssh_cmd(
+                ssh_host, ssh_port, ssh_key, train_cmd,
+                timeout=8 * 3600, pod_id=pod_id, pod_host_id=pod_host_id,
+            )
+        finally:
+            stop_poll.set()
+            poll_thread.join(timeout=5)
+
+        if r.returncode != 0:
+            _log_runpod(f"rfdetr-gpu: train.py exited rc={r.returncode}")
+            raise RuntimeError(f"RF-DETR training on pod failed:\n{(r.stdout or '')[-3500:]}")
+        _log_runpod("rfdetr-gpu: training complete on pod")
+
+        # 9. Download checkpoints
+        out_dir = _DATA_ROOT / "runs"
+        out_dir.mkdir(parents=True, exist_ok=True)
+
+        for fname in ("checkpoint_best_ema.pth", "checkpoint_best_regular.pth", "checkpoint_best_total.pth"):
+            remote_p = f"/workspace/chhat-project/runs/{fname}"
+            local_p = str(out_dir / fname)
+            _log_runpod(f"rfdetr-gpu: downloading {fname} from pod…")
+            dl = _scp_from(ssh_host, ssh_port, ssh_key, remote_p, local_p,
+                           timeout=600, pod_id=pod_id, pod_host_id=pod_host_id)
+            if dl.returncode != 0:
+                _log_runpod(f"rfdetr-gpu: WARNING download {fname} failed (may not exist)")
+            else:
+                _log_runpod(f"rfdetr-gpu: saved {local_p}")
+
+        # 10. Reload RF-DETR
+        try:
+            reload_rfdetr()
+            _log_runpod("rfdetr-gpu: reload_rfdetr OK")
+        except Exception as exc:
+            _log_runpod(f"rfdetr-gpu: WARNING reload_rfdetr failed: {exc}")
+
+        with _training_lock:
+            completed_version = _training_jobs[job_id].get("version", DEFAULT_TRAINING_VERSION)
+            _training_jobs[job_id]["status"] = "done"
+            _training_jobs[job_id]["end_time"] = _now_iso()
+            _training_jobs[job_id]["progress"] = {
+                "epoch": epochs, "total_epochs": epochs,
+                "status": "complete", "note": "Checkpoints saved under runs/",
+            }
+        next_ver = _mark_training_completed(str(completed_version))
+        _update_training_history(job_id, {
+            "status": "done",
+            "end_time": _now_iso(),
+            "progress": _training_jobs.get(job_id, {}).get("progress", {}),
+        })
+        _update_model_registry(job_id, {
+            "status": "done",
+            "end_time": _now_iso(),
+            "progress": _training_jobs.get(job_id, {}).get("progress", {}),
+        })
+        _log_runpod(f"rfdetr-gpu: job DONE job={job_id[:8]}… next_version={next_ver}")
+
+    except Exception as exc:
+        tb = traceback.format_exc()
+        _log_runpod(f"rfdetr-gpu: ERROR job={job_id[:8]}…")
+        _log_runpod(f"  {tb}")
+        with _training_lock:
+            _training_jobs[job_id]["status"] = "error"
+            _training_jobs[job_id]["error"] = tb
+            _training_jobs[job_id]["end_time"] = _now_iso()
+        _update_training_history(job_id, {"status": "error", "error": str(exc), "end_time": _now_iso()})
+        _update_model_registry(job_id, {"status": "error", "error": str(exc), "end_time": _now_iso()})
+    finally:
+        # Cleanup temp tar
+        tar_path = Path(tempfile.gettempdir()) / f"dataset_rfdetr_{job_id}.tar.gz"
+        tar_path.unlink(missing_ok=True)
+        # Terminate pod
+        if pod_id:
+            try:
+                _runpod_gql(api_key, f'mutation {{ podTerminate(input: {{ podId: "{pod_id}" }}) }}')
+                _log_runpod(f"rfdetr-gpu: pod terminated id={pod_id}")
+            except Exception as exc:
+                _log_runpod(f"rfdetr-gpu: WARNING pod terminate failed id={pod_id}: {exc}")
+        with _training_lock:
+            _training_jobs[job_id].pop("runpod_pod_id", None)
+
+
 @app.on_event("startup")
 def startup_event():
     device = get_device()
@@ -3037,12 +3396,15 @@ def train_rfdetr_endpoint(
     epochs: int = 50,
     batch_size: int = 4,
     lr: float = 0.0001,
+    grad_accum_steps: int = 4,
+    patience: int = 10,
     roboflow_url: str = "",
     clean_dataset: bool = False,
     version: str = "",
     force: bool = False,
+    use_runpod: bool = False,
 ):
-    """Train RF-DETR detection model. Requires GPU for reasonable speed."""
+    """Train RF-DETR detection model. use_runpod=true for GPU training on RunPod."""
     version = (version or _get_current_training_version()).strip() or DEFAULT_TRAINING_VERSION
     dataset_import = None
     if roboflow_url.strip():
@@ -3052,7 +3414,10 @@ def train_rfdetr_endpoint(
         "epochs": epochs,
         "batch_size": batch_size,
         "lr": lr,
+        "grad_accum_steps": grad_accum_steps,
+        "patience": patience,
         "dataset_source": "roboflow_url" if roboflow_url.strip() else "existing_local",
+        "use_runpod": use_runpod,
     }
     dataset_hash = _dataset_hash_for_type("rfdetr")
     hp_sig = _hparam_signature("rfdetr", version, params)
@@ -3068,11 +3433,6 @@ def train_rfdetr_endpoint(
 
     job_id = create_job()
     start_time = _now_iso()
-    args = [
-        "--epochs", str(epochs),
-        "--batch-size", str(batch_size),
-        "--lr", str(lr),
-    ]
     with _training_lock:
         _training_jobs[job_id] = {
             "job_id": job_id,
@@ -3093,17 +3453,34 @@ def train_rfdetr_endpoint(
         snapshot = dict(_training_jobs[job_id])
     _append_training_history(snapshot)
     _append_model_registry(snapshot)
-    threading.Thread(
-        target=_run_training_job,
-        args=(job_id, "train.py", args),
-        daemon=True,
-    ).start()
+
+    if use_runpod:
+        threading.Thread(
+            target=run_rfdetr_training_runpod_job,
+            args=(job_id, epochs, batch_size, lr, grad_accum_steps, patience),
+            daemon=True,
+        ).start()
+    else:
+        args = [
+            "--epochs", str(epochs),
+            "--batch-size", str(batch_size),
+            "--lr", str(lr),
+            "--grad-accum-steps", str(grad_accum_steps),
+            "--patience", str(patience),
+        ]
+        threading.Thread(
+            target=_run_training_job,
+            args=(job_id, "train.py", args),
+            daemon=True,
+        ).start()
+
     return {
         "job_id": job_id,
         "type": "rfdetr",
         "epochs": epochs,
         "version": version,
         "skipped": False,
+        "use_runpod": use_runpod,
         "dataset_import": dataset_import,
     }
 

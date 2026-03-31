@@ -47,7 +47,7 @@ DOWNLOAD_TIMEOUT = 15
 RFDETR_CONF_THRESHOLD = 0.15  # low threshold to catch packs in small shelf images
 OCR_ENABLED = True
 OCR_MIN_TOKEN_LEN = 3
-MIN_OUTPUT_CONFIDENCE = 0.40  # classifier softmax over 43 classes produces lower per-class probabilities
+MIN_OUTPUT_CONFIDENCE = 0.60
 CLASSIFIER_TOP_K = 5
 OCR_FULLIMG_ENABLED = True
 
