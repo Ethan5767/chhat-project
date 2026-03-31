@@ -2232,25 +2232,37 @@ async def generate_crops(image_file: UploadFile = File(...)):
                 pkg = meta["packaging_type"]
                 type_indices.setdefault(pkg, []).append(idx)
 
-            per_crop_results: list[tuple[str, float]] = [("unknown", 0.0)] * len(crop_images)
+            per_crop_results: list[list[tuple[str, float]]] = [[] for _ in crop_images]
             for pkg_type, indices in type_indices.items():
                 try:
                     type_vecs = vecs[indices]
-                    cls_results = classify_embeddings(type_vecs, device, top_k=3, packaging_type=pkg_type)
+                    cls_results = classify_embeddings(type_vecs, device, top_k=10, packaging_type=pkg_type)
                     for local_idx, global_idx in enumerate(indices):
-                        if cls_results[local_idx]:
-                            per_crop_results[global_idx] = cls_results[local_idx][0]
+                        per_crop_results[global_idx] = cls_results[local_idx]
                 except FileNotFoundError:
                     pass  # No classifier for this type yet
 
-            for crop_idx, top_pred in enumerate(per_crop_results):
-                internal_name = resolve_internal_name(top_pred[0])
-                cls_conf = top_pred[1]
-                brand = get_brand(internal_name)
+            for crop_idx, crop_preds in enumerate(per_crop_results):
+                if not crop_preds:
+                    suggested_labels.append({"internal_name": "", "brand": "", "confidence": 0.0})
+                    continue
+                # Aggregate classifier confidence at brand level to find best brand
+                brand_conf: dict[str, float] = {}
+                brand_best_product: dict[str, tuple[str, float]] = {}
+                for label, conf in crop_preds:
+                    internal = resolve_internal_name(label)
+                    brand = get_brand(internal)
+                    brand_conf[brand] = brand_conf.get(brand, 0.0) + conf
+                    prev = brand_best_product.get(brand)
+                    if prev is None or conf > prev[1]:
+                        brand_best_product[brand] = (internal, conf)
+                # Pick the brand with the highest aggregated confidence
+                best_brand = max(brand_conf, key=brand_conf.get)
+                best_product, best_conf = brand_best_product[best_brand]
                 suggested_labels.append({
-                    "internal_name": internal_name,
-                    "brand": brand,
-                    "confidence": round(cls_conf, 3),
+                    "internal_name": best_product,
+                    "brand": best_brand,
+                    "confidence": round(brand_conf[best_brand], 3),
                 })
         except Exception:
             suggested_labels = [{"internal_name": "", "brand": "", "confidence": 0.0}] * len(crop_images)

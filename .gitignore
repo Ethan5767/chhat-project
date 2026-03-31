@@ -46,7 +46,18 @@ source_materials/
 
 # Runtime artifacts
 backend/uploads/
+backend/batch_history.json
+backend/training_history.json
+backend/model_registry.json
+training_progress.json
+.training_log_*
+
+# RunPod
+runpod/runpodctl.exe
 
 # Claude Code config
 .claude/
 CLAUDE.md
+
+# Plans / docs not for public
+docs/superpowers/

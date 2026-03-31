@@ -1,6 +1,7 @@
 import json
 import io
 import logging
+import os
 import re
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -18,8 +19,10 @@ from transformers import AutoImageProcessor, AutoModel
 BATCH_MODE: Optional[int] = None
 SAVE_INTERVAL = 50
 _BACKEND_ROOT = Path(__file__).resolve().parent
-REFERENCES_DIR = _BACKEND_ROOT / "references"
-CLASSIFIER_BASE_DIR = _BACKEND_ROOT / "classifier_model"
+# Persistent data root -- survives code deploys. Defaults to backend/ for local dev.
+_DATA_ROOT = Path(os.environ.get("CHHAT_DATA_ROOT", str(_BACKEND_ROOT)))
+REFERENCES_DIR = _DATA_ROOT / "references"
+CLASSIFIER_BASE_DIR = _DATA_ROOT / "classifier_model"
 PACKAGING_TYPES = ("pack", "box")
 
 # Per-type paths (backward compat aliases pointing to pack)
@@ -37,7 +40,7 @@ DINO_MODEL_ID = "facebook/dinov2-base"
 # Written by finetune_dinov2.py; backbone weights only (dino.*), shared across pack/box brand classifiers.
 DINO_FINETUNED_FULL_PATH = CLASSIFIER_BASE_DIR / "dinov2_finetuned_full.pth"
 _PROJECT_ROOT = _BACKEND_ROOT.parent
-_RFDETR_CHECKPOINT_DIR = _PROJECT_ROOT / "runs"
+_RFDETR_CHECKPOINT_DIR = _DATA_ROOT / "runs" if (_DATA_ROOT / "runs").exists() else _PROJECT_ROOT / "runs"
 
 DOWNLOAD_TIMEOUT = 15
 RFDETR_CONF_THRESHOLD = 0.15  # low threshold to catch packs in small shelf images
@@ -56,8 +59,8 @@ CLASSIFIER_LOW_CONF = 0.50
 OCR_FALLBACK_THRESHOLD = 0.72
 OCR_FALLBACK_MARGIN = 0.08
 OCR_STRONG_THRESHOLD = 0.60
-OCR_BOOST = 0.10              # confidence boost when OCR agrees with classifier
-OCR_INDEPENDENT_MIN_SCORE = 0.65
+OCR_BOOST = 0.05              # confidence boost when OCR agrees with classifier
+OCR_INDEPENDENT_MIN_SCORE = 0.70
 
 _dino_processor = None
 _dino_model = None
@@ -783,9 +786,9 @@ def _detect_brands_from_image(
                         fullimg_ocr_families.get(brand_family, 0.0),
                     )
                 if fam_conf >= OCR_STRONG_THRESHOLD:
-                    out_conf = min(1.0, out_conf + fam_conf * 0.25)
+                    out_conf = min(1.0, out_conf + fam_conf * 0.15)
                 elif fam_conf > 0:
-                    out_conf = min(1.0, out_conf + fam_conf * 0.10)
+                    out_conf = min(1.0, out_conf + fam_conf * 0.05)
             if out_conf > fused.get(label, 0.0):
                 fused[label] = out_conf
 
@@ -794,7 +797,7 @@ def _detect_brands_from_image(
         if label in fused:
             continue
         if ocr_conf >= OCR_INDEPENDENT_MIN_SCORE:
-            fused[label] = min(1.0, ocr_conf * 0.85)
+            fused[label] = min(1.0, ocr_conf * 0.70)
 
     return _aggregate_to_products(fused)
 
