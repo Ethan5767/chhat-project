@@ -1798,7 +1798,7 @@ def run_rfdetr_training_runpod_job(
                                 "gpuCount": 1,
                             }})["podFindAndDeployOnDemand"]
                         pod_id = pod["id"]
-                        pod_host_id = pod.get("machine", {}).get("podHostId", "")
+                        pod_host_id = (pod.get("machine") or {}).get("podHostId", "")
                         cost_hr = pod.get("costPerHr", "?")
                         _log_runpod(f"rfdetr-gpu: using cloud={cloud} gpu={gpu_id} volume=50Gi")
                         _log_runpod(f"rfdetr-gpu: pod id={pod_id} cost~${cost_hr}/hr gpu={gpu_id}")
@@ -1831,18 +1831,21 @@ def run_rfdetr_training_runpod_job(
             raise RuntimeError("No SSH private key found (~/.ssh/runpod_ed25519, ~/.runpod/ssh/ or ~/.ssh/)")
 
         for attempt in range(30):
-            ports = _runpod_gql(api_key, f"""
-                query {{ pod(input: {{ podId: "{pod_id}" }}) {{
-                    runtime {{ ports {{ ip privatePort publicPort type }} }}
-                }} }}""").get("pod", {}).get("runtime", {}).get("ports", [])
-            tcp = [p for p in ports if p.get("type") == "tcp" and p.get("privatePort") == 22]
-            if tcp:
-                ssh_host = tcp[0]["ip"]
-                ssh_port = int(tcp[0]["publicPort"])
-                break
-            if attempt > 2:
-                _log_runpod(f"rfdetr-gpu: waiting for SSH port ({attempt+1}/30) pod={pod_id[:8]}…")
+            d = _runpod_gql(api_key, f"""query {{
+                pod(input: {{ podId: "{pod_id}" }}) {{
+                    runtime {{ uptimeInSeconds ports {{ ip publicPort privatePort type }} }}
+                }}
+            }}""")
+            rt = (d.get("pod") or {}).get("runtime")
+            if rt and rt.get("ports"):
+                ssh_ports = [p for p in rt["ports"] if p["privatePort"] == 22]
+                if ssh_ports:
+                    ssh_host = ssh_ports[0]["ip"]
+                    ssh_port = int(ssh_ports[0]["publicPort"])
+                    break
             time_module.sleep(10)
+            if attempt % 3 == 0 and attempt > 0:
+                _log_runpod(f"rfdetr-gpu: waiting for SSH port ({attempt}/30) pod={pod_id[:8]}…")
 
         if not ssh_host:
             raise RuntimeError("SSH port never became available")
