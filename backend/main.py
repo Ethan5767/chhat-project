@@ -880,16 +880,14 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
                  timeout=15, pod_id=pod_id, pod_host_id=pod_host_id)
 
         for local_p, remote_p in model_uploads:
-            if Path(local_p).exists():
-                _log_runpod(f"gpu-batch: uploading {Path(local_p).name}…")
-                up = _scp_to(ssh_host, ssh_port, ssh_key, str(local_p), remote_p,
-                             timeout=600, pod_id=pod_id, pod_host_id=pod_host_id)
-                if up.returncode != 0:
-                    _log_runpod(f"gpu-batch: WARNING upload {Path(local_p).name} failed")
-                else:
-                    _log_runpod(f"gpu-batch: uploaded {Path(local_p).name}")
-            else:
-                _log_runpod(f"gpu-batch: WARNING {local_p} not found, skipping")
+            if not Path(local_p).exists():
+                raise RuntimeError(f"Required model file missing: {local_p}")
+            _log_runpod(f"gpu-batch: uploading {Path(local_p).name}…")
+            up = _scp_to(ssh_host, ssh_port, ssh_key, str(local_p), remote_p,
+                         timeout=600, pod_id=pod_id, pod_host_id=pod_host_id)
+            if up.returncode != 0:
+                raise RuntimeError(f"Model upload failed: {Path(local_p).name}: {(up.stderr or '')[:200]}")
+            _log_runpod(f"gpu-batch: uploaded {Path(local_p).name}")
 
         # 6. Kill zombie GPU processes and verify CUDA before pipeline
         _log_runpod("gpu-batch: clearing zombie GPU processes and verifying CUDA…")
@@ -914,19 +912,17 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
 
         # Run pipeline on pod
         update_progress(job_id, 30, 100, "Running detection pipeline on GPU...")
-        _log_runpod("gpu-batch: starting run_pipeline on pod (long-running; up to 2h timeout)")
+        _log_runpod("gpu-batch: starting run_pipeline on pod (long-running)")
         remote_csv = f"/workspace/chhat-project/backend/uploads/{csv_path.name}"
         remote_out = f"/workspace/chhat-project/backend/uploads/{csv_path.stem}_results.csv"
 
         r = _ssh_cmd(ssh_host, ssh_port, ssh_key,
                       f"cd /workspace/chhat-project && source .venv/bin/activate && "
                       f"CUDA_VISIBLE_DEVICES=0 "
-                      f"python -c '"
-                      f"from backend.pipeline import run_pipeline; "
-                      f'out = run_pipeline("{remote_csv}"); '
-                      f'print(f"RESULT_PATH={{out}}")'
-                      f"'",
-                      timeout=7200, pod_id=pod_id, pod_host_id=pod_host_id)  # 2 hour timeout for large batches
+                      f"python -c \"from backend.pipeline import run_pipeline; "
+                      f"out = run_pipeline('{remote_csv}'); "
+                      f"print(f'RESULT_PATH={{out}}')\"",
+                      timeout=48 * 3600, pod_id=pod_id, pod_host_id=pod_host_id)  # 48h timeout for large batches
 
         if r.returncode != 0:
             raise RuntimeError(f"Pipeline failed on GPU: {r.stdout[-500:]}")

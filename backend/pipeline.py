@@ -903,6 +903,11 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
         from output_format import build_q12_row, get_output_columns
 
     device = get_device()
+    # On RunPod pods, require GPU -- abort early if only CPU available
+    if os.environ.get("RUNPOD_POD_ID") or os.environ.get("CUDA_VISIBLE_DEVICES"):
+        if device == "cpu":
+            raise RuntimeError("GPU required but not available. Aborting to avoid slow CPU processing.")
+    logger.info("Pipeline device: %s", device)
     classifier, labels = load_index()
     processor, model = load_dino(device)
     rfdetr_model = load_rfdetr()
