@@ -3,6 +3,7 @@ import hashlib
 import json
 import os
 import queue
+import re
 import shutil
 import subprocess
 import tempfile
@@ -463,6 +464,11 @@ def _paramiko_connect(pod_id: str, pod_host_id: str, key: str, connect_timeout: 
     return client
 
 
+def _strip_ansi(text: str) -> str:
+    """Remove ANSI escape codes from terminal output."""
+    return re.sub(r'\x1b\[[0-9;]*[a-zA-Z]|\x1b\].*?\x07', '', text)
+
+
 def _paramiko_proxy_exec(pod_id: str, pod_host_id: str, key: str, command: str,
                          timeout: int = 300) -> subprocess.CompletedProcess:
     """Execute command on RunPod pod via interactive shell through ssh.runpod.io.
@@ -481,14 +487,20 @@ def _paramiko_proxy_exec(pod_id: str, pod_host_id: str, key: str, command: str,
             stderr=f"paramiko connect failed: {exc}",
         )
     try:
-        channel = client.invoke_shell(term="xterm", width=4096, height=50)
+        channel = client.invoke_shell(term="dumb", width=4096, height=50)
         channel.settimeout(5.0)
 
         # Wait for shell prompt / banner to flush
-        _time.sleep(2)
+        _time.sleep(3)
         banner = b""
         while channel.recv_ready():
             banner += channel.recv(65536)
+
+        # Disable echo to prevent command from appearing in output
+        channel.sendall(b"stty -echo\n")
+        _time.sleep(0.5)
+        while channel.recv_ready():
+            channel.recv(65536)
 
         # Send command with exit code marker, then exit shell
         marker = "__PARAMIKO_EXIT_CODE__"
@@ -500,6 +512,10 @@ def _paramiko_proxy_exec(pod_id: str, pod_host_id: str, key: str, command: str,
         deadline = _time.monotonic() + float(timeout)
         while _time.monotonic() < deadline:
             try:
+                remaining = deadline - _time.monotonic()
+                if remaining <= 0:
+                    break
+                channel.settimeout(min(5.0, remaining))
                 data = channel.recv(65536)
                 if not data:
                     break
@@ -512,14 +528,15 @@ def _paramiko_proxy_exec(pod_id: str, pod_host_id: str, key: str, command: str,
         channel.close()
         full_output = "".join(out_chunks)
 
-        # Extract exit code from marker
+        # Extract exit code from marker, stripping ANSI codes
         exit_code = 0
         for line in full_output.splitlines():
-            if line.strip().startswith(marker):
-                try:
-                    exit_code = int(line.strip().replace(marker, ""))
-                except ValueError:
-                    pass
+            clean = _strip_ansi(line).strip()
+            if clean.startswith(marker):
+                code_str = clean.replace(marker, "").strip()
+                match = re.match(r'(\d+)', code_str)
+                if match:
+                    exit_code = int(match.group(1))
                 break
 
         return subprocess.CompletedProcess(
@@ -567,14 +584,14 @@ def _paramiko_proxy_upload(pod_id: str, pod_host_id: str, key: str,
         _log_runpod(f"  DO Spaces: uploading {Path(local).name} ({file_size / 1e6:.1f} MB)…")
         s3.upload_file(local, bucket, s3_key)
         url = s3.generate_presigned_url(
-            "get_object", Params={"Bucket": bucket, "Key": s3_key}, ExpiresIn=3600,
+            "get_object", Params={"Bucket": bucket, "Key": s3_key}, ExpiresIn=7200,
         )
         _log_runpod(f"  DO Spaces: upload done, pod downloading…")
         # Retry download up to 3 times with size verification to avoid truncated downloads
         for attempt in range(1, 4):
             r = _paramiko_proxy_exec(
                 pod_id, pod_host_id, key,
-                f'curl -sS -L --retry 3 --retry-delay 5 -o "{remote}" "{url}"',
+                f"curl -sS -L --retry 3 --retry-delay 5 -o '{remote}' '{url}'",
                 timeout=max(timeout, 600),
             )
             if r.returncode != 0:
@@ -588,16 +605,14 @@ def _paramiko_proxy_upload(pod_id: str, pod_host_id: str, key: str,
             # Verify downloaded size matches source
             sz_check = _paramiko_proxy_exec(
                 pod_id, pod_host_id, key,
-                f'stat -c %s "{remote}" 2>/dev/null || echo 0',
-                timeout=15,
+                f"stat -c %s '{remote}' 2>/dev/null || echo 0",
+                timeout=30,
             )
             remote_size = 0
-            for token in (sz_check.stdout or "").split():
-                try:
-                    remote_size = int(token)
-                    break
-                except ValueError:
-                    continue
+            clean_output = _strip_ansi(sz_check.stdout or "")
+            for num in re.findall(r'\b(\d{4,})\b', clean_output):
+                remote_size = int(num)
+                break
             if remote_size >= file_size * 0.99:  # allow tiny rounding difference
                 break
             _log_runpod(f"  DO Spaces: wget attempt {attempt}/3 truncated ({remote_size}/{file_size} bytes), retrying…")
@@ -640,7 +655,7 @@ def _paramiko_proxy_download(pod_id: str, pod_host_id: str, key: str,
         _log_runpod(f"  DO Spaces: pod uploading {Path(remote).name}…")
         r = _paramiko_proxy_exec(
             pod_id, pod_host_id, key,
-            f'curl -s -X PUT -T "{remote}" "{put_url}"',
+            f"curl -s -X PUT -T '{remote}' '{put_url}'",
             timeout=timeout,
         )
         if r.returncode != 0:
