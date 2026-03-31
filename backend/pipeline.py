@@ -495,16 +495,28 @@ def _looks_like_url(value) -> bool:
 
 
 def get_url_columns(df: pd.DataFrame) -> list[str]:
-    """Auto-detect columns that contain image URLs by scanning the first rows."""
+    """Auto-detect columns that contain image URLs by scanning rows.
+
+    Uses column name matching first (photo/link/image/url), then falls back
+    to scanning for columns with at least 1 URL in the first 50 rows.
+    Also checks the first data row for 'Photo' or 'Link' descriptor text.
+    """
     matches = []
-    sample = df.head(min(20, len(df)))
+    sample = df.head(min(50, len(df)))
     for col in list(df.columns):
         col_str = str(col).strip()
+        # Check column name
         if "photo" in col_str.lower() or "link" in col_str.lower() or "image" in col_str.lower() or "url" in col_str.lower():
             matches.append(col)
             continue
+        # Check first row for descriptor text like "Photo Link"
+        first_val = str(df[col].iloc[0]) if len(df) > 0 else ""
+        if "photo" in first_val.lower() or "link" in first_val.lower() or "image" in first_val.lower():
+            matches.append(col)
+            continue
+        # Check if any rows contain URLs (low threshold to catch sparse columns)
         url_count = sample[col].apply(_looks_like_url).sum()
-        if url_count >= max(1, len(sample) * 0.3):
+        if url_count >= 1:
             matches.append(col)
     return matches
 
@@ -973,8 +985,10 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
             result_row = {"Respondent.Serial": row[id_col], "Q6": ""}
             result_row.update(q12_row)
 
-            # Preserve photo URL columns
-            for col in url_columns:
+            # Preserve all photo URL columns from original CSV (not just detected ones)
+            photo_cols = [c for c in df.columns if c in url_columns or
+                          any(k in str(c).lower() for k in ("q30", "q33", "photo", "link", "image"))]
+            for col in photo_cols:
                 col_name = str(col)
                 result_row[col_name] = row[col] if not pd.isna(row[col]) else ""
 
