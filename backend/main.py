@@ -591,7 +591,13 @@ def _paramiko_proxy_upload(pod_id: str, pod_host_id: str, key: str,
                 f'stat -c %s "{remote}" 2>/dev/null || echo 0',
                 timeout=15,
             )
-            remote_size = int((sz_check.stdout or "0").strip().split("\n")[-1] or "0")
+            remote_size = 0
+            for token in (sz_check.stdout or "").split():
+                try:
+                    remote_size = int(token)
+                    break
+                except ValueError:
+                    continue
             if remote_size >= file_size * 0.99:  # allow tiny rounding difference
                 break
             _log_runpod(f"  DO Spaces: wget attempt {attempt}/3 truncated ({remote_size}/{file_size} bytes), retrying…")
