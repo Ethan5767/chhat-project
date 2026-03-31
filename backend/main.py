@@ -1712,7 +1712,8 @@ def _tar_dataset_for_runpod(tar_path: Path) -> subprocess.CompletedProcess:
         else:
             shutil.copytree(src, staging, dirs_exist_ok=True)
         r = subprocess.run(
-            ["tar", "czf", str(tar_path), "-C", str(staging.parent), "cigarette_packs"],
+            ["tar", "czf", str(tar_path), "--owner=0", "--group=0",
+             "-C", str(staging.parent), "cigarette_packs"],
             capture_output=True, text=True,
         )
         return r
@@ -1914,7 +1915,7 @@ def run_rfdetr_training_runpod_job(
         un = _ssh_cmd(
             ssh_host, ssh_port, ssh_key,
             "cd /workspace/chhat-project && rm -rf datasets/cigarette_packs && mkdir -p datasets && "
-            "tar xzf dataset_upload.tar.gz -C datasets && rm -f dataset_upload.tar.gz",
+            "tar xzf dataset_upload.tar.gz --no-same-owner -C datasets && rm -f dataset_upload.tar.gz",
             timeout=180, pod_id=pod_id, pod_host_id=pod_host_id,
         )
         if un.returncode != 0:
