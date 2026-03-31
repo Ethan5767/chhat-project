@@ -849,8 +849,9 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
         _log_runpod(f"gpu-batch: uploading CSV ({csv_path.name})")
 
         # 5. Upload CSV
+        remote_csv_path = f"/workspace/chhat-project/backend/uploads/{csv_path.name}"
         r = _scp_to(ssh_host, ssh_port, ssh_key, str(csv_path),
-                     "/workspace/chhat-project/backend/uploads/", timeout=120, pod_id=pod_id, pod_host_id=pod_host_id)
+                     remote_csv_path, timeout=120, pod_id=pod_id, pod_host_id=pod_host_id)
         if r.returncode != 0:
             raise RuntimeError(f"CSV upload failed: {r.stderr[:200]}")
 
