@@ -1697,7 +1697,7 @@ def run_classifier_training_runpod_job(
 
 def _tar_dataset_for_runpod(tar_path: Path) -> subprocess.CompletedProcess:
     """Tar datasets/cigarette_packs for upload to a RunPod pod."""
-    src = _PROJECT_ROOT / "datasets" / "cigarette_packs"
+    src = _BACKEND_ROOT.parent / "datasets" / "cigarette_packs"
     if not src.is_dir():
         return subprocess.CompletedProcess(
             args=("_tar_dataset_for_runpod",), returncode=1, stdout="",
