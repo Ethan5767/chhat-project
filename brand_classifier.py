@@ -12,6 +12,7 @@ Usage:
 """
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -25,9 +26,11 @@ from torch.utils.data import DataLoader, TensorDataset
 from transformers import AutoImageProcessor, AutoModel
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-REFERENCES_BASE_DIR = PROJECT_ROOT / "backend" / "references"
-OUTPUT_BASE_DIR = PROJECT_ROOT / "backend" / "classifier_model"
+_DATA_ROOT = Path(os.environ.get("CHHAT_DATA_ROOT", str(PROJECT_ROOT / "backend")))
+REFERENCES_BASE_DIR = _DATA_ROOT / "references"
+OUTPUT_BASE_DIR = _DATA_ROOT / "classifier_model"
 DINO_MODEL_ID = "facebook/dinov2-base"
+DINO_FINETUNED_FULL_PATH = _DATA_ROOT / "classifier_model" / "dinov2_finetuned_full.pth"
 EMBED_DIM = 1536  # CLS (768) + mean-pooled patches (768)
 PACKAGING_TYPES = ("pack", "box")
 
@@ -162,11 +165,25 @@ def train_classifier(args):
     # 2. Pre-compute DINOv2 embeddings
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu":
-        print("ERROR: CUDA not available. Training on CPU is not supported (too slow). Exiting.")
-        sys.exit(1)
+        print("WARNING: CUDA not available. Training on CPU (slower but functional).")
     print(f"Computing DINOv2 embeddings on {device}...")
     processor = AutoImageProcessor.from_pretrained(DINO_MODEL_ID)
     dino_model = AutoModel.from_pretrained(DINO_MODEL_ID)
+    # Load finetuned backbone if available (must match inference in pipeline.py)
+    if DINO_FINETUNED_FULL_PATH.is_file():
+        try:
+            state = torch.load(DINO_FINETUNED_FULL_PATH, map_location="cpu", weights_only=True)
+            prefix = "dino."
+            dino_state = {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
+            if dino_state:
+                dino_model.load_state_dict(dino_state, strict=False)
+                print(f"Loaded finetuned DINOv2 backbone from {DINO_FINETUNED_FULL_PATH}")
+            else:
+                print(f"WARNING: Finetuned checkpoint has no 'dino.*' keys, using base weights")
+        except Exception as exc:
+            print(f"WARNING: Could not load finetuned DINOv2: {exc}, using base weights")
+    else:
+        print(f"No finetuned DINOv2 at {DINO_FINETUNED_FULL_PATH}, using base weights")
     dino_model.eval()
 
     embeddings, valid_paths = compute_embeddings(image_paths, processor, dino_model, device, batch_size=args.embed_batch_size)

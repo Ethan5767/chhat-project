@@ -1,3 +1,4 @@
+import gc
 import json
 import io
 import logging
@@ -291,19 +292,26 @@ def embed_image(pil_img: Image.Image, processor, model, device: str) -> np.ndarr
     return vec
 
 
+EMBED_BATCH_SIZE = 8  # limit peak tensor memory on low-RAM servers
+
 def embed_images_batch(pil_imgs: list[Image.Image], processor, model, device: str) -> np.ndarray:
-    """Embed multiple images in a single forward pass. Returns (N, dim) L2-normalised."""
+    """Embed images in chunks to limit peak memory. Returns (N, dim) L2-normalised."""
     if not pil_imgs:
         return np.empty((0, EMBED_DIM), dtype=np.float32)
     imgs = [_pad_to_square(img.convert("RGB")) for img in pil_imgs]
-    with torch.no_grad():
-        inputs = processor(images=imgs, return_tensors="pt")
-        inputs = {k: v.to(device) for k, v in inputs.items()}
-        outputs = model(**inputs)
-        cls_tokens = outputs.last_hidden_state[:, 0, :]       # (N, 768)
-        patch_means = outputs.last_hidden_state[:, 1:, :].mean(dim=1)  # (N, 768)
-        combined = torch.cat([cls_tokens, patch_means], dim=1)  # (N, 1536)
-        vecs = combined.detach().cpu().numpy().astype(np.float32)
+    all_vecs = []
+    for i in range(0, len(imgs), EMBED_BATCH_SIZE):
+        chunk = imgs[i:i + EMBED_BATCH_SIZE]
+        with torch.no_grad():
+            inputs = processor(images=chunk, return_tensors="pt")
+            inputs = {k: v.to(device) for k, v in inputs.items()}
+            outputs = model(**inputs)
+            cls_tokens = outputs.last_hidden_state[:, 0, :]       # (B, 768)
+            patch_means = outputs.last_hidden_state[:, 1:, :].mean(dim=1)  # (B, 768)
+            combined = torch.cat([cls_tokens, patch_means], dim=1)  # (B, 1536)
+            all_vecs.append(combined.detach().cpu().numpy().astype(np.float32))
+            del inputs, outputs, cls_tokens, patch_means, combined
+    vecs = np.concatenate(all_vecs, axis=0)
     norms = np.linalg.norm(vecs, axis=1, keepdims=True)
     norms = np.where(norms == 0, 1.0, norms)
     vecs = vecs / norms
@@ -708,7 +716,7 @@ def _detect_brands_from_image(
         effective_type = pkg_type if pkg_type in type_labels else "pack"
         type_crop_indices.setdefault(effective_type, []).append(idx)
 
-    # Embed all crops at once (DINOv2 is shared)
+    # Embed crops in chunks (DINOv2 is shared)
     all_vecs = embed_images_batch(crops, processor, model, device)
 
     # Classify per type
@@ -952,6 +960,10 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
             result_row = {"Respondent.Serial": row[id_col], "Q6": ""}
 
         completed_rows.append(result_row)
+
+        # Free image/tensor memory from this row
+        images = None
+        gc.collect()
 
         if (row_idx + 1) % SAVE_INTERVAL == 0 or row_idx + 1 == process_len:
             _flush(completed_rows)

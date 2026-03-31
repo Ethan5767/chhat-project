@@ -12,6 +12,7 @@ Usage:
 """
 import argparse
 import json
+import os
 import re
 import sys
 from pathlib import Path
@@ -26,8 +27,9 @@ from torchvision import transforms
 from transformers import AutoImageProcessor, AutoModel
 
 PROJECT_ROOT = Path(__file__).resolve().parent
-REFERENCES_DIR = PROJECT_ROOT / "backend" / "references"
-OUTPUT_DIR = PROJECT_ROOT / "backend" / "classifier_model"
+_DATA_ROOT = Path(os.environ.get("CHHAT_DATA_ROOT", str(PROJECT_ROOT / "backend")))
+REFERENCES_DIR = _DATA_ROOT / "references"
+OUTPUT_DIR = _DATA_ROOT / "classifier_model"
 DINO_MODEL_ID = "facebook/dinov2-base"
 EMBED_DIM = 1536
 

@@ -1364,11 +1364,6 @@ with tab_label:
                                 _fetch_reference_listing.clear()
                                 _fetch_brand_hierarchy.clear()
                                 _fetch_reference_image_bytes.clear()
-                                # Rebuild classifier index so next detection uses updated refs
-                                try:
-                                    requests.post(f"{BACKEND_URL}/build-index", timeout=5)
-                                except Exception:
-                                    pass  # non-blocking; index rebuilds in background
                             except Exception as exc:
                                 st.error(f"Failed: {exc}")
 

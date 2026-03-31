@@ -6,10 +6,13 @@ Single source of truth for:
   - Mapping between internal names and display names
   - What exists vs what's missing in reference images
 """
+import os
 from pathlib import Path
 from collections import Counter
 
-REFERENCES_DIR = Path(__file__).resolve().parent / "references"
+_BACKEND_ROOT = Path(__file__).resolve().parent
+_DATA_ROOT = Path(os.environ.get("CHHAT_DATA_ROOT", str(_BACKEND_ROOT)))
+REFERENCES_DIR = _DATA_ROOT / "references"
 PACKAGING_TYPES = ("pack", "box")
 
 # ─── Complete brand/product registry ───
