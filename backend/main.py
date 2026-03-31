@@ -855,6 +855,42 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
         if r.returncode != 0:
             raise RuntimeError(f"CSV upload failed: {r.stderr[:200]}")
 
+        # 5b. Upload model weights needed for inference
+        _log_runpod("gpu-batch: uploading model weights to pod…")
+        model_uploads = [
+            # (local_path, remote_dir, filename)
+            (_DATA_ROOT / "classifier_model" / "pack" / "best_classifier.pth",
+             "/workspace/chhat-project/backend/classifier_model/pack/best_classifier.pth"),
+            (_DATA_ROOT / "classifier_model" / "pack" / "class_mapping.json",
+             "/workspace/chhat-project/backend/classifier_model/pack/class_mapping.json"),
+            (_DATA_ROOT / "classifier_model" / "dinov2_finetuned_full.pth",
+             "/workspace/chhat-project/backend/classifier_model/dinov2_finetuned_full.pth"),
+        ]
+        # RF-DETR checkpoint
+        rfdetr_ckpt = _DATA_ROOT / "runs" / "checkpoint_best_ema.pth"
+        if not rfdetr_ckpt.exists():
+            rfdetr_ckpt = _BACKEND_ROOT.parent / "runs" / "checkpoint_best_ema.pth"
+        if rfdetr_ckpt.exists():
+            model_uploads.append((rfdetr_ckpt, "/workspace/chhat-project/runs/checkpoint_best_ema.pth"))
+
+        # Create remote dirs
+        _ssh_cmd(ssh_host, ssh_port, ssh_key,
+                 "mkdir -p /workspace/chhat-project/backend/classifier_model/pack "
+                 "/workspace/chhat-project/runs",
+                 timeout=15, pod_id=pod_id, pod_host_id=pod_host_id)
+
+        for local_p, remote_p in model_uploads:
+            if Path(local_p).exists():
+                _log_runpod(f"gpu-batch: uploading {Path(local_p).name}…")
+                up = _scp_to(ssh_host, ssh_port, ssh_key, str(local_p), remote_p,
+                             timeout=600, pod_id=pod_id, pod_host_id=pod_host_id)
+                if up.returncode != 0:
+                    _log_runpod(f"gpu-batch: WARNING upload {Path(local_p).name} failed")
+                else:
+                    _log_runpod(f"gpu-batch: uploaded {Path(local_p).name}")
+            else:
+                _log_runpod(f"gpu-batch: WARNING {local_p} not found, skipping")
+
         # 6. Kill zombie GPU processes and verify CUDA before pipeline
         _log_runpod("gpu-batch: clearing zombie GPU processes and verifying CUDA…")
         _ssh_cmd(

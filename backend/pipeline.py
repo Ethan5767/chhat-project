@@ -45,7 +45,7 @@ _RFDETR_CHECKPOINT_DIR = _DATA_ROOT / "runs" if (_DATA_ROOT / "runs").exists() e
 
 DOWNLOAD_TIMEOUT = 15
 RFDETR_CONF_THRESHOLD = 0.15  # low threshold to catch packs in small shelf images
-OCR_ENABLED = True
+OCR_ENABLED = False
 OCR_MIN_TOKEN_LEN = 3
 MIN_OUTPUT_CONFIDENCE = 0.75
 CLASSIFIER_TOP_K = 5
