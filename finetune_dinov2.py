@@ -61,7 +61,11 @@ class ReferenceDataset(Dataset):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
-        img = Image.open(self.image_paths[idx]).convert("RGB")
+        try:
+            img = Image.open(self.image_paths[idx]).convert("RGB")
+        except Exception:
+            # Return a gray placeholder for corrupt images; training continues
+            img = Image.new("RGB", (224, 224), (128, 128, 128))
 
         # Pad to square
         w, h = img.size
@@ -238,8 +242,14 @@ def train(args):
     train_dataset = ReferenceDataset(train_paths, train_labels, processor, augment=True)
     val_dataset = ReferenceDataset(val_paths, val_labels, processor, augment=False)
 
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=0)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False, num_workers=0)
+    num_workers = 4 if device == "cuda" else 0
+    use_pin = device == "cuda"
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                              num_workers=num_workers, pin_memory=use_pin,
+                              persistent_workers=(num_workers > 0))
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
+                            num_workers=num_workers, pin_memory=use_pin,
+                            persistent_workers=(num_workers > 0))
 
     # 5. Optimizer - lower LR for backbone, higher for head
     backbone_params = [p for n, p in model.named_parameters() if p.requires_grad and "head" not in n]
@@ -267,7 +277,7 @@ def train(args):
 
         for batch_idx, (pixel_values, targets) in enumerate(train_loader):
             pixel_values = pixel_values.to(device)
-            targets = torch.tensor(targets, dtype=torch.long).to(device)
+            targets = targets.long().to(device)
 
             optimizer.zero_grad()
             logits = model(pixel_values)
@@ -288,7 +298,7 @@ def train(args):
         with torch.no_grad():
             for pixel_values, targets in val_loader:
                 pixel_values = pixel_values.to(device)
-                targets = torch.tensor(targets, dtype=torch.long).to(device)
+                targets = targets.long().to(device)
                 logits = model(pixel_values)
                 val_correct += (logits.argmax(dim=1) == targets).sum().item()
                 val_total += len(targets)
