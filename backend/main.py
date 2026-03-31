@@ -1867,17 +1867,22 @@ def run_rfdetr_training_runpod_job(
 
         # 4. Bootstrap
         r = _ssh_cmd(ssh_host, ssh_port, ssh_key,
-                     f"test -d /workspace/chhat-project/.venv",
-                     timeout=10, pod_id=pod_id, pod_host_id=pod_host_id)
-        if r.returncode != 0:
+                     "ls /workspace/chhat-project/.venv/bin/python 2>/dev/null && echo VENV_OK",
+                     timeout=15, pod_id=pod_id, pod_host_id=pod_host_id)
+        if "VENV_OK" not in _strip_ansi(r.stdout or ""):
             _log_runpod("rfdetr-gpu: repo missing on pod — clone + bootstrap (long)")
-            _ssh_cmd(ssh_host, ssh_port, ssh_key,
-                     f"cd /workspace && git clone --depth 1 {RUNPOD_REPO} chhat-project "
+            bs = _ssh_cmd(ssh_host, ssh_port, ssh_key,
+                     f"cd /workspace && rm -rf chhat-project && git clone --depth 1 {RUNPOD_REPO} chhat-project "
                      f"&& cd chhat-project && bash runpod/bootstrap_training_pod.sh",
                      timeout=1200, pod_id=pod_id, pod_host_id=pod_host_id)
+            if bs.returncode != 0:
+                raise RuntimeError(f"Bootstrap failed rc={bs.returncode}: {(bs.stdout or bs.stderr or '')[-500:]}")
             _log_runpod("rfdetr-gpu: bootstrap complete")
         else:
-            _log_runpod("rfdetr-gpu: repo present on pod")
+            _log_runpod("rfdetr-gpu: repo present on pod — git pull")
+            _ssh_cmd(ssh_host, ssh_port, ssh_key,
+                     "cd /workspace/chhat-project && git pull",
+                     timeout=60, pod_id=pod_id, pod_host_id=pod_host_id)
 
         # 5. Upload dataset
         _log_runpod("rfdetr-gpu: upload dataset archive to pod…")
