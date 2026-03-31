@@ -1190,9 +1190,11 @@ def run_dinov2_finetune_gpu_job(
                         f"cat {progress_remote} 2>/dev/null || true",
                         timeout=25, pod_id=pod_id, pod_host_id=pod_host_id,
                     )
-                    txt = (pr.stdout or "").strip()
-                    if txt.startswith("{"):
-                        data = json.loads(txt)
+                    raw = _strip_ansi(pr.stdout or "")
+                    # Extract JSON object from shell output (may contain markers/prompts)
+                    json_match = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
+                    if json_match:
+                        data = json.loads(json_match.group())
                         with _training_lock:
                             _training_jobs[job_id]["progress"] = data
                             _training_jobs[job_id]["last_update"] = _now_iso()
@@ -1558,9 +1560,10 @@ def run_classifier_training_runpod_job(
                         f"cat {progress_remote} 2>/dev/null || true",
                         timeout=25, pod_id=pod_id, pod_host_id=pod_host_id,
                     )
-                    txt = (pr.stdout or "").strip()
-                    if txt.startswith("{"):
-                        data = json.loads(txt)
+                    raw = _strip_ansi(pr.stdout or "")
+                    json_match = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
+                    if json_match:
+                        data = json.loads(json_match.group())
                         with _training_lock:
                             _training_jobs[job_id]["progress"] = data
                             _training_jobs[job_id]["last_update"] = _now_iso()
