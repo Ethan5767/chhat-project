@@ -2612,8 +2612,11 @@ def _hash_dataset_dir(path: Path) -> str:
     return h.hexdigest()
 
 
-def _dataset_hash_for_type(model_type: str) -> str:
-    if model_type in ("classifier", "dinov2_finetune"):
+def _dataset_hash_for_type(model_type: str, packaging_type: str = "") -> str:
+    if model_type == "classifier":
+        pkg = (packaging_type or "pack").strip()
+        return _hash_dataset_dir(_DATA_ROOT / "references" / pkg)
+    if model_type == "dinov2_finetune":
         return _hash_dataset_dir(_DATA_ROOT / "references")
     if model_type == "rfdetr":
         return _hash_dataset_dir(_BACKEND_ROOT.parent / "datasets" / "cigarette_packs")
@@ -2913,9 +2916,10 @@ def train_classifier_endpoint(
         "batch_size": batch_size,
         "embed_batch_size": embed_batch_size,
         "lr": lr,
+        "packaging_type": packaging_type,
         "use_runpod": use_runpod,
     }
-    dataset_hash = _dataset_hash_for_type("classifier")
+    dataset_hash = _dataset_hash_for_type("classifier", packaging_type=packaging_type)
     hp_sig = _hparam_signature("classifier", version, params)
     if not force:
         dup = _find_duplicate_completed_run("classifier", version, dataset_hash, hp_sig)

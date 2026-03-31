@@ -32,6 +32,7 @@ REFERENCES_DIR = _DATA_ROOT / "references"
 OUTPUT_DIR = _DATA_ROOT / "classifier_model"
 DINO_MODEL_ID = "facebook/dinov2-base"
 EMBED_DIM = 1536
+FINETUNED_FULL_PATH = OUTPUT_DIR / "dinov2_finetuned_full.pth"
 
 
 def label_from_filename(filename: str) -> str:
@@ -100,6 +101,8 @@ class DINOv2Classifier(nn.Module):
         cls_token = outputs.last_hidden_state[:, 0, :]
         patch_mean = outputs.last_hidden_state[:, 1:, :].mean(dim=1)
         combined = torch.cat([cls_token, patch_mean], dim=1)
+        # L2-normalize to match brand_classifier.py and pipeline.py inference
+        combined = nn.functional.normalize(combined, p=2, dim=1)
         return self.head(combined)
 
     def freeze_backbone(self):
@@ -128,6 +131,41 @@ def write_progress(progress_file: Path, data: dict):
     if progress_file:
         progress_file.parent.mkdir(parents=True, exist_ok=True)
         progress_file.write_text(json.dumps(data, indent=2))
+
+
+def load_existing_finetuned_weights(model: nn.Module) -> bool:
+    """Resume from the last fine-tuned checkpoint when shapes still match."""
+    if not FINETUNED_FULL_PATH.is_file():
+        print(f"No previous finetuned DINOv2 at {FINETUNED_FULL_PATH}, starting from base weights")
+        return False
+
+    try:
+        state = torch.load(FINETUNED_FULL_PATH, map_location="cpu", weights_only=True)
+    except TypeError:
+        state = torch.load(FINETUNED_FULL_PATH, map_location="cpu")
+    except Exception as exc:
+        print(f"WARNING: Could not load previous finetuned DINOv2 from {FINETUNED_FULL_PATH}: {exc}")
+        return False
+
+    current_state = model.state_dict()
+    filtered_state = {}
+    skipped = 0
+    for key, value in state.items():
+        if key in current_state and current_state[key].shape == value.shape:
+            filtered_state[key] = value
+        else:
+            skipped += 1
+
+    if not filtered_state:
+        print(f"WARNING: Previous checkpoint {FINETUNED_FULL_PATH} had no compatible weights, using base weights")
+        return False
+
+    missing, unexpected = model.load_state_dict(filtered_state, strict=False)
+    print(
+        f"Loaded previous finetuned weights from {FINETUNED_FULL_PATH} "
+        f"(loaded={len(filtered_state)}, skipped={skipped}, missing={len(missing)}, unexpected={len(unexpected)})"
+    )
+    return True
 
 
 def train(args):
@@ -189,6 +227,7 @@ def train(args):
     dino_model = AutoModel.from_pretrained(DINO_MODEL_ID)
 
     model = DINOv2Classifier(dino_model, num_classes, hidden_dim=512).to(device)
+    load_existing_finetuned_weights(model)
     model.unfreeze_last_n_layers(args.unfreeze_layers)
 
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -215,7 +254,7 @@ def train(args):
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     # 6. Train
-    best_val_acc = 0.0
+    best_val_acc = -1.0
     patience_counter = 0
 
     print(f"\nTraining for {args.epochs} epochs (unfreezing last {args.unfreeze_layers} layers)...")
@@ -264,7 +303,7 @@ def train(args):
             "train_acc": round(train_acc, 4),
             "val_acc": round(val_acc, 4),
             "train_loss": round(avg_loss, 4),
-            "best_val_acc": round(best_val_acc, 4),
+            "best_val_acc": round(max(best_val_acc, 0.0), 4),
             "status": "training",
         }
         write_progress(progress_file, progress)
@@ -303,18 +342,19 @@ def train(args):
     with open(OUTPUT_DIR / "class_mapping.json", "w", encoding="utf-8") as f:
         json.dump(class_mapping, f, ensure_ascii=False, indent=2)
 
+    final_best_val_acc = max(best_val_acc, 0.0)
     final_progress = {
         "epoch": epoch,
         "total_epochs": args.epochs,
         "train_acc": round(train_acc, 4),
         "val_acc": round(val_acc, 4),
-        "best_val_acc": round(best_val_acc, 4),
+        "best_val_acc": round(final_best_val_acc, 4),
         "status": "complete",
     }
     write_progress(progress_file, final_progress)
 
     print(f"\nTraining complete!")
-    print(f"  Best val accuracy: {best_val_acc:.3f}")
+    print(f"  Best val accuracy: {final_best_val_acc:.3f}")
     print(f"  Head saved to: {OUTPUT_DIR / 'dinov2_finetuned_head.pth'}")
     print(f"  Full model saved to: {OUTPUT_DIR / 'dinov2_finetuned_full.pth'}")
 

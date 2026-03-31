@@ -105,6 +105,8 @@ def compute_embeddings(image_paths: list[Path], processor, model, device: str, b
         print(f"  Embedded {len(valid_paths)}/{len(image_paths)} images", end="\r")
 
     print()
+    if not all_vecs:
+        raise RuntimeError("No valid reference images could be embedded. Check for corrupt or unsupported files.")
     return np.vstack(all_vecs), valid_paths
 
 
@@ -241,7 +243,7 @@ def train_classifier(args):
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.epochs)
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
-    best_val_acc = 0.0
+    best_val_acc = -1.0
     patience_counter = 0
 
     print(f"\nTraining classifier for {args.epochs} epochs...")
@@ -284,7 +286,7 @@ def train_classifier(args):
             Path(args.progress_file).write_text(json.dumps({
                 "epoch": epoch, "total_epochs": args.epochs,
                 "train_acc": round(train_acc, 4), "val_acc": round(val_acc, 4),
-                "train_loss": round(avg_loss, 4), "best_val_acc": round(best_val_acc, 4),
+                "train_loss": round(avg_loss, 4), "best_val_acc": round(max(best_val_acc, 0.0), 4),
                 "status": "training",
             }, indent=2))
 
@@ -319,13 +321,15 @@ def train_classifier(args):
     with open(OUTPUT_DIR / "class_mapping.json", "w", encoding="utf-8") as f:
         json.dump(class_mapping, f, ensure_ascii=False, indent=2)
 
+    final_best_val_acc = max(best_val_acc, 0.0)
+
     print(f"\nTraining complete ({pkg_type} classifier)!")
-    print(f"  Best val accuracy: {best_val_acc:.3f}")
+    print(f"  Best val accuracy: {final_best_val_acc:.3f}")
     print(f"  Model saved to: {OUTPUT_DIR}")
     print(f"  Classes: {num_classes}")
     print(f"  Best model: {OUTPUT_DIR / 'best_classifier.pth'}")
 
-    return best_val_acc
+    return final_best_val_acc
 
 
 def main():

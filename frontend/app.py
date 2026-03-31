@@ -1473,6 +1473,12 @@ with tab_train:
         cls_lr = st.number_input("Learning rate", value=0.001, format="%.4f", key="cls_lr")
         cls_batch = st.number_input("Batch size", value=64, min_value=8, max_value=256, key="cls_batch")
         cls_embed_batch = st.number_input("Embed batch size", value=8, min_value=1, max_value=64, key="cls_embed_batch")
+        cls_packaging_type = st.selectbox(
+            "Packaging type",
+            options=["pack", "box"],
+            index=0,
+            key="cls_packaging_type",
+        )
         cls_use_runpod = st.checkbox(
             "Run on RunPod GPU (faster; needs RUNPOD_API_KEY + SSH key on API server)",
             value=False,
@@ -1489,6 +1495,7 @@ with tab_train:
                         "lr": cls_lr,
                         "batch_size": cls_batch,
                         "embed_batch_size": cls_embed_batch,
+                        "packaging_type": cls_packaging_type,
                         "version": training_version,
                         "use_runpod": rp,
                     },
