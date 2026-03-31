@@ -210,7 +210,8 @@ def load_rfdetr():
         logger.info("No fine-tuned checkpoint found, using pre-trained RF-DETR-M")
         _rfdetr_model = RFDETRMedium()
     # Skip optimize_for_inference on RunPod -- torch.compile can segfault on some CUDA setups
-    if not os.environ.get("RUNPOD_POD_ID"):
+    _is_runpod = os.environ.get("RUNPOD_POD_ID") or os.path.exists("/workspace")
+    if not _is_runpod:
         try:
             _rfdetr_model.optimize_for_inference()
             logger.info("RF-DETR optimized for inference")
@@ -920,7 +921,7 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
 
     device = get_device()
     # On RunPod pods, require GPU -- abort early if only CPU available
-    if os.environ.get("RUNPOD_POD_ID") or os.environ.get("CUDA_VISIBLE_DEVICES"):
+    if os.environ.get("RUNPOD_POD_ID") or os.environ.get("CUDA_VISIBLE_DEVICES") or os.path.exists("/workspace"):
         if device == "cpu":
             raise RuntimeError("GPU required but not available. Aborting to avoid slow CPU processing.")
     logger.info("Pipeline device: %s", device)
