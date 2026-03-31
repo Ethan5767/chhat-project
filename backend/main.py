@@ -481,7 +481,7 @@ def _paramiko_proxy_exec(pod_id: str, pod_host_id: str, key: str, command: str,
             stderr=f"paramiko connect failed: {exc}",
         )
     try:
-        channel = client.invoke_shell(term="xterm", width=200, height=50)
+        channel = client.invoke_shell(term="xterm", width=4096, height=50)
         channel.settimeout(5.0)
 
         # Wait for shell prompt / banner to flush
