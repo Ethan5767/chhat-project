@@ -1457,6 +1457,25 @@ def run_classifier_training_runpod_job(
             raise RuntimeError(f"Unpack references on pod failed: {(un.stdout or un.stderr or '')[-600:]}")
         _log_runpod("classifier-gpu: references uploaded + extracted OK")
 
+        # Upload finetuned DINOv2 weights so classifier trains on matching embeddings
+        dino_ft_path = _DATA_ROOT / "classifier_model" / "dinov2_finetuned_full.pth"
+        if dino_ft_path.is_file():
+            _log_runpod("classifier-gpu: uploading finetuned DINOv2 backbone to pod…")
+            remote_cls_dir = "/workspace/chhat-project/backend/classifier_model"
+            _ssh_cmd(ssh_host, ssh_port, ssh_key, f"mkdir -p {remote_cls_dir}",
+                     timeout=15, pod_id=pod_id, pod_host_id=pod_host_id)
+            up_dino = _scp_to(
+                ssh_host, ssh_port, ssh_key, str(dino_ft_path),
+                f"{remote_cls_dir}/dinov2_finetuned_full.pth",
+                timeout=600, pod_id=pod_id, pod_host_id=pod_host_id,
+            )
+            if up_dino.returncode != 0:
+                _log_runpod(f"classifier-gpu: WARNING failed to upload finetuned DINOv2: {(up_dino.stderr or '')[:300]}")
+            else:
+                _log_runpod("classifier-gpu: finetuned DINOv2 uploaded OK")
+        else:
+            _log_runpod("classifier-gpu: no finetuned DINOv2 found, training with base weights")
+
         # Kill zombie GPU processes and verify CUDA before training
         _log_runpod("classifier-gpu: clearing zombie GPU processes and verifying CUDA…")
         _ssh_cmd(
