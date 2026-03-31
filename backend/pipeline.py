@@ -910,7 +910,7 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
             completed_rows = []
 
     def _flush(rows):
-        pd.DataFrame(rows).to_csv(out_path, index=False)
+        pd.DataFrame(rows).to_csv(out_path, index=False, encoding="utf-8-sig")
 
     for row_idx in range(start_row, process_len):
         row = df.iloc[row_idx]

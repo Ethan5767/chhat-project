@@ -1251,21 +1251,27 @@ with tab_label:
         key="label_upload",
     )
 
-    if label_image is not None and st.button("Detect and Crop Packs", key="btn_generate_crops"):
-        with st.spinner("Running RF-DETR detection..."):
-            try:
-                resp = requests.post(
-                    f"{BACKEND_URL}/generate-crops",
-                    files={"image_file": (label_image.name, label_image.getvalue(), "image/jpeg")},
-                    timeout=60,
-                )
-                resp.raise_for_status()
-                crop_data = resp.json()
-                st.session_state["label_crops"] = crop_data.get("crops", [])
-                st.session_state["label_results"] = {}
-                st.success(f"Detected {crop_data['num_crops']} packs")
-            except Exception as exc:
-                st.error(f"Detection failed: {exc}")
+    if label_image is not None:
+        # Auto-detect on upload: run detection if this is a new file
+        _upload_id = f"{label_image.name}_{label_image.size}"
+        if st.session_state.get("_label_last_upload") != _upload_id:
+            st.session_state["_label_last_upload"] = _upload_id
+            with st.spinner("Running RF-DETR detection..."):
+                try:
+                    resp = requests.post(
+                        f"{BACKEND_URL}/generate-crops",
+                        files={"image_file": (label_image.name, label_image.getvalue(), "image/jpeg")},
+                        timeout=60,
+                    )
+                    resp.raise_for_status()
+                    crop_data = resp.json()
+                    st.session_state["label_crops"] = crop_data.get("crops", [])
+                    st.session_state["label_results"] = {}
+                    # Bump generation counter so widget keys reset for new image
+                    st.session_state["label_gen"] = st.session_state.get("label_gen", 0) + 1
+                    st.success(f"Detected {crop_data['num_crops']} packs")
+                except Exception as exc:
+                    st.error(f"Detection failed: {exc}")
 
     # Step 2: Review and label each crop
     crops = st.session_state.get("label_crops", [])
@@ -1292,7 +1298,8 @@ with tab_label:
                     st.caption("Detected as: **box**")
 
             with col_form:
-                crop_key = f"crop_{crop['index']}"
+                gen = st.session_state.get("label_gen", 0)
+                crop_key = f"crop_{gen}_{crop['index']}"
                 products_for_brand = []
                 product_internals = {}
                 selected_product = ""
@@ -1357,6 +1364,11 @@ with tab_label:
                                 _fetch_reference_listing.clear()
                                 _fetch_brand_hierarchy.clear()
                                 _fetch_reference_image_bytes.clear()
+                                # Rebuild classifier index so next detection uses updated refs
+                                try:
+                                    requests.post(f"{BACKEND_URL}/build-index", timeout=5)
+                                except Exception:
+                                    pass  # non-blocking; index rebuilds in background
                             except Exception as exc:
                                 st.error(f"Failed: {exc}")
 
