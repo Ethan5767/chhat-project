@@ -569,13 +569,13 @@ def _paramiko_proxy_upload(pod_id: str, pod_host_id: str, key: str,
         url = s3.generate_presigned_url(
             "get_object", Params={"Bucket": bucket, "Key": s3_key}, ExpiresIn=3600,
         )
-        _log_runpod(f"  DO Spaces: upload done, pod wget…")
-        # Retry wget up to 3 times with size verification to avoid truncated downloads
+        _log_runpod(f"  DO Spaces: upload done, pod downloading…")
+        # Retry download up to 3 times with size verification to avoid truncated downloads
         for attempt in range(1, 4):
             r = _paramiko_proxy_exec(
                 pod_id, pod_host_id, key,
-                f'wget -q -O "{remote}" "{url}"',
-                timeout=timeout,
+                f'curl -sS -L --retry 3 --retry-delay 5 -o "{remote}" "{url}"',
+                timeout=max(timeout, 600),
             )
             if r.returncode != 0:
                 _log_runpod(f"  DO Spaces: wget attempt {attempt}/3 failed rc={r.returncode}")
