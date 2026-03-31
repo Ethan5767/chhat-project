@@ -4,13 +4,14 @@ set -euo pipefail
 ROOT="${ROOT:-/workspace/chhat-project}"
 cd "$ROOT"
 
-python3 -m venv .venv || { echo "ERROR: venv creation failed"; exit 1; }
+python3 -m venv --system-site-packages .venv || { echo "ERROR: venv creation failed"; exit 1; }
 source .venv/bin/activate
 
 python -m pip install --upgrade pip
-# Install PyTorch with CUDA 12.4 first (compatible with RunPod drivers 12.x)
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
-# Install remaining deps -- torch/torchvision already satisfied, pip won't downgrade
+# Template already has PyTorch+CUDA; only install if missing
+python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null \
+  || pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# Install remaining deps
 pip install --extra-index-url https://download.pytorch.org/whl/cu124 -r requirements.txt || true
 # Extras not in requirements.txt
 pip install scikit-learn easyocr openpyxl boto3 python-dotenv

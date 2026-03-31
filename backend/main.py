@@ -570,16 +570,36 @@ def _paramiko_proxy_upload(pod_id: str, pod_host_id: str, key: str,
             "get_object", Params={"Bucket": bucket, "Key": s3_key}, ExpiresIn=3600,
         )
         _log_runpod(f"  DO Spaces: upload done, pod wget…")
-        r = _paramiko_proxy_exec(
-            pod_id, pod_host_id, key,
-            f'wget -q -O "{remote}" "{url}"',
-            timeout=timeout,
-        )
-        if r.returncode != 0:
-            return subprocess.CompletedProcess(
-                args=["do-spaces-upload", local, remote], returncode=1,
-                stdout=r.stdout, stderr=f"pod wget failed: {r.stderr}",
+        # Retry wget up to 3 times with size verification to avoid truncated downloads
+        for attempt in range(1, 4):
+            r = _paramiko_proxy_exec(
+                pod_id, pod_host_id, key,
+                f'wget -q -O "{remote}" "{url}"',
+                timeout=timeout,
             )
+            if r.returncode != 0:
+                _log_runpod(f"  DO Spaces: wget attempt {attempt}/3 failed rc={r.returncode}")
+                if attempt == 3:
+                    return subprocess.CompletedProcess(
+                        args=["do-spaces-upload", local, remote], returncode=1,
+                        stdout=r.stdout, stderr=f"pod wget failed after 3 attempts: {r.stderr}",
+                    )
+                continue
+            # Verify downloaded size matches source
+            sz_check = _paramiko_proxy_exec(
+                pod_id, pod_host_id, key,
+                f'stat -c %s "{remote}" 2>/dev/null || echo 0',
+                timeout=15,
+            )
+            remote_size = int((sz_check.stdout or "0").strip().split("\n")[-1] or "0")
+            if remote_size >= file_size * 0.99:  # allow tiny rounding difference
+                break
+            _log_runpod(f"  DO Spaces: wget attempt {attempt}/3 truncated ({remote_size}/{file_size} bytes), retrying…")
+            if attempt == 3:
+                return subprocess.CompletedProcess(
+                    args=["do-spaces-upload", local, remote], returncode=1,
+                    stdout="", stderr=f"Download truncated after 3 attempts: got {remote_size}/{file_size} bytes",
+                )
         _log_runpod(f"  DO Spaces: pod wget done")
         return subprocess.CompletedProcess(
             args=["do-spaces-upload", local, remote], returncode=0, stdout="", stderr="",
