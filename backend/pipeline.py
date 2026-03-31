@@ -973,9 +973,16 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
                 col_name = str(col)
                 result_row[col_name] = row[col] if not pd.isna(row[col]) else ""
 
+            # Overall confidence: average of all detected product confidences
+            if all_products:
+                avg_conf = sum(all_products.values()) / len(all_products)
+                result_row["overall_confidence"] = round(avg_conf, 3)
+            else:
+                result_row["overall_confidence"] = 0.0
+
         except Exception as exc:
             logger.error("Row %d failed: %s", row_idx, exc, exc_info=True)
-            result_row = {"Respondent.Serial": row[id_col], "Q6": ""}
+            result_row = {"Respondent.Serial": row[id_col], "Q6": "", "overall_confidence": 0.0}
 
         completed_rows.append(result_row)
 

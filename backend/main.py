@@ -884,11 +884,11 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
         r = _ssh_cmd(ssh_host, ssh_port, ssh_key,
                       f"cd /workspace/chhat-project && source .venv/bin/activate && "
                       f"CUDA_VISIBLE_DEVICES=0 "
-                      f"python -c \""
+                      f"python -c '"
                       f"from backend.pipeline import run_pipeline; "
-                      f"out = run_pipeline('{remote_csv}'); "
-                      f"print(f'RESULT_PATH={{out}}')"
-                      f"\"",
+                      f'out = run_pipeline("{remote_csv}"); '
+                      f'print(f"RESULT_PATH={{out}}")'
+                      f"'",
                       timeout=7200, pod_id=pod_id, pod_host_id=pod_host_id)  # 2 hour timeout for large batches
 
         if r.returncode != 0:
