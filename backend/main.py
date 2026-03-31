@@ -2281,6 +2281,7 @@ async def detect_single(image_file: UploadFile = File(...)):
     for idx, pkg_type in enumerate(crop_pkg_types):
         type_indices.setdefault(pkg_type, []).append(idx)
 
+    BOX_FALLBACK_THRESHOLD = 0.50
     all_cls_results: list[list[tuple[str, float]]] = [[] for _ in crops]
     for pkg_type, indices in type_indices.items():
         try:
@@ -2294,6 +2295,26 @@ async def detect_single(image_file: UploadFile = File(...)):
             type_results = classify_embeddings(type_vecs, device, top_k=CLASSIFIER_TOP_K, packaging_type="pack")
             for local_idx, global_idx in enumerate(indices):
                 all_cls_results[global_idx] = type_results[local_idx]
+
+    # Box -> pack fallback: if box classifier confidence is low, re-classify with pack
+    if "box" in type_indices:
+        box_retry = []
+        for global_idx in type_indices.get("box", []):
+            results = all_cls_results[global_idx]
+            top_conf = results[0][1] if results else 0.0
+            if top_conf < BOX_FALLBACK_THRESHOLD:
+                box_retry.append(global_idx)
+        if box_retry:
+            try:
+                retry_vecs = all_vecs[box_retry]
+                pack_results = classify_embeddings(retry_vecs, device, top_k=CLASSIFIER_TOP_K, packaging_type="pack")
+                for local_idx, global_idx in enumerate(box_retry):
+                    pack_top = pack_results[local_idx][0][1] if pack_results[local_idx] else 0.0
+                    box_top = all_cls_results[global_idx][0][1] if all_cls_results[global_idx] else 0.0
+                    if pack_top > box_top:
+                        all_cls_results[global_idx] = pack_results[local_idx]
+            except FileNotFoundError:
+                pass
 
     all_brand_scores = {}
 
@@ -2655,6 +2676,7 @@ async def generate_crops(image_file: UploadFile = File(...)):
                 pkg = meta["packaging_type"]
                 type_indices.setdefault(pkg, []).append(idx)
 
+            BOX_FALLBACK_THRESHOLD = 0.50
             per_crop_results: list[list[tuple[str, float]]] = [[] for _ in crop_images]
             for pkg_type, indices in type_indices.items():
                 try:
@@ -2664,6 +2686,19 @@ async def generate_crops(image_file: UploadFile = File(...)):
                         per_crop_results[global_idx] = cls_results[local_idx]
                 except FileNotFoundError:
                     pass  # No classifier for this type yet
+
+            # Box -> pack fallback for label training suggestions
+            if "box" in type_indices:
+                for global_idx in type_indices.get("box", []):
+                    results = per_crop_results[global_idx]
+                    top_conf = results[0][1] if results else 0.0
+                    if top_conf < BOX_FALLBACK_THRESHOLD:
+                        try:
+                            pack_r = classify_embeddings(vecs[[global_idx]], device, top_k=10, packaging_type="pack")
+                            if pack_r and pack_r[0] and pack_r[0][0][1] > top_conf:
+                                per_crop_results[global_idx] = pack_r[0]
+                        except FileNotFoundError:
+                            pass
 
             for crop_idx, crop_preds in enumerate(per_crop_results):
                 if not crop_preds:

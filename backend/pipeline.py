@@ -47,7 +47,7 @@ DOWNLOAD_TIMEOUT = 15
 RFDETR_CONF_THRESHOLD = 0.15  # low threshold to catch packs in small shelf images
 OCR_ENABLED = True
 OCR_MIN_TOKEN_LEN = 3
-MIN_OUTPUT_CONFIDENCE = 0.60
+MIN_OUTPUT_CONFIDENCE = 0.75
 CLASSIFIER_TOP_K = 5
 OCR_FULLIMG_ENABLED = True
 
@@ -719,7 +719,8 @@ def _detect_brands_from_image(
     # Embed crops in chunks (DINOv2 is shared)
     all_vecs = embed_images_batch(crops, processor, model, device)
 
-    # Classify per type
+    # Classify per type; box crops fall back to pack classifier if box confidence is low
+    BOX_FALLBACK_THRESHOLD = 0.50  # if box top-1 confidence below this, use pack classifier instead
     all_cls_results: list[list[tuple[str, float]]] = [[] for _ in crops]
 
     for pkg_type, indices in type_crop_indices.items():
@@ -729,6 +730,23 @@ def _detect_brands_from_image(
         type_results = classify_embeddings(type_vecs, device, top_k=CLASSIFIER_TOP_K, packaging_type=pkg_type)
         for local_idx, global_idx in enumerate(indices):
             all_cls_results[global_idx] = type_results[local_idx]
+
+    # Box -> pack fallback: if box classifier confidence is low, re-classify with pack
+    if "box" in type_crop_indices and "pack" in type_labels:
+        box_indices_to_retry = []
+        for global_idx in type_crop_indices.get("box", []):
+            results = all_cls_results[global_idx]
+            top_conf = results[0][1] if results else 0.0
+            if top_conf < BOX_FALLBACK_THRESHOLD:
+                box_indices_to_retry.append(global_idx)
+        if box_indices_to_retry:
+            retry_vecs = all_vecs[box_indices_to_retry]
+            pack_results = classify_embeddings(retry_vecs, device, top_k=CLASSIFIER_TOP_K, packaging_type="pack")
+            for local_idx, global_idx in enumerate(box_indices_to_retry):
+                pack_top = pack_results[local_idx][0][1] if pack_results[local_idx] else 0.0
+                box_top = all_cls_results[global_idx][0][1] if all_cls_results[global_idx] else 0.0
+                if pack_top > box_top:
+                    all_cls_results[global_idx] = pack_results[local_idx]
 
     # Build combined label profiles for OCR matching (union of all types)
     combined_labels = set()
