@@ -918,7 +918,7 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
 
         r = _ssh_cmd(ssh_host, ssh_port, ssh_key,
                       f"cd /workspace/chhat-project && source .venv/bin/activate && "
-                      f"CUDA_VISIBLE_DEVICES=0 "
+                      f"CUDA_VISIBLE_DEVICES=0 CUDA_LAUNCH_BLOCKING=1 "
                       f"python -c \"from backend.pipeline import run_pipeline; "
                       f"out = run_pipeline('{remote_csv}'); "
                       f"print(f'RESULT_PATH={{out}}')\"",

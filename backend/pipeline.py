@@ -209,11 +209,15 @@ def load_rfdetr():
     else:
         logger.info("No fine-tuned checkpoint found, using pre-trained RF-DETR-M")
         _rfdetr_model = RFDETRMedium()
-    try:
-        _rfdetr_model.optimize_for_inference()
-        logger.info("RF-DETR optimized for inference")
-    except Exception as exc:
-        logger.warning("Could not optimize RF-DETR for inference: %s", exc)
+    # Skip optimize_for_inference on RunPod -- torch.compile can segfault on some CUDA setups
+    if not os.environ.get("RUNPOD_POD_ID"):
+        try:
+            _rfdetr_model.optimize_for_inference()
+            logger.info("RF-DETR optimized for inference")
+        except Exception as exc:
+            logger.warning("Could not optimize RF-DETR for inference: %s", exc)
+    else:
+        logger.info("RF-DETR: skipping optimize_for_inference on RunPod")
     return _rfdetr_model
 
 
