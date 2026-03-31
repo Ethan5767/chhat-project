@@ -895,8 +895,9 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
             raise RuntimeError(f"Pipeline failed on GPU: {r.stdout[-500:]}")
         _log_runpod(f"gpu-batch: remote pipeline finished rc=0 tail_stdout_chars={len(r.stdout or '')}")
 
-        # Parse actual output path
-        result_line = [l for l in r.stdout.splitlines() if "RESULT_PATH=" in l]
+        # Parse actual output path (strip ANSI codes first)
+        clean_stdout = _strip_ansi(r.stdout or "")
+        result_line = [l for l in clean_stdout.splitlines() if "RESULT_PATH=" in l]
         if result_line:
             remote_result = result_line[-1].split("RESULT_PATH=")[1].strip()
         else:
