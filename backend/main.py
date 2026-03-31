@@ -1817,7 +1817,16 @@ def run_rfdetr_training_runpod_job(
             raise RuntimeError(f"No RunPod capacity for RF-DETR after {deploy_rounds} round(s)")
 
         # 3. Wait for SSH
-        ssh_key = _find_runpod_ssh_key()
+        ssh_key = None
+        for key_path in (
+            os.path.expanduser("~/.ssh/runpod_ed25519"),
+            os.path.expanduser("~/.runpod/ssh/RunPod-Key-Go"),
+            os.path.expanduser("~/.ssh/id_ed25519"),
+            os.path.expanduser("~/.ssh/id_rsa"),
+        ):
+            if os.path.exists(key_path):
+                ssh_key = key_path
+                break
         if not ssh_key:
             raise RuntimeError("No SSH private key found (~/.ssh/runpod_ed25519, ~/.runpod/ssh/ or ~/.ssh/)")
 
