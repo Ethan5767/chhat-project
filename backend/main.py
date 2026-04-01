@@ -1244,7 +1244,7 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
 
         r = _ssh_cmd(ssh_host, ssh_port, ssh_key,
                       f"cd /workspace/chhat-project && source .venv/bin/activate && "
-                      f"PYTORCH_JIT=0 CUDA_VISIBLE_DEVICES=0 CUDA_LAUNCH_BLOCKING=1 "
+                      f"CUDA_VISIBLE_DEVICES=0 "
                       f"python -c \"from backend.pipeline import run_pipeline; "
                       f"out = run_pipeline('{remote_csv}'); "
                       f"print(f'RESULT_PATH={{out}}')\"",
@@ -2415,9 +2415,10 @@ def run_rfdetr_training_runpod_job(
         progress_remote = f"/tmp/rfdetr_progress_{job_id}.json"
         train_cmd = (
             f"cd /workspace/chhat-project && source .venv/bin/activate && "
-            f"PYTORCH_JIT=0 CUDA_VISIBLE_DEVICES=0 CUDA_LAUNCH_BLOCKING=1 "
+            f"CUDA_VISIBLE_DEVICES=0 "
             f"python train.py --epochs {epochs} --batch-size {batch_size} "
             f"--lr {lr} --grad-accum-steps {grad_accum_steps} --patience {patience} "
+            f"--num-workers 8 "
             f"--progress-file {progress_remote}"
         )
 

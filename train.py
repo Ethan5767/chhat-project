@@ -131,6 +131,7 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--grad-accum-steps", type=int, default=4)
     parser.add_argument("--patience", type=int, default=10)
+    parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--progress-file", type=str, default="")
     args = parser.parse_args()
 
@@ -181,6 +182,8 @@ def main():
         output_dir=str(OUTPUT_DIR),
         early_stopping=True,
         early_stopping_patience=args.patience,
+        num_workers=args.num_workers,
+        persistent_workers=True if args.num_workers > 0 else None,
     )
 
     if args.progress_file:
