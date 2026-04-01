@@ -186,6 +186,11 @@ def main():
         persistent_workers=True if args.num_workers > 0 else None,
     )
 
+    # Determine accelerator: explicitly use "gpu" when CUDA is available to avoid
+    # PTL accelerator="auto" failing to detect GPU on some RunPod pods.
+    import torch as _torch
+    _accel = "gpu" if _torch.cuda.is_available() else "auto"
+
     if args.progress_file:
         try:
             from rfdetr.training import RFDETRDataModule, RFDETRModelModule, build_trainer
@@ -193,7 +198,7 @@ def main():
             config = model.get_train_config(**train_kwargs)
             module = RFDETRModelModule(model.model_config, config)
             datamodule = RFDETRDataModule(model.model_config, config)
-            trainer = build_trainer(config, model.model_config)
+            trainer = build_trainer(config, model.model_config, accelerator=_accel)
             trainer.callbacks.append(
                 _make_progress_callback(args.progress_file, args.epochs)
             )
@@ -201,9 +206,9 @@ def main():
             model.model.model = module.model
         except ImportError:
             # Fallback if training extras layout changed
-            model.train(**train_kwargs)
+            model.train(device="cuda" if _torch.cuda.is_available() else "cpu", **train_kwargs)
     else:
-        model.train(**train_kwargs)
+        model.train(device="cuda" if _torch.cuda.is_available() else "cpu", **train_kwargs)
 
     # Write final progress
     if args.progress_file:
