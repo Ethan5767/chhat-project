@@ -6,7 +6,7 @@
 #   .\sync_code_to_server.ps1 -Restart
 
 param(
-    [string]$Server = "root@152.42.247.183",
+    [string]$Server = "root@134.209.96.41",
     [string]$RemoteDir = "/opt/chhat-project",
     [switch]$Restart
 )

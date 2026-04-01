@@ -87,6 +87,43 @@ def _auto_split_train_valid(dataset_dir: Path, ratio: float = VALID_SPLIT_RATIO)
           f"({len(train_anns)} / {len(valid_anns)} annotations)")
 
 
+def _make_progress_callback(progress_file: str, total_epochs: int):
+    """Create a PyTorch Lightning callback that writes mAP metrics to progress JSON."""
+    import pytorch_lightning as pl
+
+    class ProgressWriterCallback(pl.Callback):
+        def on_validation_epoch_end(self, trainer, pl_module):
+            if not progress_file:
+                return
+            metrics = trainer.callback_metrics
+            progress = {
+                "epoch": trainer.current_epoch + 1,
+                "total_epochs": total_epochs,
+                "status": "training",
+            }
+            metric_keys = {
+                "val/mAP_50_95": "mAP_50_95",
+                "val/mAP_50": "mAP_50",
+                "val/mAP_75": "mAP_75",
+                "val/mAR": "mAR",
+                "val/F1": "F1",
+                "val/ema_mAP_50_95": "ema_mAP_50_95",
+                "val/ema_mAP_50": "ema_mAP_50",
+                "val/ema_mAR": "ema_mAR",
+            }
+            for ptl_key, out_key in metric_keys.items():
+                if ptl_key in metrics:
+                    val = metrics[ptl_key]
+                    progress[out_key] = round(float(val), 4)
+            try:
+                Path(progress_file).parent.mkdir(parents=True, exist_ok=True)
+                Path(progress_file).write_text(json.dumps(progress, indent=2))
+            except Exception:
+                pass
+
+    return ProgressWriterCallback()
+
+
 def main():
     parser = argparse.ArgumentParser(description="Fine-tune RF-DETR on cigarette pack detection")
     parser.add_argument("--epochs", type=int, default=50)
@@ -134,7 +171,8 @@ def main():
             "status": "starting",
         }, indent=2))
 
-    model.train(
+    # Build trainer manually to inject our progress callback for mAP logging
+    train_kwargs = dict(
         dataset_dir=str(DATASET_DIR),
         epochs=args.epochs,
         batch_size=args.batch_size,
@@ -144,6 +182,25 @@ def main():
         early_stopping=True,
         early_stopping_patience=args.patience,
     )
+
+    if args.progress_file:
+        try:
+            from rfdetr.training import RFDETRDataModule, RFDETRModelModule, build_trainer
+
+            config = model.get_train_config(**train_kwargs)
+            module = RFDETRModelModule(model.model_config, config)
+            datamodule = RFDETRDataModule(model.model_config, config)
+            trainer = build_trainer(config, model.model_config)
+            trainer.callbacks.append(
+                _make_progress_callback(args.progress_file, args.epochs)
+            )
+            trainer.fit(module, datamodule, ckpt_path=config.resume or None)
+            model.model.model = module.model
+        except ImportError:
+            # Fallback if training extras layout changed
+            model.train(**train_kwargs)
+    else:
+        model.train(**train_kwargs)
 
     # Write final progress
     if args.progress_file:

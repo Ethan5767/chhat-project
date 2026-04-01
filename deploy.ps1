@@ -7,7 +7,7 @@
 #   Normal -IncludeAssets merges/overwrites from tarball without deleting the references folder first.
 
 param(
-    [string]$Server = "root@152.42.247.183",
+    [string]$Server = "root@134.209.96.41",
     [string]$RemoteDir = "/opt/chhat-project",
     [switch]$IncludeAssets,
     # Only with -IncludeAssets: rm -rf backend/references on server before extracting references tarball.
@@ -121,7 +121,7 @@ Step "Service status + health checks"
 ssh $Server "sleep 4; systemctl is-active chhat-backend chhat-frontend nginx && curl -sS --max-time 15 http://127.0.0.1:8000/health"
 
 try {
-    $status = (Invoke-WebRequest -UseBasicParsing "http://152.42.247.183" -TimeoutSec 15).StatusCode
+    $status = (Invoke-WebRequest -UseBasicParsing "http://134.209.96.41" -TimeoutSec 15).StatusCode
     Write-Host "Public UI check: HTTP $status" -ForegroundColor Green
 } catch {
     Write-Warning "Public UI check failed: $($_.Exception.Message)"

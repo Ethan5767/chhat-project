@@ -4,14 +4,13 @@ This file provides guidance to Claude Code when working in the rf-detr-cigarette
 
 ## Project Overview
 
-Cigarette brand detection system for CHHAT. Uses RF-DETR-Medium for object detection, DINOv2 + linear classifier for brand classification, and EasyOCR for text verification. Backend is FastAPI, frontend is Streamlit.
+Cigarette brand detection system for CHHAT. Uses RF-DETR-Medium for object detection and DINOv2 + linear classifier for brand classification. Backend is FastAPI, frontend is Streamlit.
 
 ## Architecture
 
 - **Detection**: RF-DETR-Medium fine-tuned on cigarette pack dataset (checkpoint at `runs/checkpoint_best_ema.pth`)
 - **Classification**: DINOv2-base (frozen or fine-tuned) backbone + per-packaging-type linear classifiers
-- **OCR**: EasyOCR with brand-consensus fusion (OCR is primary signal, DINOv2 confirms product)
-- **Pipeline flow**: Image -> RF-DETR detect packs -> crop -> DINOv2 embed -> classifier predict -> OCR verify -> output
+- **Pipeline flow**: Image -> RF-DETR detect packs -> crop -> DINOv2 embed -> classifier predict -> output
 - **Packaging types**: pack, box (separate classifiers per type)
 - **Brand registry**: 29 brands, 68 products defined in `backend/brand_registry.py` (single source of truth)
 
@@ -69,13 +68,21 @@ What works:
 - File transfer via DO Spaces (SFTP through proxy fails for large files)
 - Classifier GPU fallback: tries SECURE then COMMUNITY cloud, 8+ GPU types, 5 retry rounds
 
+## RunPod Pod Reuse
+
+- Pods are stopped (not terminated) after jobs to preserve /workspace volume
+- Pod registry at `_DATA_ROOT / "runpod_pods.json"` tracks reusable pods per job type (batch, dinov2, classifier, rfdetr)
+- On next job, try `podResume` first (skip bootstrap + weight upload), fall back to create-new if GPU unavailable
+- `podHostId` may change on resume -- re-queried after `podResume`
+- Container disk is wiped on stop, but /workspace persists (venv, model weights, repo all survive)
+- Stopped pod volume cost: ~$0.20/GB/month ($10/month for 50GB)
+- Management endpoints: `GET /runpod/pods`, `POST /runpod/pods/{id}/terminate`, `POST /runpod/pods/cleanup`
+
 ## Conventions
 
 - No emojis in code, commits, or output
 - Use "product" not "SKU" (Brand -> Product hierarchy)
-- OCR is primary brand signal, DINOv2 confirms product (not the other way around)
 - `brand_registry.py` is the single source of truth for all brand/product mappings
-- Use EasyOCR, not Tesseract
 
 ## Sensitive Files
 
@@ -155,6 +162,22 @@ These issues were discovered and fixed. Document here to avoid repeating them:
 - Check `pod is not None` (not truthy string check on `pod_id`)
 - Install `rfdetr[train,loggers]` as separate step after bootstrap (not in requirements.txt)
 - Progress polling every 12s with regex JSON extraction
+- **GPU preference**: A100 > RTX 4090/4080 > L40S (H100 removed -- overkill and expensive for RF-DETR training)
+- **Pod clones from GitHub, not server**: Code changes (train.py, pipeline.py) must be pushed to GitHub before triggering RunPod training, otherwise the pod runs stale code
+- **NEVER send kill signals to training PID**: `kill -USR1` or similar to inspect a running train.py process will terminate it (exit code 138). Use `nvidia-smi`, `ps aux`, `/proc/PID/status` for diagnostics instead.
+
+### COCO Dataset Category Issues (Roboflow exports)
+- Roboflow exports include an empty parent `objects` category (id=0) with zero annotations
+- RF-DETR / pycocotools treats category_id=0 as valid, causing mAP=0.000 because no predictions match the phantom category
+- **Always remove the `objects` category** before training: keep only `cigarette_box` and `cigarette_pack`, re-index to 0-based contiguous IDs
+- Roboflow bbox values are strings (`'101.27'` not `101.27`); must cast to float before training
+- When merging multiple Roboflow exports (e.g. coco v3, v4, v6), deduplicate by filename -- different versions may annotate the same images differently; prefer the highest version number
+
+### RF-DETR mAP Progress Logging
+- `train.py` now uses a custom PTL `ProgressWriterCallback` that writes mAP metrics (mAP_50_95, mAP_50, mAP_75, mAR, F1, ema variants) to the progress JSON after each validation epoch
+- `_metrics_from_progress()` in main.py extracts these mAP fields for the training status API
+- The old train.py only wrote epoch/total_epochs/status (no mAP), so remote monitoring showed no accuracy
+- The callback is injected by importing rfdetr training internals (`RFDETRModelModule`, `RFDETRDataModule`, `build_trainer`) and appending to `trainer.callbacks` before `trainer.fit()`
 
 ### RunPod SSH Key
 - SSH key: `~/.ssh/runpod_ed25519` on the server

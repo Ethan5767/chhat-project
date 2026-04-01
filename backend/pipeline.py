@@ -4,6 +4,7 @@ import io
 import logging
 import os
 import re
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Callable, Optional
@@ -14,7 +15,6 @@ import requests
 import torch
 import torch.nn as nn
 from PIL import Image
-from rapidfuzz import fuzz
 from transformers import AutoImageProcessor, AutoModel
 
 BATCH_MODE: Optional[int] = None
@@ -44,29 +44,13 @@ _PROJECT_ROOT = _BACKEND_ROOT.parent
 _RFDETR_CHECKPOINT_DIR = _DATA_ROOT / "runs" if (_DATA_ROOT / "runs").exists() else _PROJECT_ROOT / "runs"
 
 DOWNLOAD_TIMEOUT = 15
-RFDETR_CONF_THRESHOLD = 0.15  # low threshold to catch packs in small shelf images
-OCR_ENABLED = False
-OCR_MIN_TOKEN_LEN = 3
+RFDETR_CONF_THRESHOLD = 0.10  # low threshold to catch packs in small shelf images
 MIN_OUTPUT_CONFIDENCE = 0.75
 CLASSIFIER_TOP_K = 5
-OCR_FULLIMG_ENABLED = True
-
-# Simplified 3-tier OCR fusion:
-# Tier 1: Classifier confident (>= 0.85) -> trust classifier
-# Tier 2: Classifier moderate (>= 0.50) -> check OCR for confirmation
-# Tier 3: Classifier lost (< 0.50) -> OCR can override
-CLASSIFIER_HIGH_CONF = 0.85
-CLASSIFIER_LOW_CONF = 0.50
-OCR_FALLBACK_THRESHOLD = 0.72
-OCR_FALLBACK_MARGIN = 0.08
-OCR_STRONG_THRESHOLD = 0.60
-OCR_BOOST = 0.05              # confidence boost when OCR agrees with classifier
-OCR_INDEPENDENT_MIN_SCORE = 0.70
 
 _dino_processor = None
 _dino_model = None
 _rfdetr_model = None
-_ocr_reader = None
 # Per-type classifiers: {"pack": (classifier, mapping), "box": (classifier, mapping)}
 _classifiers: dict[str, tuple] = {}
 # Legacy single-classifier aliases (for backward compat)
@@ -258,15 +242,6 @@ def reload_dino():
         raise
 
 
-def load_ocr():
-    """Load EasyOCR reader (English). Cached after first call."""
-    global _ocr_reader
-    if _ocr_reader is None:
-        import easyocr
-        _ocr_reader = easyocr.Reader(["en"], gpu=torch.cuda.is_available())
-    return _ocr_reader
-
-
 EMBED_DIM = 1536  # CLS (768) + mean-pooled patches (768)
 
 
@@ -298,23 +273,48 @@ def embed_image(pil_img: Image.Image, processor, model, device: str) -> np.ndarr
 
 
 EMBED_BATCH_SIZE = 8  # limit peak tensor memory on low-RAM servers
+# H100-optimised batch size -- set by run_pipeline when CUDA available
+_EMBED_BATCH_SIZE_OVERRIDE: Optional[int] = None
+
+
+def _get_embed_batch_size() -> int:
+    if _EMBED_BATCH_SIZE_OVERRIDE is not None:
+        return _EMBED_BATCH_SIZE_OVERRIDE
+    return EMBED_BATCH_SIZE
+
+
+def _preprocess_crops_parallel(pil_imgs: list[Image.Image], max_workers: int = 8) -> list[Image.Image]:
+    """Pad-to-square + RGB convert in parallel threads."""
+    def _prep(img):
+        return _pad_to_square(img.convert("RGB"))
+    if len(pil_imgs) <= 4:
+        return [_prep(img) for img in pil_imgs]
+    with ThreadPoolExecutor(max_workers=min(max_workers, len(pil_imgs))) as pool:
+        return list(pool.map(_prep, pil_imgs))
+
 
 def embed_images_batch(pil_imgs: list[Image.Image], processor, model, device: str) -> np.ndarray:
     """Embed images in chunks to limit peak memory. Returns (N, dim) L2-normalised."""
     if not pil_imgs:
         return np.empty((0, EMBED_DIM), dtype=np.float32)
-    imgs = [_pad_to_square(img.convert("RGB")) for img in pil_imgs]
+    batch_size = _get_embed_batch_size()
+    imgs = _preprocess_crops_parallel(pil_imgs)
     all_vecs = []
-    for i in range(0, len(imgs), EMBED_BATCH_SIZE):
-        chunk = imgs[i:i + EMBED_BATCH_SIZE]
+    use_amp = device == "cuda"
+    for i in range(0, len(imgs), batch_size):
+        chunk = imgs[i:i + batch_size]
         with torch.no_grad():
             inputs = processor(images=chunk, return_tensors="pt")
             inputs = {k: v.to(device) for k, v in inputs.items()}
-            outputs = model(**inputs)
+            if use_amp:
+                with torch.cuda.amp.autocast():
+                    outputs = model(**inputs)
+            else:
+                outputs = model(**inputs)
             cls_tokens = outputs.last_hidden_state[:, 0, :]       # (B, 768)
             patch_means = outputs.last_hidden_state[:, 1:, :].mean(dim=1)  # (B, 768)
             combined = torch.cat([cls_tokens, patch_means], dim=1)  # (B, 1536)
-            all_vecs.append(combined.detach().cpu().numpy().astype(np.float32))
+            all_vecs.append(combined.float().detach().cpu().numpy().astype(np.float32))
             del inputs, outputs, cls_tokens, patch_means, combined
     vecs = np.concatenate(all_vecs, axis=0)
     norms = np.linalg.norm(vecs, axis=1, keepdims=True)
@@ -456,15 +456,18 @@ def classify_embeddings(
         x = torch.tensor(embeddings, dtype=torch.float32).to(device)
         logits = classifier(x)
         probs = torch.softmax(logits, dim=1)
+        k = min(top_k, probs.shape[1])
+        topk_vals, topk_idxs = torch.topk(probs, k, dim=1)  # (N, k) batched
+        topk_vals_np = topk_vals.cpu().numpy()
+        topk_idxs_np = topk_idxs.cpu().numpy()
 
     results = []
     for i in range(len(embeddings)):
-        topk_vals, topk_idxs = torch.topk(probs[i], min(top_k, probs.shape[1]))
         sample_results = []
-        for val, idx in zip(topk_vals, topk_idxs):
-            label_key = str(idx.item())
+        for j in range(k):
+            label_key = str(topk_idxs_np[i, j])
             label = idx_to_label.get(label_key, f"unknown_{label_key}")
-            sample_results.append((label, float(val.item())))
+            sample_results.append((label, float(topk_vals_np[i, j])))
         results.append(sample_results)
 
     return results
@@ -550,136 +553,6 @@ def _valid_url_value(value) -> bool:
     return _looks_like_url(value)
 
 
-def _normalize_text(text: str) -> str:
-    text = text.lower().replace("_", " ")
-    text = re.sub(r"[^a-z0-9\s]+", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text
-
-
-def _build_label_profiles(labels: list[str]) -> list[dict]:
-    profiles = []
-    for label in labels:
-        norm_label = _normalize_text(label)
-        base_label = re.sub(r"\s+\d+$", "", norm_label).strip()
-        parts = [p for p in base_label.split() if p]
-        brand = parts[0] if parts else base_label
-        variant = " ".join(parts[1:]).strip() if len(parts) > 1 else ""
-        tokens = {t for t in parts if len(t) >= OCR_MIN_TOKEN_LEN}
-        profiles.append(
-            {
-                "label": label,
-                "norm": norm_label,
-                "base": base_label,
-                "brand": brand,
-                "variant": variant,
-                "tokens": tokens,
-            }
-        )
-    return profiles
-
-
-def _run_ocr_on_image(image: Image.Image) -> list:
-    """Run EasyOCR on an image. Returns [(bbox, text, confidence), ...]."""
-    try:
-        reader = load_ocr()
-    except Exception as exc:
-        logger.warning("OCR disabled because EasyOCR failed to load: %s", exc)
-        return []
-    try:
-        img_np = np.array(image.convert("RGB"))
-        results = reader.readtext(img_np)
-        return results  # already [(bbox, text, conf)]
-    except Exception as exc:
-        logger.warning("OCR read failed: %s", exc)
-        return []
-
-
-def _ocr_brand_scores_from_items(ocr_items: list, label_profiles: list[dict]) -> dict[str, float]:
-    """Match OCR text to brand labels using fuzzy matching.
-
-    Uses token-level matching with fuzzy per-token comparison so that
-    "La pn" matches "lapin", "MEVWS" matches "mevius", etc.
-    Requires the OCR text to be at least 60% similar to the brand token
-    to count as a match, preventing false positives like "image" -> "esse".
-    """
-    brand_scores: dict[str, float] = {}
-
-    # Filter out common non-brand text (error pages, generic words)
-    noise_words = {"this", "image", "cannot", "displayed", "found", "error",
-                   "the", "and", "for", "are", "not", "with", "that", "from",
-                   "have", "has", "was", "were", "been", "being", "page"}
-
-    for item in ocr_items:
-        if len(item) < 3:
-            continue
-        try:
-            text = str(item[1]).strip()
-            text_conf = float(item[2])
-        except (IndexError, TypeError, ValueError):
-            continue
-        norm_text = _normalize_text(text)
-        if not norm_text or len(norm_text) < 2:
-            continue
-
-        text_tokens = [t for t in norm_text.split() if len(t) >= 2]
-        # Skip if all tokens are noise
-        meaningful_tokens = [t for t in text_tokens if t not in noise_words]
-        if not meaningful_tokens:
-            continue
-
-        for prof in label_profiles:
-            brand_name = prof["brand"]  # e.g. "mevius", "esse", "555"
-            brand_tokens = prof["tokens"]  # e.g. {"mevius", "original"}
-
-            # Strategy 1: Exact token match (highest confidence)
-            exact_matches = 0
-            for tok in meaningful_tokens:
-                if tok in brand_tokens:
-                    exact_matches += 1
-            if exact_matches > 0:
-                score = min(1.0, text_conf * (0.70 + 0.10 * exact_matches))
-                if score > brand_scores.get(prof["label"], 0.0):
-                    brand_scores[prof["label"]] = float(score)
-                continue
-
-            # Strategy 2: Fuzzy token match (for OCR errors like "La pn" -> "lapin")
-            # Compare each OCR token against each brand token individually
-            # Also try joining the full OCR text as one string for split-word matches
-            best_token_fuzzy = 0.0
-
-            # Try the full normalized text against brand name (catches "la pn" -> "lapin")
-            joined = norm_text.replace(" ", "")
-            if len(joined) >= 3:
-                brand_ratio = fuzz.ratio(joined, brand_name) / 100.0
-                if brand_ratio >= 0.60:
-                    best_token_fuzzy = max(best_token_fuzzy, brand_ratio)
-
-            for ocr_tok in meaningful_tokens:
-                if len(ocr_tok) < 3:
-                    continue
-                # Compare against brand name
-                brand_ratio = fuzz.ratio(ocr_tok, brand_name) / 100.0
-                if brand_ratio >= 0.60:
-                    best_token_fuzzy = max(best_token_fuzzy, brand_ratio)
-
-                # Compare against each brand token
-                for bt in brand_tokens:
-                    if len(bt) < 3:
-                        continue
-                    tok_ratio = fuzz.ratio(ocr_tok, bt) / 100.0
-                    if tok_ratio >= 0.60:
-                        best_token_fuzzy = max(best_token_fuzzy, tok_ratio)
-
-            if best_token_fuzzy >= 0.60:
-                score = text_conf * best_token_fuzzy * 0.85
-                if score > brand_scores.get(prof["label"], 0.0):
-                    brand_scores[prof["label"]] = float(score)
-
-    return brand_scores
-
-
-
 def _detect_brands_from_image(
     image: Image.Image,
     rfdetr_model,
@@ -691,28 +564,23 @@ def _detect_brands_from_image(
 ) -> dict[str, float]:
     """Detect and classify cigarette brands in an image.
 
-    Pipeline (classifier-first with OCR fallback):
+    Pipeline:
       1. RF-DETR detects bounding boxes with class_id (0=pack, 1=box)
       2. Crops are grouped by packaging type
       3. Each group is classified by its type-specific DINOv2 classifier
-      4. EasyOCR runs only on uncertain crops (low confidence / low margin)
-      5. OCR signals boost matching classifier families for uncertain crops
     """
     # Load labels for each available packaging type
     type_labels = {}
-    type_label_profiles = {}
     for pkg_type in PACKAGING_TYPES:
         try:
             _, pkg_labels = load_index(packaging_type=pkg_type)
             type_labels[pkg_type] = pkg_labels
-            type_label_profiles[pkg_type] = _build_label_profiles(pkg_labels)
         except FileNotFoundError:
             pass
 
     # Fallback: if no type-specific classifiers, use legacy labels
     if not type_labels:
         type_labels["pack"] = labels
-        type_label_profiles["pack"] = _build_label_profiles(labels)
 
     detections = rfdetr_model.predict(image, threshold=RFDETR_CONF_THRESHOLD)
     crops: list[Image.Image] = []
@@ -785,82 +653,13 @@ def _detect_brands_from_image(
                 if pack_top > box_top:
                     all_cls_results[global_idx] = pack_results[local_idx]
 
-    # Build combined label profiles for OCR matching (union of all types)
-    combined_labels = set()
-    for pkg_labels in type_labels.values():
-        combined_labels.update(pkg_labels)
-    combined_label_profiles = _build_label_profiles(list(combined_labels))
-    label_profile_map = {p["label"]: p for p in combined_label_profiles}
-
-    def _needs_ocr_fallback(crop_results: list[tuple[str, float]]) -> bool:
-        if not OCR_ENABLED:
-            return False
-        if not crop_results:
-            return True
-        top1 = float(crop_results[0][1])
-        top2 = float(crop_results[1][1]) if len(crop_results) > 1 else 0.0
-        margin = top1 - top2
-        return top1 < OCR_FALLBACK_THRESHOLD or margin < OCR_FALLBACK_MARGIN
-
-    ocr_needed = [_needs_ocr_fallback(r) for r in all_cls_results]
-
-    # OCR fallback only for uncertain crops
-    per_crop_ocr_scores: list[dict[str, float]] = [{} for _ in crops]
-    ocr_best: dict[str, float] = {}
-    for idx, crop in enumerate(crops):
-        if not ocr_needed[idx]:
-            continue
-        ocr_items = _run_ocr_on_image(crop)
-        crop_ocr_scores = _ocr_brand_scores_from_items(ocr_items, combined_label_profiles)
-        per_crop_ocr_scores[idx] = crop_ocr_scores
-        for label, conf in crop_ocr_scores.items():
-            if conf > ocr_best.get(label, 0.0):
-                ocr_best[label] = conf
-
-    # Optional full-image OCR context
-    fullimg_ocr_families: dict[str, float] = {}
-    if OCR_FULLIMG_ENABLED and has_detections and any(ocr_needed):
-        fullimg_scores = _ocr_brand_scores_from_items(_run_ocr_on_image(image), combined_label_profiles)
-        for label, conf in fullimg_scores.items():
-            if conf > ocr_best.get(label, 0.0):
-                ocr_best[label] = conf
-            family = label_profile_map.get(label, {}).get("brand", "")
-            if family:
-                fullimg_ocr_families[family] = max(fullimg_ocr_families.get(family, 0.0), conf)
-
-    # Fuse classifier with OCR fallback
+    # Aggregate classifier results directly
     fused: dict[str, float] = {}
-    for crop_idx, crop_results in enumerate(all_cls_results):
-        crop_ocr_scores = per_crop_ocr_scores[crop_idx]
-        crop_ocr_families: dict[str, float] = {}
-        for label, ocr_conf in crop_ocr_scores.items():
-            family = label_profile_map.get(label, {}).get("brand", "")
-            if family:
-                crop_ocr_families[family] = max(crop_ocr_families.get(family, 0.0), ocr_conf)
-
+    for crop_results in all_cls_results:
         for label, cls_conf in crop_results:
             out_conf = float(cls_conf)
-            if ocr_needed[crop_idx]:
-                brand_family = label_profile_map.get(label, {}).get("brand", "")
-                fam_conf = 0.0
-                if brand_family:
-                    fam_conf = max(
-                        crop_ocr_families.get(brand_family, 0.0),
-                        fullimg_ocr_families.get(brand_family, 0.0),
-                    )
-                if fam_conf >= OCR_STRONG_THRESHOLD:
-                    out_conf = min(1.0, out_conf + fam_conf * 0.15)
-                elif fam_conf > 0:
-                    out_conf = min(1.0, out_conf + fam_conf * 0.05)
             if out_conf > fused.get(label, 0.0):
                 fused[label] = out_conf
-
-    # OCR-only brands
-    for label, ocr_conf in ocr_best.items():
-        if label in fused:
-            continue
-        if ocr_conf >= OCR_INDEPENDENT_MIN_SCORE:
-            fused[label] = min(1.0, ocr_conf * 0.70)
 
     return _aggregate_to_products(fused)
 
@@ -978,8 +777,185 @@ def _process_single_row(row, url_columns, id_col, df_columns, rfdetr_model, proc
     return result_row
 
 
-# Number of rows to prefetch images for while GPU processes current row
-PREFETCH_AHEAD = 4
+# ---------------------------------------------------------------------------
+# GPU-optimised multi-row batch processing
+# ---------------------------------------------------------------------------
+MULTI_ROW_BATCH = 8   # number of rows to process in one GPU mega-batch
+PREFETCH_AHEAD = 48   # prefetch images for upcoming rows
+
+
+_cached_type_labels: Optional[dict] = None
+
+
+def _get_type_labels_cached(labels):
+    """Cache type labels across batches to avoid reloading every call."""
+    global _cached_type_labels
+    if _cached_type_labels is not None:
+        return _cached_type_labels
+    type_labels = {}
+    for pkg_type in PACKAGING_TYPES:
+        try:
+            _, pkg_labels = load_index(packaging_type=pkg_type)
+            type_labels[pkg_type] = pkg_labels
+        except FileNotFoundError:
+            pass
+    if not type_labels:
+        type_labels["pack"] = labels
+    _cached_type_labels = type_labels
+    return type_labels
+
+
+def _process_rows_batched(
+    rows_with_images: list[tuple],  # [(row, images_dict), ...]
+    url_columns, id_col, df_columns, rfdetr_model, processor, model,
+    device, index, labels, build_q12_row,
+) -> list[dict]:
+    """Process multiple rows at once, batching ALL crops across ALL images across ALL rows
+    through a single DINOv2 + classifier pass for maximum GPU utilization."""
+
+    type_labels = _get_type_labels_cached(labels)
+
+    # Phase 1: RF-DETR detection on all images, collect all crops
+    # Structure: for each row, for each col, list of (crop, crop_type)
+    row_col_crops: list[dict[str, list[tuple[Image.Image, str]]]] = []
+    all_crops: list[Image.Image] = []
+    all_crop_types: list[str] = []
+    crop_to_rowcol: list[tuple[int, str, int]] = []  # (row_idx, col_name, crop_idx_within_col)
+
+    for row_idx, (row, images) in enumerate(rows_with_images):
+        col_crops: dict[str, list[tuple[Image.Image, str]]] = {}
+        for col in url_columns:
+            col_name = str(col)
+            image = images.get(col_name) if images else None
+            if image is None:
+                col_crops[col_name] = []
+                continue
+
+            detections = rfdetr_model.predict(image, threshold=RFDETR_CONF_THRESHOLD)
+            has_det = len(detections) > 0 if detections is not None else False
+
+            crops_for_col: list[tuple[Image.Image, str]] = []
+            if has_det:
+                width, height = image.size
+                xyxy = detections.xyxy
+                class_ids = detections.class_id if hasattr(detections, "class_id") and detections.class_id is not None else None
+                for i, box in enumerate(xyxy):
+                    x1, y1, x2, y2 = [int(v) for v in box]
+                    bw, bh = x2 - x1, y2 - y1
+                    pad_x, pad_y = int(bw * 0.10), int(bh * 0.10)
+                    x1 = max(0, x1 - pad_x)
+                    y1 = max(0, y1 - pad_y)
+                    x2 = min(width, x2 + pad_x)
+                    y2 = min(height, y2 + pad_y)
+                    if x2 <= x1 or y2 <= y1:
+                        continue
+                    crop = image.crop((x1, y1, x2, y2))
+                    ctype = "pack"
+                    if class_ids is not None and len(class_ids) > i:
+                        ctype = "box" if int(class_ids[i]) == 1 else "pack"
+                    crops_for_col.append((crop, ctype))
+            else:
+                crops_for_col.append((image, "pack"))
+
+            for cidx, (crop, ctype) in enumerate(crops_for_col):
+                crop_to_rowcol.append((row_idx, col_name, cidx))
+                all_crops.append(crop)
+                all_crop_types.append(ctype)
+
+            col_crops[col_name] = crops_for_col
+        row_col_crops.append(col_crops)
+
+    if not all_crops:
+        # No images at all -- return empty result rows
+        results = []
+        for row_idx, (row, _) in enumerate(rows_with_images):
+            result_row = {"Respondent.Serial": row[id_col], "Q6": "", "overall_confidence": 0.0}
+            results.append(result_row)
+        return results
+
+    # Phase 2: Mega-batch DINOv2 embedding of ALL crops at once
+    all_vecs = embed_images_batch(all_crops, processor, model, device)
+
+    # Phase 3: Classify all embeddings grouped by packaging type
+    type_crop_indices: dict[str, list[int]] = {}
+    for idx, ctype in enumerate(all_crop_types):
+        effective = ctype if ctype in type_labels else "pack"
+        type_crop_indices.setdefault(effective, []).append(idx)
+
+    all_cls_results: list[list[tuple[str, float]]] = [[] for _ in all_crops]
+    for pkg_type, indices in type_crop_indices.items():
+        if not indices:
+            continue
+        type_vecs = all_vecs[indices]
+        type_results = classify_embeddings(type_vecs, device, top_k=CLASSIFIER_TOP_K, packaging_type=pkg_type)
+        for local_idx, global_idx in enumerate(indices):
+            all_cls_results[global_idx] = type_results[local_idx]
+
+    # Box -> pack fallback
+    BOX_FALLBACK_THRESHOLD = 0.50
+    if "box" in type_crop_indices and "pack" in type_labels:
+        box_retry = [gi for gi in type_crop_indices.get("box", [])
+                     if not all_cls_results[gi] or all_cls_results[gi][0][1] < BOX_FALLBACK_THRESHOLD]
+        if box_retry:
+            retry_vecs = all_vecs[box_retry]
+            pack_results = classify_embeddings(retry_vecs, device, top_k=CLASSIFIER_TOP_K, packaging_type="pack")
+            for li, gi in enumerate(box_retry):
+                pack_top = pack_results[li][0][1] if pack_results[li] else 0.0
+                box_top = all_cls_results[gi][0][1] if all_cls_results[gi] else 0.0
+                if pack_top > box_top:
+                    all_cls_results[gi] = pack_results[li]
+
+    # Phase 4: Map results back to rows and build output
+    # Group crop results by (row_idx, col_name)
+    row_col_results: dict[tuple[int, str], list[tuple[str, float]]] = defaultdict(list)
+    for flat_idx, (row_idx, col_name, _) in enumerate(crop_to_rowcol):
+        for label, conf in all_cls_results[flat_idx]:
+            row_col_results[(row_idx, col_name)].append((label, conf))
+
+    result_rows = []
+    for row_idx, (row, _) in enumerate(rows_with_images):
+        try:
+            all_products: dict[str, float] = {}
+            for col in url_columns:
+                col_name = str(col)
+                crop_results = row_col_results.get((row_idx, col_name), [])
+                if not crop_results:
+                    continue
+                fused: dict[str, float] = {}
+                for label, conf in crop_results:
+                    if float(conf) > fused.get(label, 0.0):
+                        fused[label] = float(conf)
+                products = _aggregate_to_products(fused)
+                for product, pconf in products.items():
+                    if pconf >= MIN_OUTPUT_CONFIDENCE:
+                        if pconf > all_products.get(product, 0.0):
+                            all_products[product] = pconf
+
+            detected = [p for p, _ in sorted(all_products.items(), key=lambda x: -x[1])]
+            q12_row = build_q12_row(detected)
+            result_row = {"Respondent.Serial": row[id_col], "Q6": ""}
+            result_row.update(q12_row)
+
+            photo_cols = [c for c in df_columns if c in url_columns or
+                          any(k in str(c).lower() for k in ("q30", "q33", "photo", "link", "image"))]
+            for col in photo_cols:
+                col_name = str(col)
+                result_row[col_name] = row[col] if not pd.isna(row[col]) else ""
+
+            if all_products:
+                avg_conf = sum(all_products.values()) / len(all_products)
+                result_row["overall_confidence"] = round(avg_conf, 3)
+            else:
+                result_row["overall_confidence"] = 0.0
+        except Exception as exc:
+            logger.error("Row %d failed in batch: %s", row_idx, exc, exc_info=True)
+            result_row = {"Respondent.Serial": row[id_col], "Q6": "", "overall_confidence": 0.0}
+
+        result_rows.append(result_row)
+
+    # Free GPU memory
+    del all_vecs, all_crops, all_cls_results
+    return result_rows
 
 
 def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]] = None) -> Path:
@@ -999,6 +975,24 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
         if device == "cpu":
             raise RuntimeError("GPU required but not available. Aborting to avoid slow CPU processing.")
     logger.info("Pipeline device: %s", device)
+
+    # H100/A100 GPU optimisation: large batch size for DINOv2 embeddings
+    global _EMBED_BATCH_SIZE_OVERRIDE
+    if device == "cuda":
+        try:
+            vram_gb = torch.cuda.get_device_properties(0).total_mem / (1024**3)
+            if vram_gb >= 70:       # H100 80GB, A100 80GB
+                _EMBED_BATCH_SIZE_OVERRIDE = 128
+            elif vram_gb >= 30:     # A100 40GB, A6000
+                _EMBED_BATCH_SIZE_OVERRIDE = 64
+            elif vram_gb >= 16:     # RTX 4090, L4
+                _EMBED_BATCH_SIZE_OVERRIDE = 32
+            else:
+                _EMBED_BATCH_SIZE_OVERRIDE = 16
+            logger.info("GPU VRAM %.1f GB -> embed_batch_size=%d", vram_gb, _EMBED_BATCH_SIZE_OVERRIDE)
+        except Exception:
+            _EMBED_BATCH_SIZE_OVERRIDE = 32
+
     classifier, labels = load_index()
     processor, model = load_dino(device)
     rfdetr_model = load_rfdetr()
@@ -1045,6 +1039,7 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
         pd.DataFrame(rows).to_csv(out_path, index=False, encoding="utf-8-sig")
 
     # Prefetch: submit image downloads for upcoming rows in a background pool
+    batch_size = MULTI_ROW_BATCH if device == "cuda" else 1
     prefetch_pool = ThreadPoolExecutor(max_workers=PREFETCH_AHEAD, thread_name_prefix="prefetch")
     prefetch_futures: dict[int, any] = {}
 
@@ -1054,44 +1049,65 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
             prefetch_futures[row_idx] = prefetch_pool.submit(_download_row_images, row, url_columns)
 
     # Seed the prefetch queue
-    for i in range(start_row, min(start_row + PREFETCH_AHEAD, process_len)):
+    for i in range(start_row, min(start_row + PREFETCH_AHEAD * batch_size, process_len)):
         _submit_prefetch(i)
 
-    for row_idx in range(start_row, process_len):
-        row = df.iloc[row_idx]
+    row_idx = start_row
+    while row_idx < process_len:
+        # Collect a batch of rows with their prefetched images
+        batch_end = min(row_idx + batch_size, process_len)
+        rows_with_images = []
+        for ri in range(row_idx, batch_end):
+            row = df.iloc[ri]
+            images = None
+            if ri in prefetch_futures:
+                try:
+                    images = prefetch_futures.pop(ri).result(timeout=120)
+                except Exception:
+                    images = None
+            if images is None:
+                images = _download_row_images(row, url_columns)
+            rows_with_images.append((row, images))
 
-        # Get prefetched images or download synchronously as fallback
-        images = None
-        if row_idx in prefetch_futures:
-            try:
-                images = prefetch_futures.pop(row_idx).result(timeout=120)
-            except Exception:
-                images = None  # will re-download in _process_single_row
-        # Clean up any other consumed futures
+        # Clean up consumed futures
         for k in list(prefetch_futures.keys()):
-            if k < row_idx:
+            if k < batch_end:
                 prefetch_futures.pop(k, None)
 
-        # Submit prefetch for next rows
-        for i in range(row_idx + 1, min(row_idx + 1 + PREFETCH_AHEAD, process_len)):
+        # Submit prefetch for upcoming rows
+        for i in range(batch_end, min(batch_end + PREFETCH_AHEAD * batch_size, process_len)):
             _submit_prefetch(i)
 
-        result_row = _process_single_row(
-            row, url_columns, id_col, df.columns, rfdetr_model,
-            processor, model, device, index, labels, build_q12_row, images,
-        )
-        completed_rows.append(result_row)
+        # Process the batch
+        if batch_size > 1 and device == "cuda":
+            batch_results = _process_rows_batched(
+                rows_with_images, url_columns, id_col, df.columns,
+                rfdetr_model, processor, model, device, index, labels, build_q12_row,
+            )
+        else:
+            batch_results = []
+            for row, images in rows_with_images:
+                r = _process_single_row(
+                    row, url_columns, id_col, df.columns, rfdetr_model,
+                    processor, model, device, index, labels, build_q12_row, images,
+                )
+                batch_results.append(r)
 
-        # Free image/tensor memory from this row
-        images = None
-        if (row_idx + 1) % 100 == 0:
+        completed_rows.extend(batch_results)
+
+        # Free memory
+        rows_with_images = None
+        batch_results = None
+        if batch_end % 100 < batch_size:
             gc.collect()
 
-        if (row_idx + 1) % SAVE_INTERVAL == 0 or row_idx + 1 == process_len:
+        if batch_end % SAVE_INTERVAL < batch_size or batch_end == process_len:
             _flush(completed_rows)
 
         if progress_cb:
-            progress_cb(row_idx + 1, process_len, f"Processed row {row_idx + 1}/{process_len}")
+            progress_cb(batch_end, process_len, f"Processed row {batch_end}/{process_len}")
+
+        row_idx = batch_end
 
     prefetch_pool.shutdown(wait=False)
 

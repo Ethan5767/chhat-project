@@ -468,7 +468,6 @@ st.markdown(
         <span class="pipe-tag">RF-DETR</span>
         <span class="pipe-tag">DINOv2-base</span>
         <span class="pipe-tag">Brand Classifier</span>
-        <span class="pipe-tag">EasyOCR</span>
     </div>
     """,
     unsafe_allow_html=True,
@@ -780,48 +779,6 @@ with tab_single:
                 else:
                     brand_lines = '<div style="font-size:11px;color:#9ea7be;">No brand match</div>'
 
-                # OCR debug per crop (what EasyOCR saw + OCR-derived brand scores).
-                ocr_texts = box.get("ocr_texts", [])
-                ocr_brand_scores = box.get("ocr_brand_scores", [])
-                if ocr_brand_scores:
-                    ocr_brand_lines = ""
-                    for br in ocr_brand_scores[:3]:
-                        ocr_conf = br["confidence"]
-                        ocr_conf_pct = int(ocr_conf * 100)
-                        bar_color = "#22c55e" if ocr_conf >= 0.70 else "#f59e0b" if ocr_conf >= 0.50 else "#ef4444"
-                        ocr_brand_lines += f"""
-                            <div style="margin-bottom:4px;">
-                                <div style="display:flex;justify-content:space-between;font-size:11px;">
-                                    <span>{br["brand"].replace("_", " ")}</span>
-                                    <span style="color:{bar_color};font-weight:700;">{ocr_conf:.3f}</span>
-                                </div>
-                                <div style="background:rgba(255,255,255,0.1);border-radius:3px;height:4px;margin-top:2px;">
-                                    <div style="background:{bar_color};height:4px;border-radius:3px;width:{ocr_conf_pct}%;"></div>
-                                </div>
-                            </div>"""
-                else:
-                    ocr_brand_lines = '<div style="font-size:11px;color:#9ea7be;">OCR brand scores: none</div>'
-
-                if ocr_texts:
-                    # Show top OCR text snippets only.
-                    def _escape_html(s: str) -> str:
-                        return (
-                            s.replace("&", "&amp;")
-                            .replace("<", "&lt;")
-                            .replace(">", "&gt;")
-                            .replace('"', "&quot;")
-                            .replace("'", "&#039;")
-                        )
-
-                    ocr_text_preview = ", ".join(
-                        _escape_html(str(t["text"]).strip())
-                        for t in ocr_texts[:5]
-                        if t.get("text")
-                    )
-                    ocr_text_block = f'<div style="font-size:11px;color:#9ea7be;margin-bottom:6px;">OCR texts: {ocr_text_preview}</div>'
-                else:
-                    ocr_text_block = '<div style="font-size:11px;color:#9ea7be;margin-bottom:6px;">OCR texts: none</div>'
-
                 tooltip_pos = "below" if top_pct < 20 else "above"
                 overlay_divs += f"""
                 <div class="det-box" style="
@@ -836,20 +793,8 @@ with tab_single:
                             <span style="color:#9ea7be;font-weight:400;"> &middot; RF-DETR {box["det_conf"]:.2f}</span>
                         </div>
                         {brand_lines}
-                        <div style="margin-top:8px;border-top:1px solid rgba(255,255,255,0.12);padding-top:8px;">
-                            {ocr_text_block}
-                            <div style="font-size:11px;font-weight:700;color:#8b9aff;margin-bottom:6px;">OCR brand scores</div>
-                            {ocr_brand_lines}
-                        </div>
                     </div>
                 </div>"""
-
-            # OCR-only brands note
-            ocr_indep = result.get("ocr_independent", [])
-            ocr_note = ""
-            if ocr_indep:
-                ocr_items = ", ".join(f'{b["brand"].replace("_"," ")} ({b["confidence"]:.2f})' for b in ocr_indep[:5])
-                ocr_note = f'<div class="ocr-note">OCR-only detections (no RF-DETR box): {ocr_items}</div>'
 
             interactive_html = f"""<!DOCTYPE html>
 <html><head><meta charset="utf-8"><style>
@@ -934,22 +879,11 @@ body {{ background:transparent; font-family: -apple-system, BlinkMacSystemFont, 
 .det-box:hover .det-tooltip {{
     display: block;
 }}
-.ocr-note {{
-    margin-top: 8px;
-    padding: 8px 12px;
-    background: rgba(99,102,241,0.1);
-    border-radius: 8px;
-    border: 1px solid rgba(99,102,241,0.2);
-    font-size: 12px;
-    color: #8b9aff;
-    line-height: 1.5;
-}}
 </style></head><body>
 <div class="det-container">
     <img src="data:image/jpeg;base64,{img_b64}" alt="detection result" />
     {overlay_divs}
 </div>
-{ocr_note}
 <script>
 (function() {{
     var img = document.querySelector('.det-container img');
@@ -1028,13 +962,6 @@ body {{ background:transparent; font-family: -apple-system, BlinkMacSystemFont, 
                             "Det conf": b["det_conf"],
                             "Top brand": top_brand.replace("_", " "),
                             "Brand conf": round(top_conf, 3),
-                        "Top OCR brand": (
-                            (b.get("ocr_brand_scores", [{}])[0].get("brand", "-") if b.get("ocr_brand_scores") else "-")
-                            .replace("_", " ")
-                        ),
-                        "Top OCR conf": (
-                            round(b.get("ocr_brand_scores", [{}])[0].get("confidence", 0.0), 3) if b.get("ocr_brand_scores") else 0.0
-                        ),
                         })
                     st.dataframe(pd.DataFrame(box_rows), width="stretch", hide_index=True)
                 else:

@@ -237,8 +237,14 @@ def train_classifier(args):
         torch.tensor(X_val, dtype=torch.float32),
         torch.tensor(y_val, dtype=torch.long),
     )
-    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False)
+    dl_workers = 8 if device == "cuda" else 0
+    dl_pin = device == "cuda"
+    train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
+                              num_workers=dl_workers, pin_memory=dl_pin,
+                              persistent_workers=(dl_workers > 0))
+    val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
+                            num_workers=dl_workers, pin_memory=dl_pin,
+                            persistent_workers=(dl_workers > 0))
 
     # 5. Train classifier head
     classifier = BrandClassifier(EMBED_DIM, num_classes).to(device)

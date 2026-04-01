@@ -14,7 +14,7 @@ python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null \
 # Install remaining deps
 pip install --extra-index-url https://download.pytorch.org/whl/cu124 -r requirements.txt || true
 # Extras not in requirements.txt
-pip install scikit-learn easyocr openpyxl boto3 python-dotenv
+pip install scikit-learn openpyxl boto3 python-dotenv
 # Verify critical packages -- fail hard if torch/CUDA missing
 python -c "import sklearn; import torch; assert torch.cuda.is_available(), 'CUDA not available after install'; print(f'torch={torch.__version__} cuda={torch.cuda.is_available()} sklearn OK')"
 

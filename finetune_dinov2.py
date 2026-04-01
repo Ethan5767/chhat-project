@@ -242,14 +242,16 @@ def train(args):
     train_dataset = ReferenceDataset(train_paths, train_labels, processor, augment=True)
     val_dataset = ReferenceDataset(val_paths, val_labels, processor, augment=False)
 
-    num_workers = 4 if device == "cuda" else 0
+    num_workers = 8 if device == "cuda" else 0
     use_pin = device == "cuda"
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True,
                               num_workers=num_workers, pin_memory=use_pin,
-                              persistent_workers=(num_workers > 0))
+                              persistent_workers=(num_workers > 0),
+                              prefetch_factor=2 if num_workers > 0 else None)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size, shuffle=False,
                             num_workers=num_workers, pin_memory=use_pin,
-                            persistent_workers=(num_workers > 0))
+                            persistent_workers=(num_workers > 0),
+                            prefetch_factor=2 if num_workers > 0 else None)
 
     # 5. Optimizer - lower LR for backbone, higher for head
     backbone_params = [p for n, p in model.named_parameters() if p.requires_grad and "head" not in n]
