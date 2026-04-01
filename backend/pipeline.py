@@ -479,7 +479,27 @@ def load_index(packaging_type: str = "pack"):
     return classifier, labels
 
 
+# Image cache directory -- set by run_pipeline or externally before processing
+IMAGE_CACHE_DIR: Optional[Path] = None
+
+
+def _extract_image_id(url: str) -> Optional[str]:
+    """Extract the ID parameter from an Ipsos image URL."""
+    m = re.search(r'[?&]ID=(\d+)', url, re.IGNORECASE)
+    return m.group(1) if m else None
+
+
 def download_image(url: str) -> Optional[Image.Image]:
+    # Check local cache first
+    if IMAGE_CACHE_DIR is not None:
+        img_id = _extract_image_id(url)
+        if img_id:
+            cached_path = IMAGE_CACHE_DIR / f"{img_id}.jpg"
+            if cached_path.exists():
+                try:
+                    return Image.open(cached_path).convert("RGB")
+                except Exception:
+                    pass  # fall through to network download
     try:
         response = requests.get(url, timeout=DOWNLOAD_TIMEOUT)
         response.raise_for_status()
@@ -912,8 +932,62 @@ def _download_row_images(
     return results
 
 
+def _process_single_row(row, url_columns, id_col, df_columns, rfdetr_model, processor, model, device, index, labels, build_q12_row, images=None):
+    """Process a single row: download images (if not prefetched), detect brands, return result dict."""
+    try:
+        if images is None:
+            images = _download_row_images(row, url_columns)
+
+        all_products: dict[str, float] = {}
+        for col in url_columns:
+            col_name = str(col)
+            image = images.get(col_name)
+            if image is None:
+                continue
+            col_best = _detect_brands_from_image(
+                image=image, rfdetr_model=rfdetr_model,
+                processor=processor, model=model,
+                device=device, index=index, labels=labels,
+            )
+            for product, conf in col_best.items():
+                if conf >= MIN_OUTPUT_CONFIDENCE:
+                    if conf > all_products.get(product, 0.0):
+                        all_products[product] = conf
+
+        detected = [p for p, _ in sorted(all_products.items(), key=lambda x: -x[1])]
+        q12_row = build_q12_row(detected)
+        result_row = {"Respondent.Serial": row[id_col], "Q6": ""}
+        result_row.update(q12_row)
+
+        photo_cols = [c for c in df_columns if c in url_columns or
+                      any(k in str(c).lower() for k in ("q30", "q33", "photo", "link", "image"))]
+        for col in photo_cols:
+            col_name = str(col)
+            result_row[col_name] = row[col] if not pd.isna(row[col]) else ""
+
+        if all_products:
+            avg_conf = sum(all_products.values()) / len(all_products)
+            result_row["overall_confidence"] = round(avg_conf, 3)
+        else:
+            result_row["overall_confidence"] = 0.0
+
+    except Exception as exc:
+        logger.error("Row failed: %s", exc, exc_info=True)
+        result_row = {"Respondent.Serial": row[id_col], "Q6": "", "overall_confidence": 0.0}
+
+    return result_row
+
+
+# Number of rows to prefetch images for while GPU processes current row
+PREFETCH_AHEAD = 4
+
+
 def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]] = None) -> Path:
-    """Process a CSV of image URLs and output brand/product detection in Q12A/Q12B format."""
+    """Process a CSV of image URLs and output brand/product detection in Q12A/Q12B format.
+
+    Optimization: prefetches images for upcoming rows in background threads while
+    the GPU processes the current row, overlapping network I/O with GPU compute.
+    """
     try:
         from .output_format import build_q12_row, get_output_columns
     except ImportError:
@@ -931,6 +1005,16 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
     index = classifier
 
     csv_path = Path(csv_path)
+
+    # Auto-detect image cache: check for image_cache/ next to the CSV
+    global IMAGE_CACHE_DIR
+    candidate_cache = csv_path.parent / "image_cache"
+    if candidate_cache.is_dir() and any(candidate_cache.glob("*.jpg")):
+        IMAGE_CACHE_DIR = candidate_cache
+        logger.info("Image cache found: %s (%d files)", candidate_cache, len(list(candidate_cache.glob("*.jpg"))))
+    else:
+        logger.info("No image cache found, will download from network")
+
     df = pd.read_csv(csv_path)
     original_len = len(df)
     url_columns = get_url_columns(df)
@@ -960,65 +1044,56 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
     def _flush(rows):
         pd.DataFrame(rows).to_csv(out_path, index=False, encoding="utf-8-sig")
 
+    # Prefetch: submit image downloads for upcoming rows in a background pool
+    prefetch_pool = ThreadPoolExecutor(max_workers=PREFETCH_AHEAD, thread_name_prefix="prefetch")
+    prefetch_futures: dict[int, any] = {}
+
+    def _submit_prefetch(row_idx):
+        if row_idx < process_len and row_idx not in prefetch_futures:
+            row = df.iloc[row_idx]
+            prefetch_futures[row_idx] = prefetch_pool.submit(_download_row_images, row, url_columns)
+
+    # Seed the prefetch queue
+    for i in range(start_row, min(start_row + PREFETCH_AHEAD, process_len)):
+        _submit_prefetch(i)
+
     for row_idx in range(start_row, process_len):
         row = df.iloc[row_idx]
-        try:
-            images = _download_row_images(row, url_columns)
 
-            # Collect all detected products across all images for this row
-            all_products: dict[str, float] = {}
-            for col in url_columns:
-                col_name = str(col)
-                image = images.get(col_name)
-                if image is None:
-                    continue
-                col_best = _detect_brands_from_image(
-                    image=image, rfdetr_model=rfdetr_model,
-                    processor=processor, model=model,
-                    device=device, index=index, labels=labels,
-                )
-                for product, conf in col_best.items():
-                    if conf >= MIN_OUTPUT_CONFIDENCE:
-                        if conf > all_products.get(product, 0.0):
-                            all_products[product] = conf
+        # Get prefetched images or download synchronously as fallback
+        images = None
+        if row_idx in prefetch_futures:
+            try:
+                images = prefetch_futures.pop(row_idx).result(timeout=120)
+            except Exception:
+                images = None  # will re-download in _process_single_row
+        # Clean up any other consumed futures
+        for k in list(prefetch_futures.keys()):
+            if k < row_idx:
+                prefetch_futures.pop(k, None)
 
-            # Sort by confidence and get product names
-            detected = [p for p, _ in sorted(all_products.items(), key=lambda x: -x[1])]
+        # Submit prefetch for next rows
+        for i in range(row_idx + 1, min(row_idx + 1 + PREFETCH_AHEAD, process_len)):
+            _submit_prefetch(i)
 
-            # Build Q12A/Q12B formatted row
-            q12_row = build_q12_row(detected)
-            result_row = {"Respondent.Serial": row[id_col], "Q6": ""}
-            result_row.update(q12_row)
-
-            # Preserve all photo URL columns from original CSV (not just detected ones)
-            photo_cols = [c for c in df.columns if c in url_columns or
-                          any(k in str(c).lower() for k in ("q30", "q33", "photo", "link", "image"))]
-            for col in photo_cols:
-                col_name = str(col)
-                result_row[col_name] = row[col] if not pd.isna(row[col]) else ""
-
-            # Overall confidence: average of all detected product confidences
-            if all_products:
-                avg_conf = sum(all_products.values()) / len(all_products)
-                result_row["overall_confidence"] = round(avg_conf, 3)
-            else:
-                result_row["overall_confidence"] = 0.0
-
-        except Exception as exc:
-            logger.error("Row %d failed: %s", row_idx, exc, exc_info=True)
-            result_row = {"Respondent.Serial": row[id_col], "Q6": "", "overall_confidence": 0.0}
-
+        result_row = _process_single_row(
+            row, url_columns, id_col, df.columns, rfdetr_model,
+            processor, model, device, index, labels, build_q12_row, images,
+        )
         completed_rows.append(result_row)
 
         # Free image/tensor memory from this row
         images = None
-        gc.collect()
+        if (row_idx + 1) % 100 == 0:
+            gc.collect()
 
         if (row_idx + 1) % SAVE_INTERVAL == 0 or row_idx + 1 == process_len:
             _flush(completed_rows)
 
         if progress_cb:
             progress_cb(row_idx + 1, process_len, f"Processed row {row_idx + 1}/{process_len}")
+
+    prefetch_pool.shutdown(wait=False)
 
     # NOT_PROCESSED markers for remaining rows
     if BATCH_MODE is not None:

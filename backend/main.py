@@ -356,7 +356,7 @@ def _tar_backend_references_for_runpod(refs_tar: Path) -> subprocess.CompletedPr
             return r0
 
         return subprocess.run(
-            ["tar", "-czf", str(refs_tar), "-C", str(staging_root), "references"],
+            ["tar", "-czf", str(refs_tar), "--owner=0", "--group=0", "-C", str(staging_root), "references"],
             capture_output=True,
             text=True,
             timeout=900,
@@ -580,9 +580,16 @@ def _paramiko_proxy_upload(pod_id: str, pod_host_id: str, key: str,
     bucket = _do_spaces_bucket()
     try:
         s3 = _do_spaces_client()
+        from boto3.s3.transfer import TransferConfig
         file_size = Path(local).stat().st_size
+        # Use larger multipart chunks for big files (image cache can be 10+ GB)
+        xfer_config = TransferConfig(
+            multipart_threshold=64 * 1024 * 1024,   # 64 MB
+            multipart_chunksize=64 * 1024 * 1024,   # 64 MB
+            max_concurrency=10,
+        )
         _log_runpod(f"  DO Spaces: uploading {Path(local).name} ({file_size / 1e6:.1f} MB)…")
-        s3.upload_file(local, bucket, s3_key)
+        s3.upload_file(local, bucket, s3_key, Config=xfer_config)
         url = s3.generate_presigned_url(
             "get_object", Params={"Bucket": bucket, "Key": s3_key}, ExpiresIn=7200,
         )
@@ -748,27 +755,60 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
     try:
         update_progress(job_id, 1, 100, "Creating RunPod GPU pod...")
 
-        # 1. Create pod
-        pod = _runpod_gql(api_key, """
-            mutation CreatePod($input: PodFindAndDeployOnDemandInput!) {
-                podFindAndDeployOnDemand(input: $input) { id costPerHr machine { podHostId } }
-            }""", {"input": {
-                "name": f"batch-{job_id[:8]}",
-                "templateId": RUNPOD_TEMPLATE,
-                "gpuTypeId": RUNPOD_GPU_ID,
-                "cloudType": "COMMUNITY",
-                "containerDiskInGb": 20,
-                "volumeInGb": 50,
-                "volumeMountPath": "/workspace",
-                "gpuCount": 1,
-                "ports": "22/tcp",
-            }})["podFindAndDeployOnDemand"]
+        # 1. Create pod (multi-GPU/cloud fallback like training jobs)
+        gpu_candidates = _classifier_gpu_candidates()
+        cloud_types = _classifier_cloud_types()
+        vol_gb = _classifier_volume_gb()
+        deploy_rounds, deploy_pause = _classifier_deploy_retry_settings()
+        # Prefer A100 for batch inference, then fall back to classifier chain
+        batch_gpu_chain = [RUNPOD_GPU_ID] + [g for g in gpu_candidates if g != RUNPOD_GPU_ID]
+        pod = None
+        gpu_id = batch_gpu_chain[0]
+        used_cloud = None
+        for round_idx in range(deploy_rounds):
+            if round_idx > 0:
+                _log_runpod(f"gpu-batch: capacity retry {round_idx + 1}/{deploy_rounds} (waiting {deploy_pause}s)…")
+                import time as time_module
+                time_module.sleep(deploy_pause)
+            for try_cloud in cloud_types:
+                for try_gpu in batch_gpu_chain:
+                    try:
+                        _log_runpod(f"gpu-batch: try round={round_idx + 1} cloud={try_cloud} gpu={try_gpu}…")
+                        pod = _runpod_gql(api_key, """
+                            mutation CreatePod($input: PodFindAndDeployOnDemandInput!) {
+                                podFindAndDeployOnDemand(input: $input) { id costPerHr machine { podHostId } }
+                            }""", {"input": {
+                                "name": f"batch-{job_id[:8]}",
+                                "templateId": RUNPOD_TEMPLATE,
+                                "gpuTypeId": try_gpu,
+                                "cloudType": try_cloud,
+                                "containerDiskInGb": 20,
+                                "volumeInGb": vol_gb,
+                                "volumeMountPath": "/workspace",
+                                "gpuCount": 1,
+                                "ports": "22/tcp",
+                            }})["podFindAndDeployOnDemand"]
+                        gpu_id = try_gpu
+                        used_cloud = try_cloud
+                        break
+                    except RuntimeError as exc:
+                        _log_runpod(f"gpu-batch: cloud={try_cloud} gpu={try_gpu} failed: {exc}")
+                        continue
+                if pod is not None:
+                    break
+            if pod is not None:
+                break
+        if pod is None:
+            raise RuntimeError(
+                f"No RunPod capacity for batch after {deploy_rounds} round(s). "
+                "Try later or set RUNPOD_CLASSIFIER_GPU_ID to an available GPU.",
+            )
         pod_id = pod["id"]
         pod_host_id = (pod.get("machine") or {}).get("podHostId", "")
         if not pod_host_id:
             _log_runpod("gpu-batch: WARNING podHostId empty -- SSH proxy disabled, falling back to direct IP")
         cost_hr = pod.get("costPerHr", 0)
-        _log_runpod(f"gpu-batch: pod created id={pod_id} host={pod_host_id} ~${cost_hr}/hr template={RUNPOD_TEMPLATE} gpu={RUNPOD_GPU_ID}")
+        _log_runpod(f"gpu-batch: pod created id={pod_id} host={pod_host_id} ~${cost_hr}/hr template={RUNPOD_TEMPLATE} gpu={gpu_id}")
         update_progress(job_id, 5, 100, f"Pod created ({pod_id[:8]}..., ${cost_hr}/hr). Waiting for SSH...")
 
         # 2. Wait for SSH port
@@ -889,6 +929,47 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
                 raise RuntimeError(f"Model upload failed: {Path(local_p).name}: {(up.stderr or '')[:200]}")
             _log_runpod(f"gpu-batch: uploaded {Path(local_p).name}")
 
+        # 5c. Upload image cache if available (pre-downloaded images for faster processing)
+        # Check canonical location (next to CSV in UPLOADS_DIR), then fallback to backend/uploads/
+        local_cache_dir = csv_path.parent / "image_cache"
+        if not (local_cache_dir.is_dir() and any(local_cache_dir.glob("*.jpg"))):
+            fallback_cache = _BACKEND_ROOT / "uploads" / "image_cache"
+            if fallback_cache.is_dir() and any(fallback_cache.glob("*.jpg")):
+                local_cache_dir = fallback_cache
+                _log_runpod(f"gpu-batch: using fallback cache at {fallback_cache}")
+        if local_cache_dir.is_dir() and any(local_cache_dir.glob("*.jpg")):
+            cache_files = list(local_cache_dir.glob("*.jpg"))
+            _log_runpod(f"gpu-batch: image cache found ({len(cache_files)} images), creating tarball…")
+            import tarfile
+            import tempfile
+            tar_path = Path(tempfile.gettempdir()) / "image_cache.tar.gz"
+            with tarfile.open(tar_path, "w:gz") as tar:
+                for img_file in cache_files:
+                    tar.add(str(img_file), arcname=f"image_cache/{img_file.name}")
+            tar_size_mb = tar_path.stat().st_size / (1024 * 1024)
+            _log_runpod(f"gpu-batch: uploading image cache tarball ({tar_size_mb:.0f} MB)…")
+            _ssh_cmd(ssh_host, ssh_port, ssh_key,
+                     "mkdir -p /workspace/chhat-project/backend/uploads",
+                     timeout=15, pod_id=pod_id, pod_host_id=pod_host_id)
+            up = _scp_to(ssh_host, ssh_port, ssh_key, str(tar_path),
+                         "/workspace/chhat-project/backend/uploads/image_cache.tar.gz",
+                         timeout=7200, pod_id=pod_id, pod_host_id=pod_host_id)
+            if up.returncode != 0:
+                _log_runpod(f"gpu-batch: WARNING image cache upload failed, will download from network: {(up.stderr or '')[:200]}")
+            else:
+                # Extract on pod
+                ext = _ssh_cmd(ssh_host, ssh_port, ssh_key,
+                               "cd /workspace/chhat-project/backend/uploads && "
+                               "tar --no-same-owner -xzf image_cache.tar.gz && "
+                               "rm image_cache.tar.gz && "
+                               "ls image_cache/ | wc -l",
+                               timeout=600, pod_id=pod_id, pod_host_id=pod_host_id)
+                _log_runpod(f"gpu-batch: image cache extracted on pod ({(ext.stdout or '').strip()} files)")
+            # Clean up local tarball
+            tar_path.unlink(missing_ok=True)
+        else:
+            _log_runpod("gpu-batch: no image cache found, pod will download from network")
+
         # 6. Kill zombie GPU processes and verify CUDA before pipeline
         _log_runpod("gpu-batch: clearing zombie GPU processes and verifying CUDA…")
         _ssh_cmd(
@@ -918,7 +999,7 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
 
         r = _ssh_cmd(ssh_host, ssh_port, ssh_key,
                       f"cd /workspace/chhat-project && source .venv/bin/activate && "
-                      f"CUDA_VISIBLE_DEVICES=0 CUDA_LAUNCH_BLOCKING=1 "
+                      f"PYTORCH_JIT=0 CUDA_VISIBLE_DEVICES=0 CUDA_LAUNCH_BLOCKING=1 "
                       f"python -c \"from backend.pipeline import run_pipeline; "
                       f"out = run_pipeline('{remote_csv}'); "
                       f"print(f'RESULT_PATH={{out}}')\"",
@@ -1177,7 +1258,7 @@ def run_dinov2_finetune_gpu_job(
         un = _ssh_cmd(
             ssh_host, ssh_port, ssh_key,
             "cd /workspace/chhat-project/backend && rm -rf references && mkdir -p references && "
-            "tar xzf references_upload.tar.gz && rm -f references_upload.tar.gz",
+            "tar xzf references_upload.tar.gz --no-same-owner && rm -f references_upload.tar.gz",
             timeout=180, pod_id=pod_id, pod_host_id=pod_host_id,
         )
         if un.returncode != 0:
@@ -1527,7 +1608,7 @@ def run_classifier_training_runpod_job(
         un = _ssh_cmd(
             ssh_host, ssh_port, ssh_key,
             "cd /workspace/chhat-project/backend && rm -rf references && mkdir -p references && "
-            "tar xzf references_upload.tar.gz && rm -f references_upload.tar.gz",
+            "tar xzf references_upload.tar.gz --no-same-owner && rm -f references_upload.tar.gz",
             timeout=180, pod_id=pod_id, pod_host_id=pod_host_id,
         )
         if un.returncode != 0:
@@ -1992,7 +2073,7 @@ def run_rfdetr_training_runpod_job(
         progress_remote = f"/tmp/rfdetr_progress_{job_id}.json"
         train_cmd = (
             f"cd /workspace/chhat-project && source .venv/bin/activate && "
-            f"CUDA_VISIBLE_DEVICES=0 "
+            f"PYTORCH_JIT=0 CUDA_VISIBLE_DEVICES=0 CUDA_LAUNCH_BLOCKING=1 "
             f"python train.py --epochs {epochs} --batch-size {batch_size} "
             f"--lr {lr} --grad-accum-steps {grad_accum_steps} --patience {patience} "
             f"--progress-file {progress_remote}"
