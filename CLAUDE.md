@@ -135,3 +135,35 @@ These issues were discovered and fixed. Document here to avoid repeating them:
 - ALL scripts must respect this: `pipeline.py`, `brand_classifier.py`, `finetune_dinov2.py`, `brand_registry.py`
 - RunPod pods don't set CHHAT_DATA_ROOT; they use the default `PROJECT_ROOT / "backend"` which is correct for the pod's filesystem
 - Never hardcode paths to `backend/references/` or `backend/classifier_model/`; always use the `_DATA_ROOT` variable
+
+### RunPod GPU Batch Processing (`run_pipeline_gpu_job`)
+- **Must upload model weights**: Pod needs classifier (`best_classifier.pth`, `class_mapping.json`), DINOv2 finetuned (`dinov2_finetuned_full.pth`), and RF-DETR checkpoint (`checkpoint_best_ema.pth`)
+- **Upload to file paths not directories**: `_scp_to()` via DO Spaces requires full file path, not directory (curl -o /path/dir/ fails)
+- **Segfault from optimize_for_inference**: `torch.compile` (used by `optimize_for_inference()`) segfaults on RunPod A100s. Skip it when on RunPod.
+- **RunPod detection**: `RUNPOD_POD_ID` env var is NOT set on generic RunPod templates. Detect via `os.path.exists("/workspace")` instead.
+- **Python -c quoting**: Use escaped double quotes pattern `python -c \"...\"` with single quotes for string literals inside. Mixed quoting causes shell parsing failures.
+- **Timeout for large batches**: 12k rows takes ~8-10 hours. Set timeout to 48h (`48 * 3600`), not 2h.
+- **CUDA_LAUNCH_BLOCKING=1**: Add to pipeline command for proper error traces instead of bare segfaults.
+- **tar --no-same-owner**: Windows-created tar archives have uid 197609; Linux tar fails to set ownership. Use `--no-same-owner` on extraction.
+- **tar --owner=0 --group=0**: Strip Windows UIDs when creating archives on the server.
+
+### RunPod RF-DETR Training (`run_rfdetr_training_runpod_job`)
+- Must match DINOv2 flow structure exactly: `volumeMountPath: "/workspace"`, `ports: "22/tcp"` in pod creation
+- SSH probe: 20 attempts with `SSH_OK` marker, timeout=60, 15s between
+- Bootstrap check: use `test -f train.py && echo OK || echo MISSING` (not checking .venv)
+- Pod creation loop order: cloud -> gpu (not gpu -> cloud)
+- Check `pod is not None` (not truthy string check on `pod_id`)
+- Install `rfdetr[train,loggers]` as separate step after bootstrap (not in requirements.txt)
+- Progress polling every 12s with regex JSON extraction
+
+### RunPod SSH Key
+- SSH key: `~/.ssh/runpod_ed25519` on the server
+- Must be registered in RunPod account settings (Settings > SSH Public Keys)
+- When server IP changes, the key is already on the server but may need re-registering in RunPod dashboard
+- Pod SSH auth uses paramiko through `ssh.runpod.io` proxy with `podHostId` as username
+
+### URL Column Detection (`get_url_columns`)
+- Client CSVs have sparse image columns (some only 2-5% of rows have URLs)
+- Old 30% threshold missed most image columns; lowered to 1 URL in first 50 rows
+- Also checks first row for descriptor text like "Photo Link" or "Q32 Photo Link"
+- Must preserve ALL Q30/Q33 columns in output even if not detected as URL columns
