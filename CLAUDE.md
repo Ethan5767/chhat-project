@@ -70,6 +70,8 @@ What works:
 
 ## RunPod Pod Reuse
 
+- **NEVER create or destroy RunPod pods.** Always reuse the existing pod by stopping and resuming it. If a pod is stopped, resume it. If it is running, use it as-is. Only create a new pod if no pod exists at all.
+- **NEVER terminate a pod** unless the user explicitly asks to terminate a specific pod by ID
 - Pods are stopped (not terminated) after jobs to preserve /workspace volume
 - Pod registry at `_DATA_ROOT / "runpod_pods.json"` tracks reusable pods per job type (batch, dinov2, classifier, rfdetr)
 - On next job, try `podResume` first (skip bootstrap + weight upload), fall back to create-new if GPU unavailable

@@ -362,6 +362,15 @@ def _get_stopped_pod(job_type: str) -> dict | None:
     return None
 
 
+def _get_reusable_pod(job_type: str) -> dict | None:
+    """Get any registered pod (running or stopped) for the given job type."""
+    reg = _load_pod_registry()
+    entry = reg.get(job_type)
+    if entry and entry.get("pod_id"):
+        return entry
+    return None
+
+
 def _log_runpod(msg: str) -> None:
     """Console log for RunPod / GPU jobs (visible in journalctl for systemd)."""
     print(f"[runpod] {msg}", flush=True)
@@ -494,28 +503,52 @@ def _runpod_resume(api_key: str, pod_id: str, gpu_count: int = 1) -> dict | None
 
 
 def _try_resume_pod(api_key: str, job_type: str, job_id: str, ssh_key: str) -> tuple[str, str, str, str] | None:
-    """Try to resume a stopped pod for this job type.
+    """Try to reuse an existing pod for this job type (running or stopped).
 
     Returns (pod_id, pod_host_id, ssh_host, ssh_port) if successful, None if not.
     On failure, unregisters the stale pod entry.
     """
     import time as _time
 
-    entry = _get_stopped_pod(job_type)
+    # First check for any registered pod (running or stopped)
+    entry = _get_reusable_pod(job_type)
     if not entry:
         return None
 
     pod_id = entry["pod_id"]
-    _log_runpod(f"[{job_id}] Found stopped pod {pod_id} for {job_type}, attempting resume...")
+    pod_status = entry.get("status", "unknown")
 
-    resumed = _runpod_resume(api_key, pod_id)
-    if not resumed:
-        _log_runpod(f"[{job_id}] Resume failed, will create new pod")
+    # Query RunPod API for actual pod state
+    try:
+        live = _runpod_gql(api_key, f'query {{ pod(input: {{ podId: "{pod_id}" }}) {{ id desiredStatus runtime {{ uptimeInSeconds ports {{ ip publicPort privatePort type }} }} machine {{ podHostId }} }} }}')
+        live_pod = live.get("pod")
+    except Exception:
+        live_pod = None
+
+    if not live_pod:
+        _log_runpod(f"[{job_id}] Registered pod {pod_id} no longer exists, clearing registry")
         _unregister_pod(job_type)
         return None
 
-    # Update pod_host_id (may change on resume)
-    new_host_id = resumed.get("machine", {}).get("podHostId", entry.get("pod_host_id"))
+    live_status = (live_pod.get("desiredStatus") or "").upper()
+    new_host_id = (live_pod.get("machine") or {}).get("podHostId", entry.get("pod_host_id"))
+
+    if live_status == "RUNNING":
+        # Pod is already running -- reuse directly (no resume needed)
+        _log_runpod(f"[{job_id}] Found RUNNING pod {pod_id} for {job_type}, reusing directly")
+    elif live_status == "EXITED":
+        # Pod is stopped -- resume it
+        _log_runpod(f"[{job_id}] Found stopped pod {pod_id} for {job_type}, attempting resume...")
+        resumed = _runpod_resume(api_key, pod_id)
+        if not resumed:
+            _log_runpod(f"[{job_id}] Resume failed, will create new pod")
+            _unregister_pod(job_type)
+            return None
+        new_host_id = (resumed.get("machine") or {}).get("podHostId", new_host_id)
+    else:
+        _log_runpod(f"[{job_id}] Pod {pod_id} in unexpected state {live_status}, clearing registry")
+        _unregister_pod(job_type)
+        return None
 
     # Wait for SSH port to become available
     _log_runpod(f"[{job_id}] Pod resumed, waiting for SSH...")
