@@ -675,6 +675,19 @@ with tab_single:
     if not index_exists:
         st.warning("No brand classifier found. Run `python brand_classifier.py` first or use the **Reference Index** tab to train one.")
 
+    _MODEL_OPTIONS = {
+        "RF-DETR Medium (default)": "medium",
+        "RF-DETR Large (704px, higher accuracy)": "large",
+        "RF-DETR Base (560px, faster)": "base",
+    }
+    selected_model_label = st.selectbox(
+        "RF-DETR Model",
+        options=list(_MODEL_OPTIONS.keys()),
+        index=0,
+        key="rfdetr_model_select",
+    )
+    selected_model_size = _MODEL_OPTIONS[selected_model_label]
+
     img_file = st.file_uploader(
         "Upload an image",
         type=["jpg", "jpeg", "png", "webp", "bmp"],
@@ -728,7 +741,12 @@ with tab_single:
 
         try:
             files = {"image_file": (img_file.name, img_bytes, img_file.type or "image/jpeg")}
-            resp = requests.post(f"{BACKEND_URL}/detect-single", files=files, timeout=120)
+            resp = requests.post(
+                f"{BACKEND_URL}/detect-single",
+                files=files,
+                data={"model_size": selected_model_size},
+                timeout=120,
+            )
             resp.raise_for_status()
             result = resp.json()
             anim_box.empty()

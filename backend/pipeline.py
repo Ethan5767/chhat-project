@@ -51,6 +51,7 @@ CLASSIFIER_TOP_K = 5
 _dino_processor = None
 _dino_model = None
 _rfdetr_model = None
+_rfdetr_models: dict[str, object] = {}  # model_size -> loaded model instance
 # Per-type classifiers: {"pack": (classifier, mapping), "box": (classifier, mapping)}
 _classifiers: dict[str, tuple] = {}
 # Legacy single-classifier aliases (for backward compat)
@@ -181,35 +182,55 @@ def _find_best_checkpoint() -> Optional[Path]:
     return None
 
 
-def load_rfdetr():
-    global _rfdetr_model
-    if _rfdetr_model is not None:
+def load_rfdetr(model_size: str = "medium"):
+    """Load an RF-DETR model by size. Caches each size separately.
+
+    Args:
+        model_size: One of "base", "medium", "large".
+    """
+    global _rfdetr_model, _rfdetr_models
+    size = model_size.lower().strip()
+    if size not in ("base", "medium", "large"):
+        size = "medium"
+
+    # Return cached model if available
+    if size in _rfdetr_models:
+        _rfdetr_model = _rfdetr_models[size]
         return _rfdetr_model
-    from rfdetr import RFDETRMedium
+
+    from rfdetr import RFDETRBase, RFDETRMedium, RFDETRLarge
+    model_classes = {"base": RFDETRBase, "medium": RFDETRMedium, "large": RFDETRLarge}
+    cls = model_classes[size]
+
     checkpoint = _find_best_checkpoint()
     if checkpoint:
-        logger.info("Loading fine-tuned RF-DETR from %s", checkpoint)
-        _rfdetr_model = RFDETRMedium(pretrain_weights=str(checkpoint))
+        logger.info("Loading fine-tuned RF-DETR-%s from %s", size, checkpoint)
+        model = cls(pretrain_weights=str(checkpoint))
     else:
-        logger.info("No fine-tuned checkpoint found, using pre-trained RF-DETR-M")
-        _rfdetr_model = RFDETRMedium()
+        logger.info("No fine-tuned checkpoint found, using pre-trained RF-DETR-%s", size)
+        model = cls()
+
     # Skip optimize_for_inference on RunPod -- torch.compile can segfault on some CUDA setups
     _is_runpod = os.environ.get("RUNPOD_POD_ID") or os.path.exists("/workspace")
     if not _is_runpod:
         try:
-            _rfdetr_model.optimize_for_inference()
-            logger.info("RF-DETR optimized for inference")
+            model.optimize_for_inference()
+            logger.info("RF-DETR-%s optimized for inference", size)
         except Exception as exc:
-            logger.warning("Could not optimize RF-DETR for inference: %s", exc)
+            logger.warning("Could not optimize RF-DETR-%s for inference: %s", size, exc)
     else:
-        logger.info("RF-DETR: skipping optimize_for_inference on RunPod")
-    return _rfdetr_model
+        logger.info("RF-DETR-%s: skipping optimize_for_inference on RunPod", size)
+
+    _rfdetr_models[size] = model
+    _rfdetr_model = model
+    return model
 
 
 def reload_rfdetr():
     """Force-reload RF-DETR from the latest checkpoint. Call after training completes."""
-    global _rfdetr_model
+    global _rfdetr_model, _rfdetr_models
     _rfdetr_model = None
+    _rfdetr_models.clear()
     return load_rfdetr()
 
 

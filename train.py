@@ -11,7 +11,7 @@ import random
 import shutil
 from pathlib import Path
 
-from rfdetr import RFDETRMedium
+from rfdetr import RFDETRBase, RFDETRMedium, RFDETRLarge
 
 DATASET_DIR = Path(__file__).resolve().parent / "datasets" / "cigarette_packs"
 OUTPUT_DIR = Path(__file__).resolve().parent / "runs"
@@ -132,6 +132,7 @@ def main():
     parser.add_argument("--grad-accum-steps", type=int, default=4)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--num-workers", type=int, default=8)
+    parser.add_argument("--model-size", type=str, default="medium", choices=["base", "medium", "large"])
     parser.add_argument("--progress-file", type=str, default="")
     args = parser.parse_args()
 
@@ -162,7 +163,8 @@ def main():
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-    model = RFDETRMedium()
+    _model_classes = {"base": RFDETRBase, "medium": RFDETRMedium, "large": RFDETRLarge}
+    model = _model_classes[args.model_size]()
 
     # Write initial progress
     if args.progress_file:

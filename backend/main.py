@@ -2183,6 +2183,7 @@ def run_rfdetr_training_runpod_job(
     lr: float = 1e-4,
     grad_accum_steps: int = 4,
     patience: int = 10,
+    model_size: str = "medium",
 ):
     """Train RF-DETR on a RunPod GPU pod. Mirrors run_dinov2_finetune_gpu_job structure exactly."""
     import time as time_module
@@ -2451,7 +2452,7 @@ def run_rfdetr_training_runpod_job(
             f"CUDA_VISIBLE_DEVICES=0 "
             f"python train.py --epochs {epochs} --batch-size {batch_size} "
             f"--lr {lr} --grad-accum-steps {grad_accum_steps} --patience {patience} "
-            f"--num-workers 8 "
+            f"--model-size {model_size} --num-workers 8 "
             f"--progress-file {progress_remote}"
         )
 
@@ -2702,7 +2703,7 @@ def index_status():
 
 
 @app.post("/detect-single")
-async def detect_single(image_file: UploadFile = File(...)):
+async def detect_single(image_file: UploadFile = File(...), model_size: str = Form("medium")):
     """Run detection on a single image. Returns per-box brand assignments for interactive UI."""
     from PIL import Image
     import base64
@@ -2730,7 +2731,7 @@ async def detect_single(image_file: UploadFile = File(...)):
     device = get_device()
     index, labels = load_index()
     processor, model = load_dino(device)
-    rfdetr_model = load_rfdetr()
+    rfdetr_model = load_rfdetr(model_size=model_size)
     img_w, img_h = pil_img.size
 
     # RF-DETR detection
@@ -3877,13 +3878,14 @@ def train_rfdetr_endpoint(
     lr: float = 0.0001,
     grad_accum_steps: int = 4,
     patience: int = 10,
+    model_size: str = "medium",
     roboflow_url: str = "",
     clean_dataset: bool = False,
     version: str = "",
     force: bool = False,
     use_runpod: bool = False,
 ):
-    """Train RF-DETR detection model. use_runpod=true for GPU training on RunPod."""
+    """Train RF-DETR detection model. model_size: base/medium/large. use_runpod=true for GPU training."""
     version = (version or _get_current_training_version()).strip() or DEFAULT_TRAINING_VERSION
     dataset_import = None
     if roboflow_url.strip():
@@ -3936,7 +3938,7 @@ def train_rfdetr_endpoint(
     if use_runpod:
         threading.Thread(
             target=run_rfdetr_training_runpod_job,
-            args=(job_id, epochs, batch_size, lr, grad_accum_steps, patience),
+            args=(job_id, epochs, batch_size, lr, grad_accum_steps, patience, model_size),
             daemon=True,
         ).start()
     else:
@@ -3946,6 +3948,7 @@ def train_rfdetr_endpoint(
             "--lr", str(lr),
             "--grad-accum-steps", str(grad_accum_steps),
             "--patience", str(patience),
+            "--model-size", model_size,
         ]
         threading.Thread(
             target=_run_training_job,
