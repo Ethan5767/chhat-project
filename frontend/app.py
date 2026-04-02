@@ -1108,20 +1108,53 @@ with tab_index:
                                         to_delete.append(fname)
 
                             if to_delete:
-                                if st.button(f"Delete {len(to_delete)} selected", type="secondary", key=f"batch_del_{ref_type}_{picked_internal}"):
-                                    deleted = 0
-                                    for fname in to_delete:
-                                        try:
-                                            resp = requests.delete(f"{BACKEND_URL}/reference-image/{ref_type}/{fname}", timeout=5)
-                                            if resp.status_code == 200:
-                                                deleted += 1
-                                        except Exception:
-                                            pass
-                                    if deleted:
-                                        # Only clear listing cache, not image cache
-                                        _fetch_reference_listing.clear()
-                                        _fetch_brand_hierarchy.clear()
-                                        st.rerun()
+                                action_col1, action_col2 = st.columns(2)
+                                with action_col1:
+                                    if st.button(f"Delete {len(to_delete)} selected", type="secondary", key=f"batch_del_{ref_type}_{picked_internal}"):
+                                        deleted = 0
+                                        for fname in to_delete:
+                                            try:
+                                                resp = requests.delete(f"{BACKEND_URL}/reference-image/{ref_type}/{fname}", timeout=5)
+                                                if resp.status_code == 200:
+                                                    deleted += 1
+                                            except Exception:
+                                                pass
+                                        if deleted:
+                                            _fetch_reference_listing.clear()
+                                            _fetch_brand_hierarchy.clear()
+                                            st.rerun()
+                                with action_col2:
+                                    # Move to another brand/product
+                                    all_targets = []
+                                    for b, prods in sorted(brand_hierarchy.items()):
+                                        for p in prods:
+                                            label = f"{b} / {p['display_name']}"
+                                            all_targets.append((label, p["internal_name"]))
+                                    target_label = st.selectbox(
+                                        "Move selected to:",
+                                        options=["-- Select target --"] + [t[0] for t in all_targets],
+                                        key=f"move_target_{ref_type}_{picked_internal}",
+                                    )
+                                    if target_label != "-- Select target --":
+                                        target_internal = next(t[1] for t in all_targets if t[0] == target_label)
+                                        if st.button(f"Move {len(to_delete)} images", key=f"batch_move_{ref_type}_{picked_internal}"):
+                                            moved = 0
+                                            for fname in to_delete:
+                                                try:
+                                                    resp = requests.post(
+                                                        f"{BACKEND_URL}/reference-image/move",
+                                                        json={"filename": fname, "packaging_type": ref_type, "target_product": target_internal},
+                                                        timeout=5,
+                                                    )
+                                                    if resp.status_code == 200:
+                                                        moved += 1
+                                                except Exception:
+                                                    pass
+                                            if moved:
+                                                _fetch_reference_listing.clear()
+                                                _fetch_brand_hierarchy.clear()
+                                                st.success(f"Moved {moved} images to {target_label}")
+                                                st.rerun()
                     except Exception as exc:
                         st.caption(f"Could not load references: {exc}")
 

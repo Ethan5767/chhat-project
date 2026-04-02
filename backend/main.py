@@ -3320,6 +3320,32 @@ def delete_reference_image(packaging_type: str, filename: str):
     return {"status": "deleted", "packaging_type": packaging_type, "filename": filename}
 
 
+@app.post("/reference-image/move")
+def move_reference_image(body: dict):
+    """Move a reference image to a different product (rename to match target product prefix)."""
+    filename = body.get("filename", "")
+    packaging_type = body.get("packaging_type", "pack")
+    target_product = body.get("target_product", "")
+    if packaging_type not in ("pack", "box"):
+        raise HTTPException(status_code=400, detail="packaging_type must be 'pack' or 'box'")
+    if not filename or not target_product:
+        raise HTTPException(status_code=400, detail="filename and target_product required")
+    refs_dir = _DATA_ROOT / "references" / packaging_type
+    src = refs_dir / filename
+    if not src.exists() or not src.is_file():
+        raise HTTPException(status_code=404, detail="Image not found")
+    if not src.resolve().parent == refs_dir.resolve():
+        raise HTTPException(status_code=400, detail="Invalid path")
+    # Find next available index for target product
+    existing = sorted(refs_dir.glob(f"{target_product}_*.*"))
+    next_idx = len(existing) + 1
+    ext = src.suffix or ".jpg"
+    new_name = f"{target_product}_{next_idx}{ext}"
+    dst = refs_dir / new_name
+    src.rename(dst)
+    return {"status": "moved", "old_filename": filename, "new_filename": new_name, "target_product": target_product}
+
+
 @app.get("/reference-images/{product_name}")
 def list_reference_images(product_name: str, packaging_type: str = "pack"):
     """List all reference image filenames for a product in a packaging type subfolder."""
