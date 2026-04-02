@@ -3346,6 +3346,18 @@ def move_reference_image(body: dict):
     return {"status": "moved", "old_filename": filename, "new_filename": new_name, "target_product": target_product}
 
 
+@app.get("/brand-book-sample/{internal_name}")
+def brand_book_sample(internal_name: str):
+    """Return the first brand book sample image for a product (from the KH Census Brand Book)."""
+    samples_dir = _BACKEND_ROOT / "brand_book_samples"
+    if not samples_dir.exists():
+        raise HTTPException(status_code=404, detail="No brand book samples")
+    candidates = sorted(samples_dir.glob(f"{internal_name}_*.*"))
+    if not candidates:
+        raise HTTPException(status_code=404, detail=f"No sample for {internal_name}")
+    return FileResponse(str(candidates[0]), media_type="image/jpeg")
+
+
 @app.get("/reference-images/{product_name}")
 def list_reference_images(product_name: str, packaging_type: str = "pack"):
     """List all reference image filenames for a product in a packaging type subfolder."""

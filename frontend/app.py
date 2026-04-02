@@ -1139,6 +1139,13 @@ with tab_index:
                                 )
                                 if move_brand != "-- Select brand --" and move_product_display != "-- Select product --":
                                     target_internal = next(p["internal_name"] for p in move_products_list if p["display_name"] == move_product_display)
+                                    # Show brand book sample image for target product
+                                    try:
+                                        sample_resp = requests.get(f"{BACKEND_URL}/brand-book-sample/{target_internal}", timeout=5)
+                                        if sample_resp.status_code == 200:
+                                            st.image(sample_resp.content, caption=f"Brand book: {move_product_display}", width=150)
+                                    except Exception:
+                                        pass
                                     if st.button(f"Move {len(to_delete)} images", key=f"batch_move_{ref_type}_{picked_internal}"):
                                         moved = 0
                                         for fname in to_delete:
@@ -1351,6 +1358,16 @@ with tab_label:
                         index=default_prod_idx,
                         key=f"{crop_key}_product",
                     )
+
+                    # Show brand book sample for selected product
+                    label_internal = product_internals.get(selected_product, "")
+                    if label_internal:
+                        try:
+                            sample_resp = requests.get(f"{BACKEND_URL}/brand-book-sample/{label_internal}", timeout=5)
+                            if sample_resp.status_code == 200:
+                                st.image(sample_resp.content, caption=f"Brand book: {selected_product}", width=120)
+                        except Exception:
+                            pass
 
                     if st.button("Add to references", key=f"{crop_key}_add"):
                         internal_name = product_internals.get(selected_product, "")
