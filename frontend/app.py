@@ -1109,8 +1109,13 @@ with tab_index:
                         else:
                             st.caption(f"{len(filenames)} {ref_type} reference images")
 
-                            # Checkbox select for batch delete
-                            to_delete = []
+                            # Persistent selection across pages
+                            sel_key = f"selected_refs_{ref_type}_{picked_internal}"
+                            if sel_key not in st.session_state:
+                                st.session_state[sel_key] = set()
+                            # Clean out stale selections (files that no longer exist)
+                            st.session_state[sel_key] &= set(filenames)
+
                             PAGE_SIZE = 50
                             page_key = f"ref_page_{ref_type}_{picked_internal}"
                             if page_key not in st.session_state:
@@ -1120,25 +1125,47 @@ with tab_index:
                             start = current_page * PAGE_SIZE
                             page_filenames = filenames[start:start + PAGE_SIZE]
                             if len(filenames) > PAGE_SIZE:
-                                pg_col1, pg_col2, pg_col3 = st.columns([1, 2, 1])
+                                pg_col1, pg_col2, pg_col3, pg_col4 = st.columns([1, 2, 1, 2])
                                 with pg_col1:
                                     if st.button("Prev", key=f"prev_{page_key}", disabled=current_page == 0):
+                                        # Sync checkboxes on current page before navigating
+                                        for _f in page_filenames:
+                                            if st.session_state.get(f"sel_{ref_type}_{_f}", False):
+                                                st.session_state[sel_key].add(_f)
+                                            else:
+                                                st.session_state[sel_key].discard(_f)
                                         st.session_state[page_key] = max(0, current_page - 1)
                                         st.rerun()
                                 with pg_col2:
                                     st.caption(f"Page {current_page + 1}/{total_pages} ({len(filenames)} total)")
                                 with pg_col3:
                                     if st.button("Next", key=f"next_{page_key}", disabled=current_page >= total_pages - 1):
+                                        for _f in page_filenames:
+                                            if st.session_state.get(f"sel_{ref_type}_{_f}", False):
+                                                st.session_state[sel_key].add(_f)
+                                            else:
+                                                st.session_state[sel_key].discard(_f)
                                         st.session_state[page_key] = current_page + 1
                                         st.rerun()
+                                with pg_col4:
+                                    total_selected = len(st.session_state[sel_key])
+                                    if total_selected:
+                                        st.caption(f"{total_selected} selected across all pages")
                             cols = st.columns(min(5, len(page_filenames)))
                             for img_idx, fname in enumerate(page_filenames):
                                 with cols[img_idx % len(cols)]:
                                     img_bytes = _fetch_reference_image_bytes(ref_type, fname)
                                     if img_bytes:
                                         st.image(img_bytes, caption=fname, width=110)
-                                    if st.checkbox("Select", key=f"sel_{ref_type}_{fname}", value=False):
-                                        to_delete.append(fname)
+                                    st.checkbox("Select", key=f"sel_{ref_type}_{fname}", value=fname in st.session_state[sel_key])
+
+                            # Sync current page checkboxes into persistent set
+                            for fname in page_filenames:
+                                if st.session_state.get(f"sel_{ref_type}_{fname}", False):
+                                    st.session_state[sel_key].add(fname)
+                                else:
+                                    st.session_state[sel_key].discard(fname)
+                            to_delete = sorted(st.session_state[sel_key])
 
                             if to_delete:
                                 if st.button(f"Delete {len(to_delete)} selected", type="secondary", key=f"batch_del_{ref_type}_{picked_internal}"):
@@ -1151,6 +1178,7 @@ with tab_index:
                                         except Exception:
                                             pass
                                     if deleted:
+                                        st.session_state[sel_key] = set()
                                         _fetch_reference_listing.clear()
                                         _fetch_brand_hierarchy.clear()
                                         st.rerun()
@@ -1190,6 +1218,7 @@ with tab_index:
                                             except Exception:
                                                 pass
                                         if moved:
+                                            st.session_state[sel_key] = set()
                                             _fetch_reference_listing.clear()
                                             _fetch_brand_hierarchy.clear()
                                             st.success(f"Moved {moved} images to {move_brand} / {move_product_display}")
