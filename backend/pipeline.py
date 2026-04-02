@@ -186,11 +186,11 @@ def load_rfdetr(model_size: str = "medium"):
     """Load an RF-DETR model by size. Caches each size separately.
 
     Args:
-        model_size: One of "nano", "small", "base", "medium", "large".
+        model_size: One of "nano", "small", "base", "medium", "large", "xlarge", "2xlarge".
     """
     global _rfdetr_model, _rfdetr_models
     size = model_size.lower().strip()
-    if size not in ("nano", "small", "base", "medium", "large", "seg2xlarge"):
+    if size not in ("nano", "small", "base", "medium", "large", "xlarge", "2xlarge"):
         size = "medium"
 
     # Return cached model if available
@@ -198,17 +198,31 @@ def load_rfdetr(model_size: str = "medium"):
         _rfdetr_model = _rfdetr_models[size]
         return _rfdetr_model
 
-    from rfdetr import RFDETRNano, RFDETRSmall, RFDETRBase, RFDETRMedium, RFDETRLarge, RFDETRSeg2XLarge
-    model_classes = {"nano": RFDETRNano, "small": RFDETRSmall, "base": RFDETRBase, "medium": RFDETRMedium, "large": RFDETRLarge, "seg2xlarge": RFDETRSeg2XLarge}
+    from rfdetr import RFDETRNano, RFDETRSmall, RFDETRBase, RFDETRMedium, RFDETRLarge
+    model_classes = {"nano": RFDETRNano, "small": RFDETRSmall, "base": RFDETRBase, "medium": RFDETRMedium, "large": RFDETRLarge}
+
+    # XL/2XL require rfdetr[plus]
+    try:
+        from rfdetr import RFDETRXLarge, RFDETR2XLarge
+        model_classes["xlarge"] = RFDETRXLarge
+        model_classes["2xlarge"] = RFDETR2XLarge
+    except ImportError:
+        if size in ("xlarge", "2xlarge"):
+            logger.error("RF-DETR %s requires rfdetr[plus]. Install with: pip install 'rfdetr[plus]'", size)
+            size = "medium"
+
     cls = model_classes[size]
 
     checkpoint = _find_best_checkpoint(model_size=size)
+    kwargs = {}
+    if size in ("xlarge", "2xlarge"):
+        kwargs["accept_platform_model_license"] = True
     if checkpoint:
         logger.info("Loading fine-tuned RF-DETR-%s from %s", size, checkpoint)
-        model = cls(pretrain_weights=str(checkpoint))
+        model = cls(pretrain_weights=str(checkpoint), **kwargs)
     else:
         logger.info("No fine-tuned checkpoint found, using pre-trained RF-DETR-%s", size)
-        model = cls()
+        model = cls(**kwargs)
 
     # Skip optimize_for_inference on RunPod -- torch.compile can segfault on some CUDA setups
     _is_runpod = os.environ.get("RUNPOD_POD_ID") or os.path.exists("/workspace")

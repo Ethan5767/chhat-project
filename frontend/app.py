@@ -694,7 +694,8 @@ with tab_single:
     _MODEL_OPTIONS = {
         "RF-DETR Medium (default)": "medium",
         "RF-DETR Large (704px, higher accuracy)": "large",
-        "RF-DETR Seg-2XL (768px, largest)": "seg2xlarge",
+        "RF-DETR 2XLarge (880px, highest accuracy)": "2xlarge",
+        "RF-DETR XLarge (700px)": "xlarge",
         "RF-DETR Base (560px, balanced)": "base",
         "RF-DETR Small (faster)": "small",
         "RF-DETR Nano (fastest, lightweight)": "nano",

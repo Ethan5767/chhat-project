@@ -1,4 +1,4 @@
-rfdetr[train]>=1.6.0
+rfdetr[train,plus]>=1.6.0
 supervision>=0.21.0
 torch>=2.2.0
 torchvision>=0.17.0

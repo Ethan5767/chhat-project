@@ -2258,19 +2258,28 @@ def run_rfdetr_training_runpod_job(
         if not resumed:
             # 2. Provision pod -- fastest GPUs first for RF-DETR training
             _log_runpod("rfdetr-gpu: creating RunPod pod...")
-            gpu_candidates = [
-                "NVIDIA A100-SXM4-80GB",
-                "NVIDIA A100 80GB PCIe",
-                "NVIDIA A100-SXM4-40GB",
-                "NVIDIA GeForce RTX 4090",
-                "NVIDIA GeForce RTX 4080",
-                "NVIDIA RTX A6000",
-                "NVIDIA RTX A5000",
-                "NVIDIA L40S",
-                "NVIDIA L40",
-                "NVIDIA GeForce RTX 3090",
-                "NVIDIA L4",
-            ]
+            if model_size in ("xlarge", "2xlarge"):
+                # XL/2XL need 80GB+ VRAM (126.9M params, 880px resolution)
+                gpu_candidates = [
+                    "NVIDIA A100-SXM4-80GB",
+                    "NVIDIA A100 80GB PCIe",
+                    "NVIDIA H100 80GB HBM3",
+                    "NVIDIA H100 PCIe",
+                ]
+            else:
+                gpu_candidates = [
+                    "NVIDIA A100-SXM4-80GB",
+                    "NVIDIA A100 80GB PCIe",
+                    "NVIDIA A100-SXM4-40GB",
+                    "NVIDIA GeForce RTX 4090",
+                    "NVIDIA GeForce RTX 4080",
+                    "NVIDIA RTX A6000",
+                    "NVIDIA RTX A5000",
+                    "NVIDIA L40S",
+                    "NVIDIA L40",
+                    "NVIDIA GeForce RTX 3090",
+                    "NVIDIA L4",
+                ]
             cloud_types = ["SECURE", "COMMUNITY"]
             vol_gb = _classifier_volume_gb()
             deploy_rounds, deploy_pause = _classifier_deploy_retry_settings()
@@ -2438,7 +2447,7 @@ def run_rfdetr_training_runpod_job(
         install_r = _ssh_cmd(
             ssh_host, ssh_port, ssh_key,
             "cd /workspace/chhat-project && source .venv/bin/activate && "
-            "pip install 'rfdetr[train,loggers]' -q",
+            "pip install 'rfdetr[train,loggers,plus]' -q",
             timeout=300, pod_id=pod_id, pod_host_id=pod_host_id,
         )
         if install_r.returncode != 0:
@@ -3932,7 +3941,7 @@ def train_rfdetr_endpoint(
     force: bool = False,
     use_runpod: bool = False,
 ):
-    """Train RF-DETR detection model. model_size: nano/small/base/medium/large/seg2xlarge. use_runpod=true for GPU training."""
+    """Train RF-DETR detection model. model_size: nano/small/base/medium/large/xlarge/2xlarge. use_runpod=true for GPU training."""
     version = (version or _get_current_training_version()).strip() or DEFAULT_TRAINING_VERSION
     dataset_import = None
     if roboflow_url.strip():

@@ -11,7 +11,14 @@ import random
 import shutil
 from pathlib import Path
 
-from rfdetr import RFDETRNano, RFDETRSmall, RFDETRBase, RFDETRMedium, RFDETRLarge, RFDETRSeg2XLarge
+from rfdetr import RFDETRNano, RFDETRSmall, RFDETRBase, RFDETRMedium, RFDETRLarge
+
+# XL/2XL require rfdetr[plus] (PML 1.0 license)
+try:
+    from rfdetr import RFDETRXLarge, RFDETR2XLarge
+except ImportError:
+    RFDETRXLarge = None
+    RFDETR2XLarge = None
 
 DATASET_DIR = Path(__file__).resolve().parent / "datasets" / "cigarette_packs"
 OUTPUT_DIR = Path(__file__).resolve().parent / "runs"
@@ -132,7 +139,7 @@ def main():
     parser.add_argument("--grad-accum-steps", type=int, default=4)
     parser.add_argument("--patience", type=int, default=10)
     parser.add_argument("--num-workers", type=int, default=8)
-    parser.add_argument("--model-size", type=str, default="medium", choices=["nano", "small", "base", "medium", "large", "seg2xlarge"])
+    parser.add_argument("--model-size", type=str, default="medium", choices=["nano", "small", "base", "medium", "large", "xlarge", "2xlarge"])
     parser.add_argument("--progress-file", type=str, default="")
     args = parser.parse_args()
 
@@ -165,8 +172,43 @@ def main():
     output_dir = OUTPUT_DIR / args.model_size
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    _model_classes = {"nano": RFDETRNano, "small": RFDETRSmall, "base": RFDETRBase, "medium": RFDETRMedium, "large": RFDETRLarge, "seg2xlarge": RFDETRSeg2XLarge}
-    model = _model_classes[args.model_size]()
+    _model_classes = {
+        "nano": RFDETRNano, "small": RFDETRSmall, "base": RFDETRBase,
+        "medium": RFDETRMedium, "large": RFDETRLarge,
+    }
+    if RFDETRXLarge is not None:
+        _model_classes["xlarge"] = RFDETRXLarge
+    if RFDETR2XLarge is not None:
+        _model_classes["2xlarge"] = RFDETR2XLarge
+
+    if args.model_size not in _model_classes:
+        raise RuntimeError(
+            f"Model size '{args.model_size}' requires rfdetr[plus]. "
+            f"Install with: pip install 'rfdetr[plus]'"
+        )
+
+    # XL/2XL require PML license acceptance
+    if args.model_size in ("xlarge", "2xlarge"):
+        model = _model_classes[args.model_size](accept_platform_model_license=True)
+    else:
+        model = _model_classes[args.model_size]()
+
+    # Validate model loaded correctly by checking param count
+    import torch as _torch_check
+    param_count = sum(p.numel() for p in model.model.model.parameters())
+    expected_params = {
+        "nano": (28e6, 33e6), "small": (30e6, 34e6), "base": (30e6, 36e6),
+        "medium": (31e6, 36e6), "large": (31e6, 36e6),
+        "xlarge": (120e6, 135e6), "2xlarge": (120e6, 135e6),
+    }
+    lo, hi = expected_params.get(args.model_size, (0, 1e12))
+    print(f"[model-check] {args.model_size}: {param_count/1e6:.1f}M params "
+          f"(expected {lo/1e6:.0f}-{hi/1e6:.0f}M)", flush=True)
+    if not (lo <= param_count <= hi):
+        raise RuntimeError(
+            f"Model param count {param_count/1e6:.1f}M does not match expected range "
+            f"for {args.model_size} ({lo/1e6:.0f}-{hi/1e6:.0f}M). Wrong model loaded!"
+        )
 
     # Write initial progress
     if args.progress_file:
