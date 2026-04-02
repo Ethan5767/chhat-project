@@ -269,6 +269,22 @@ BRAND_REGISTRY = {
         ("ZEST YOGO", "zest_yogo"),
         ("ZOUK", "zouk"),
     ],
+    # ─── Unassigned (old catch-all "others" prefixes pending manual reassignment) ───
+    "UNASSIGNED": [
+        ("ESSE OTHERS (unassigned)", "esse_other"),
+        ("FINE OTHERS (unassigned)", "fine_other"),
+        ("555 OTHERS (unassigned)", "555_other"),
+        ("ARA OTHERS (unassigned)", "ara_other"),
+        ("LUXURY OTHERS (unassigned)", "luxury_other"),
+        ("GOLD SEAL OTHERS (unassigned)", "gold_seal_other"),
+        ("MARLBORO OTHERS (unassigned)", "marlboro_other"),
+        ("IZA OTHERS (unassigned)", "iza_other"),
+        ("COW BOY OTHERS (unassigned)", "cow_boy_other"),
+        ("COCO PALM OTHERS (unassigned)", "coco_palm_other"),
+        ("ORIS OTHERS (unassigned)", "oris_other"),
+        ("CHINESE BRAND (unassigned)", "chinese_brand"),
+        ("OTHER (unassigned)", "other"),
+    ],
 }
 
 # ─── Output product mapping ───
@@ -402,6 +418,20 @@ OUTPUT_PRODUCT_MAP = {
     "yellow_elephant": "OTHERS",
     "zest_yogo": "OTHERS",
     "zouk": "OTHERS",
+    # Unassigned (old catch-all prefixes) -> map to parent OTHERS column in output
+    "esse_other": "ESSE OTHERS",
+    "fine_other": "FINE OTHERS",
+    "555_other": "555 OTHERS",
+    "ara_other": "ARA OTHERS",
+    "luxury_other": "LUXURY OTHERS",
+    "gold_seal_other": "GOLD SEAL OTHERS",
+    "marlboro_other": "MARLBORO OTHERS",
+    "iza_other": "IZA OTHERS",
+    "cow_boy_other": "COW BOY OTHERS",
+    "coco_palm_other": "COCO PALM OTHERS",
+    "oris_other": "ORIS OTHERS",
+    "chinese_brand": "CHINESE BRANDS",
+    "other": "OTHERS",
 }
 
 # ─── Legacy name aliases ───
@@ -415,22 +445,10 @@ LEGACY_ALIASES = {
     "oris_sliver": "oris_silver",
     "cow_boy_bluberry_mint": "cow_boy_blueberry_mint",
     "esse_double_change": "esse_change",
-    # Old catch-all names -> keep working (map to first sub-product or generic)
-    "esse_other": "esse_change_cafe",
-    "fine_other": "fine_gold",
-    "555_other": "555_refined_charcoal_filter",
-    "ara_other": "ara_cool",
-    "luxury_other": "luxury_lights",
-    "gold_seal_other": "gold_seal_full_flavor",
-    "marlboro_other": "marlboro_menthol",
-    "iza_other": "iza_lights",
-    "cow_boy_other": "cow_boy_lights",
-    "coco_palm_other": "coco_palm_gold",
-    "oris_other": "oris_pulse",
-    "chinese_brand": "diamond_hehua",
-    "other": "galaxy",
-    "other_4": "galaxy",
+    # Old catch-all names kept as-is so existing reference images remain loadable.
+    # These are treated as "unassigned" in the UI for manual reassignment.
     "cambo": "cambo_ff",
+    "other_4": "other",
 }
 
 
