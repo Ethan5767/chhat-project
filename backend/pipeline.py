@@ -167,18 +167,18 @@ def load_dino(device: str):
     return _dino_processor, _dino_model
 
 
-def _find_best_checkpoint() -> Optional[Path]:
+def _find_best_checkpoint(model_size: str = "medium") -> Optional[Path]:
     if not _RFDETR_CHECKPOINT_DIR.exists():
         return None
-    candidates = list(_RFDETR_CHECKPOINT_DIR.rglob("best*.pth"))
-    if not candidates:
-        candidates = list(_RFDETR_CHECKPOINT_DIR.rglob("*.pth"))
-    if not candidates:
-        candidates = list(_RFDETR_CHECKPOINT_DIR.rglob("best*.pt"))
-    if not candidates:
-        candidates = list(_RFDETR_CHECKPOINT_DIR.rglob("*.pt"))
-    if candidates:
-        return max(candidates, key=lambda p: p.stat().st_mtime)
+    # Look in size-specific subdirectory first (e.g. runs/medium/, runs/large/)
+    size_dir = _RFDETR_CHECKPOINT_DIR / model_size
+    search_dirs = [size_dir, _RFDETR_CHECKPOINT_DIR] if size_dir.exists() else [_RFDETR_CHECKPOINT_DIR]
+    for d in search_dirs:
+        for pattern in ("best*.pth", "*.pth", "best*.pt", "*.pt"):
+            # Only search immediate children (not recursively into other size dirs)
+            candidates = [f for f in d.glob(pattern) if f.is_file()]
+            if candidates:
+                return max(candidates, key=lambda p: p.stat().st_mtime)
     return None
 
 
@@ -202,7 +202,7 @@ def load_rfdetr(model_size: str = "medium"):
     model_classes = {"base": RFDETRBase, "medium": RFDETRMedium, "large": RFDETRLarge}
     cls = model_classes[size]
 
-    checkpoint = _find_best_checkpoint()
+    checkpoint = _find_best_checkpoint(model_size=size)
     if checkpoint:
         logger.info("Loading fine-tuned RF-DETR-%s from %s", size, checkpoint)
         model = cls(pretrain_weights=str(checkpoint))
@@ -226,12 +226,12 @@ def load_rfdetr(model_size: str = "medium"):
     return model
 
 
-def reload_rfdetr():
+def reload_rfdetr(model_size: str = "medium"):
     """Force-reload RF-DETR from the latest checkpoint. Call after training completes."""
     global _rfdetr_model, _rfdetr_models
     _rfdetr_model = None
-    _rfdetr_models.clear()
-    return load_rfdetr()
+    _rfdetr_models.pop(model_size, None)
+    return load_rfdetr(model_size=model_size)
 
 
 def reload_classifiers():

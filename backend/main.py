@@ -2506,11 +2506,11 @@ def run_rfdetr_training_runpod_job(
             raise RuntimeError(f"RF-DETR training on pod failed:\n{(r_train.stdout or '')[-3500:]}")
         _log_runpod("rfdetr-gpu: training complete on pod")
 
-        # 10. Download checkpoints
-        out_dir = _DATA_ROOT / "runs"
+        # 10. Download checkpoints (into size-specific subdirectory)
+        out_dir = _DATA_ROOT / "runs" / model_size
         out_dir.mkdir(parents=True, exist_ok=True)
         for fname in ("checkpoint_best_ema.pth", "checkpoint_best_regular.pth", "checkpoint_best_total.pth"):
-            remote_p = f"/workspace/chhat-project/runs/{fname}"
+            remote_p = f"/workspace/chhat-project/runs/{model_size}/{fname}"
             local_p = str(out_dir / fname)
             _log_runpod(f"rfdetr-gpu: downloading {fname} from pod…")
             dl = _scp_from(ssh_host, ssh_port, ssh_key, remote_p, local_p, timeout=600, pod_id=pod_id, pod_host_id=pod_host_id)
@@ -2521,8 +2521,8 @@ def run_rfdetr_training_runpod_job(
 
         # 11. Reload RF-DETR
         try:
-            reload_rfdetr()
-            _log_runpod("rfdetr-gpu: reload_rfdetr OK")
+            reload_rfdetr(model_size=model_size)
+            _log_runpod(f"rfdetr-gpu: reload_rfdetr OK (size={model_size})")
         except Exception as exc:
             _log_runpod(f"rfdetr-gpu: WARNING reload_rfdetr failed: {exc}")
 
@@ -3683,8 +3683,9 @@ def _run_training_job(job_id: str, script: str, args: list[str]):
             # Hot-reload the model so inference uses the new weights immediately
             if model_type == "rfdetr":
                 try:
-                    reload_rfdetr()
-                    print(f"[train] RF-DETR model hot-reloaded after training (job {job_id[:8]})")
+                    trained_size = _training_jobs.get(job_id, {}).get("params", {}).get("model_size", "medium")
+                    reload_rfdetr(model_size=trained_size)
+                    print(f"[train] RF-DETR model hot-reloaded after training (job {job_id[:8]}, size={trained_size})")
                 except Exception as exc:
                     print(f"[train] WARNING: Failed to hot-reload RF-DETR: {exc}")
             elif model_type == "classifier":
@@ -3897,6 +3898,7 @@ def train_rfdetr_endpoint(
         "lr": lr,
         "grad_accum_steps": grad_accum_steps,
         "patience": patience,
+        "model_size": model_size,
         "dataset_source": "roboflow_url" if roboflow_url.strip() else "existing_local",
         "use_runpod": use_runpod,
     }

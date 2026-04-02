@@ -161,7 +161,9 @@ def main():
                 }, indent=2))
             raise FileNotFoundError(msg)
 
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    # Save checkpoints in size-specific subdirectory (e.g. runs/medium/, runs/large/)
+    output_dir = OUTPUT_DIR / args.model_size
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     _model_classes = {"base": RFDETRBase, "medium": RFDETRMedium, "large": RFDETRLarge}
     model = _model_classes[args.model_size]()
@@ -181,7 +183,7 @@ def main():
         batch_size=args.batch_size,
         grad_accum_steps=args.grad_accum_steps,
         lr=args.lr,
-        output_dir=str(OUTPUT_DIR),
+        output_dir=str(output_dir),
         early_stopping=True,
         early_stopping_patience=args.patience,
         num_workers=args.num_workers,
