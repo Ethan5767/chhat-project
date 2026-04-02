@@ -44,7 +44,7 @@ _PROJECT_ROOT = _BACKEND_ROOT.parent
 _RFDETR_CHECKPOINT_DIR = _DATA_ROOT / "runs" if (_DATA_ROOT / "runs").exists() else _PROJECT_ROOT / "runs"
 
 DOWNLOAD_TIMEOUT = 15
-RFDETR_CONF_THRESHOLD = 0.10  # low threshold to catch packs in small shelf images
+RFDETR_CONF_THRESHOLD = 0.15
 MIN_OUTPUT_CONFIDENCE = 0.75
 CLASSIFIER_TOP_K = 5
 
@@ -186,11 +186,11 @@ def load_rfdetr(model_size: str = "medium"):
     """Load an RF-DETR model by size. Caches each size separately.
 
     Args:
-        model_size: One of "base", "medium", "large".
+        model_size: One of "nano", "small", "base", "medium", "large".
     """
     global _rfdetr_model, _rfdetr_models
     size = model_size.lower().strip()
-    if size not in ("base", "medium", "large"):
+    if size not in ("nano", "small", "base", "medium", "large", "seg2xlarge"):
         size = "medium"
 
     # Return cached model if available
@@ -198,8 +198,8 @@ def load_rfdetr(model_size: str = "medium"):
         _rfdetr_model = _rfdetr_models[size]
         return _rfdetr_model
 
-    from rfdetr import RFDETRBase, RFDETRMedium, RFDETRLarge
-    model_classes = {"base": RFDETRBase, "medium": RFDETRMedium, "large": RFDETRLarge}
+    from rfdetr import RFDETRNano, RFDETRSmall, RFDETRBase, RFDETRMedium, RFDETRLarge, RFDETRSeg2XLarge
+    model_classes = {"nano": RFDETRNano, "small": RFDETRSmall, "base": RFDETRBase, "medium": RFDETRMedium, "large": RFDETRLarge, "seg2xlarge": RFDETRSeg2XLarge}
     cls = model_classes[size]
 
     checkpoint = _find_best_checkpoint(model_size=size)

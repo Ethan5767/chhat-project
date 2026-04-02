@@ -2201,7 +2201,7 @@ def run_rfdetr_training_runpod_job(
         return
 
     _log_runpod(
-        f"rfdetr-gpu job={job_id[:8]}… start epochs={epochs} batch={batch_size} "
+        f"rfdetr-gpu job={job_id[:8]}… start model_size={model_size} epochs={epochs} batch={batch_size} "
         f"lr={lr} grad_accum={grad_accum_steps} patience={patience} "
         f"key={_mask_secret_hint(api_key)}",
     )
@@ -3932,7 +3932,7 @@ def train_rfdetr_endpoint(
     force: bool = False,
     use_runpod: bool = False,
 ):
-    """Train RF-DETR detection model. model_size: base/medium/large. use_runpod=true for GPU training."""
+    """Train RF-DETR detection model. model_size: nano/small/base/medium/large/seg2xlarge. use_runpod=true for GPU training."""
     version = (version or _get_current_training_version()).strip() or DEFAULT_TRAINING_VERSION
     dataset_import = None
     if roboflow_url.strip():
