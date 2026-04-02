@@ -3236,16 +3236,16 @@ async def add_reference(
     TYPE_DIR.mkdir(parents=True, exist_ok=True)
 
     import re
-    existing = list(TYPE_DIR.glob(f"{product_name}_*.*"))
-    max_idx = 0
-    for p in existing:
-        match = re.search(r"_(\d+)$", p.stem)
-        if match:
-            max_idx = max(max_idx, int(match.group(1)))
-    next_idx = max_idx + 1
-
-    save_path = TYPE_DIR / f"{product_name}_{next_idx}.jpg"
-    save_path.write_bytes(data)
+    with _ref_lock:
+        existing = list(TYPE_DIR.glob(f"{product_name}_*.*"))
+        max_idx = 0
+        for p in existing:
+            match = re.search(r"_(\d+)$", p.stem)
+            if match:
+                max_idx = max(max_idx, int(match.group(1)))
+        next_idx = max_idx + 1
+        save_path = TYPE_DIR / f"{product_name}_{next_idx}.jpg"
+        save_path.write_bytes(data)
 
     return {
         "status": "added",
@@ -3320,6 +3320,9 @@ def delete_reference_image(packaging_type: str, filename: str):
     return {"status": "deleted", "packaging_type": packaging_type, "filename": filename}
 
 
+_ref_lock = threading.Lock()
+
+
 @app.post("/reference-image/move")
 def move_reference_image(body: dict):
     """Move a reference image to a different product (rename to match target product prefix)."""
@@ -3336,13 +3339,18 @@ def move_reference_image(body: dict):
         raise HTTPException(status_code=404, detail="Image not found")
     if not src.resolve().parent == refs_dir.resolve():
         raise HTTPException(status_code=400, detail="Invalid path")
-    # Find next available index for target product
-    existing = sorted(refs_dir.glob(f"{target_product}_*.*"))
-    next_idx = len(existing) + 1
-    ext = src.suffix or ".jpg"
-    new_name = f"{target_product}_{next_idx}{ext}"
-    dst = refs_dir / new_name
-    src.rename(dst)
+    with _ref_lock:
+        existing = sorted(refs_dir.glob(f"{target_product}_*.*"))
+        next_idx = len(existing) + 1
+        ext = src.suffix or ".jpg"
+        new_name = f"{target_product}_{next_idx}{ext}"
+        dst = refs_dir / new_name
+        # Collision-safe: increment until unused
+        while dst.exists():
+            next_idx += 1
+            new_name = f"{target_product}_{next_idx}{ext}"
+            dst = refs_dir / new_name
+        src.rename(dst)
     return {"status": "moved", "old_filename": filename, "new_filename": new_name, "target_product": target_product}
 
 

@@ -193,6 +193,29 @@ def _fetch_reference_listing(internal_name: str, packaging_type: str = "pack"):
     return None
 
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def _fetch_brand_book_sample(internal_name: str):
+    """Fetch brand book sample image, cached for 1 hour."""
+    try:
+        resp = requests.get(f"{BACKEND_URL}/brand-book-sample/{internal_name}", timeout=5)
+        if resp.status_code == 200:
+            return resp.content
+    except Exception:
+        pass
+    return None
+
+
+@st.cache_data(ttl=30, show_spinner=False)
+def _fetch_index_status():
+    """Fetch index status, cached 30s."""
+    try:
+        resp = requests.get(f"{BACKEND_URL}/index-status", timeout=10)
+        resp.raise_for_status()
+        return resp.json()
+    except Exception:
+        return {"exists": False, "brand_count": 0, "brands": []}
+
+
 # -- Page config --
 st.set_page_config(page_title="RF-DETR Brand Detector", layout="wide", page_icon="[D]")
 
@@ -476,7 +499,7 @@ st.write("")
 
 # -- Health check --
 try:
-    health = requests.get(f"{BACKEND_URL}/health", timeout=15)
+    health = requests.get(f"{BACKEND_URL}/health", timeout=5)
     health.raise_for_status()
 except Exception as health_exc:
     st.error(
@@ -490,15 +513,8 @@ except Exception as health_exc:
     st.stop()
 
 # -- Index status (sidebar-style) --
-index_exists = False
-idx_data = {"brand_count": 0, "brands": []}
-try:
-    idx_resp = requests.get(f"{BACKEND_URL}/index-status", timeout=10)
-    idx_resp.raise_for_status()
-    idx_data = idx_resp.json()
-    index_exists = bool(idx_data.get("exists", False))
-except Exception:
-    pass
+idx_data = _fetch_index_status()
+index_exists = bool(idx_data.get("exists", False))
 
 # -- Tabs --
 tab_batch, tab_single, tab_index, tab_label, tab_train = st.tabs([
@@ -1048,10 +1064,7 @@ with tab_index:
     st.markdown("---")
     st.markdown("##### Brand & Product Registry")
     try:
-        reg_resp = requests.get(f"{BACKEND_URL}/brand-registry", timeout=10)
-        reg_resp.raise_for_status()
-        reg_data = reg_resp.json()
-        brand_hierarchy = reg_data.get("brands", {})
+        brand_hierarchy, reg_data = _fetch_brand_hierarchy()
 
         st.caption(
             f"{reg_data.get('total_brands', 0)} brands, "
@@ -1098,8 +1111,28 @@ with tab_index:
 
                             # Checkbox select for batch delete
                             to_delete = []
-                            cols = st.columns(min(5, len(filenames)))
-                            for img_idx, fname in enumerate(filenames):
+                            PAGE_SIZE = 50
+                            page_key = f"ref_page_{ref_type}_{picked_internal}"
+                            if page_key not in st.session_state:
+                                st.session_state[page_key] = 0
+                            total_pages = max(1, (len(filenames) + PAGE_SIZE - 1) // PAGE_SIZE)
+                            current_page = st.session_state[page_key]
+                            start = current_page * PAGE_SIZE
+                            page_filenames = filenames[start:start + PAGE_SIZE]
+                            if len(filenames) > PAGE_SIZE:
+                                pg_col1, pg_col2, pg_col3 = st.columns([1, 2, 1])
+                                with pg_col1:
+                                    if st.button("Prev", key=f"prev_{page_key}", disabled=current_page == 0):
+                                        st.session_state[page_key] = max(0, current_page - 1)
+                                        st.rerun()
+                                with pg_col2:
+                                    st.caption(f"Page {current_page + 1}/{total_pages} ({len(filenames)} total)")
+                                with pg_col3:
+                                    if st.button("Next", key=f"next_{page_key}", disabled=current_page >= total_pages - 1):
+                                        st.session_state[page_key] = current_page + 1
+                                        st.rerun()
+                            cols = st.columns(min(5, len(page_filenames)))
+                            for img_idx, fname in enumerate(page_filenames):
                                 with cols[img_idx % len(cols)]:
                                     img_bytes = _fetch_reference_image_bytes(ref_type, fname)
                                     if img_bytes:
@@ -1140,12 +1173,9 @@ with tab_index:
                                 if move_brand != "-- Select brand --" and move_product_display != "-- Select product --":
                                     target_internal = next(p["internal_name"] for p in move_products_list if p["display_name"] == move_product_display)
                                     # Show brand book sample image for target product
-                                    try:
-                                        sample_resp = requests.get(f"{BACKEND_URL}/brand-book-sample/{target_internal}", timeout=5)
-                                        if sample_resp.status_code == 200:
-                                            st.image(sample_resp.content, caption=f"Brand book: {move_product_display}", width=150)
-                                    except Exception:
-                                        pass
+                                    sample_bytes = _fetch_brand_book_sample(target_internal)
+                                    if sample_bytes:
+                                        st.image(sample_bytes, caption=f"Brand book: {move_product_display}", width=150)
                                     if st.button(f"Move {len(to_delete)} images", key=f"batch_move_{ref_type}_{picked_internal}"):
                                         moved = 0
                                         for fname in to_delete:
@@ -1362,12 +1392,9 @@ with tab_label:
                     # Show brand book sample for selected product
                     label_internal = product_internals.get(selected_product, "")
                     if label_internal:
-                        try:
-                            sample_resp = requests.get(f"{BACKEND_URL}/brand-book-sample/{label_internal}", timeout=5)
-                            if sample_resp.status_code == 200:
-                                st.image(sample_resp.content, caption=f"Brand book: {selected_product}", width=120)
-                        except Exception:
-                            pass
+                        sample_bytes = _fetch_brand_book_sample(label_internal)
+                        if sample_bytes:
+                            st.image(sample_bytes, caption=f"Brand book: {selected_product}", width=120)
 
                     if st.button("Add to references", key=f"{crop_key}_add"):
                         internal_name = product_internals.get(selected_product, "")
@@ -1455,23 +1482,18 @@ with tab_train:
     train_col1, train_col2 = st.columns(2)
 
     # --- Fetch training dataset summary (shared by both columns) ---
-    _train_reg_data = {}
+    _train_hierarchy, _train_reg_data = _fetch_brand_hierarchy()
     _train_pack_total = 0
     _train_box_total = 0
     _train_products_with_refs = 0
-    try:
-        _tr_resp = requests.get(f"{BACKEND_URL}/brand-registry", timeout=5)
-        if _tr_resp.status_code == 200:
-            _train_reg_data = _tr_resp.json()
-            # Use per-type totals from disk (references/pack, references/box). Summing
-            # per-product pack_count only counts filenames that match BRAND_REGISTRY; unregistered
-            # labels still train in brand_classifier.py but would show 0 here otherwise.
-            _per_type = _train_reg_data.get("per_type") or {}
-            _train_pack_total = int(_per_type.get("pack", 0) or 0)
-            _train_box_total = int(_per_type.get("box", 0) or 0)
-            _train_products_with_refs = int(_train_reg_data.get("products_with_refs", 0) or 0)
-    except Exception:
-        pass
+    if _train_reg_data:
+        # Use per-type totals from disk (references/pack, references/box). Summing
+        # per-product pack_count only counts filenames that match BRAND_REGISTRY; unregistered
+        # labels still train in brand_classifier.py but would show 0 here otherwise.
+        _per_type = _train_reg_data.get("per_type") or {}
+        _train_pack_total = int(_per_type.get("pack", 0) or 0)
+        _train_box_total = int(_per_type.get("box", 0) or 0)
+        _train_products_with_refs = int(_train_reg_data.get("products_with_refs", 0) or 0)
 
     # --- Brand Classifier (frozen DINOv2 + MLP) ---
     with train_col1:
