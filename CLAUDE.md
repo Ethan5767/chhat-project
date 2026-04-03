@@ -4,13 +4,17 @@ This file provides guidance to Claude Code when working in the rf-detr-cigarette
 
 ## Project Overview
 
-Cigarette brand detection system for CHHAT. Uses RF-DETR-Medium for object detection and DINOv2 + linear classifier for brand classification. Backend is FastAPI, frontend is Streamlit.
+Cigarette brand detection system for CHHAT. Dual-detector backend (Co-DETR Swin-L or RF-DETR) for object detection and DINOv2 + linear classifier for brand classification. Backend is FastAPI, frontend is Streamlit.
 
 ## Architecture
 
-- **Detection**: RF-DETR-Medium fine-tuned on cigarette pack dataset (checkpoint at `runs/checkpoint_best_ema.pth`)
+- **Detection**: Dual-detector system, selectable via UI or `CHHAT_DETECTOR_BACKEND` env var:
+  - **Co-DETR Swin-L** (default): mmdetection-based, mAP=0.837, checkpoint at `co_detr_weights/epoch_24.pth` (~2.8GB, .gitignored). Single class ("cigarette").
+  - **RF-DETR**: rfdetr pip package, multiple sizes (nano to 2xlarge), checkpoint at `runs/checkpoint_best_ema.pth`. Two classes (pack, box).
 - **Classification**: DINOv2-base (frozen or fine-tuned) backbone + per-packaging-type linear classifiers
-- **Pipeline flow**: Image -> RF-DETR detect packs -> crop -> DINOv2 embed -> classifier predict -> output
+- **Pipeline flow**: Image -> detect packs (Co-DETR or RF-DETR) -> crop -> DINOv2 embed -> classifier predict -> output
+- **Co-DETR model code**: `backend/co_detr/` (5 files from mmdet CO_DETR project)
+- **Co-DETR config**: `backend/co_detr_inference_config.py`
 - **Packaging types**: pack, box (separate classifiers per type)
 - **Brand registry**: 29 brands, 68 products defined in `backend/brand_registry.py` (single source of truth)
 
@@ -38,7 +42,9 @@ python brand_classifier.py --packaging-type pack --epochs 100
 | File | Purpose |
 |------|---------|
 | `backend/main.py` | FastAPI server, all endpoints, RunPod GPU job orchestration |
-| `backend/pipeline.py` | Detection + classification pipeline |
+| `backend/pipeline.py` | Detection + classification pipeline (dual-detector) |
+| `backend/co_detr_inference_config.py` | Co-DETR Swin-L mmdet inference config |
+| `backend/co_detr/` | Co-DETR model code (CoDETR, CoDINOHead, etc.) |
 | `backend/brand_registry.py` | Brand/product definitions (source of truth) |
 | `backend/output_format.py` | CSV output column mappings (Q12A/Q12B) |
 | `brand_classifier.py` | DINOv2 classifier training script |

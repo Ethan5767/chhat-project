@@ -217,7 +217,7 @@ def _fetch_index_status():
 
 
 # -- Page config --
-st.set_page_config(page_title="RF-DETR Brand Detector", layout="wide", page_icon="[D]")
+st.set_page_config(page_title="Cigarette Brand Detector", layout="wide", page_icon="[D]")
 
 # -- Styles --
 st.markdown(
@@ -476,8 +476,8 @@ st.markdown(
     <div class="app-header">
         <div class="app-logo">[D]</div>
         <div>
-            <div class="app-title">RF-DETR Cigarette Brand Detector</div>
-            <div class="app-subtitle">Automated shelf survey analysis with RF-DETR detection and visual + text recognition</div>
+            <div class="app-title">Cigarette Brand Detector</div>
+            <div class="app-subtitle">Automated shelf survey analysis with AI detection and visual + text recognition</div>
         </div>
     </div>
     """,
@@ -488,7 +488,7 @@ st.markdown(
 st.markdown(
     """
     <div class="pipeline-info">
-        <span class="pipe-tag">RF-DETR</span>
+        <span class="pipe-tag">AI Detection</span>
         <span class="pipe-tag">DINOv2-base</span>
         <span class="pipe-tag">Brand Classifier</span>
     </div>
@@ -686,10 +686,22 @@ with tab_batch:
 with tab_single:
     st.markdown('<div class="panel">', unsafe_allow_html=True)
     st.markdown("#### Single Image Detection")
-    st.caption("Upload a shelf photo to see RF-DETR bounding boxes. Hover over each box to see the detected brand and confidence.")
+    st.caption("Upload a shelf photo to see detection bounding boxes. Hover over each box to see the detected brand and confidence.")
 
     if not index_exists:
         st.warning("No brand classifier found. Run `python brand_classifier.py` first or use the **Reference Index** tab to train one.")
+
+    _DETECTOR_OPTIONS = {
+        "Co-DETR Swin-L (highest accuracy, slower)": "codetr",
+        "RF-DETR (faster, multi-size)": "rfdetr",
+    }
+    selected_detector_label = st.selectbox(
+        "Detector Backend",
+        options=list(_DETECTOR_OPTIONS.keys()),
+        index=0,
+        key="detector_backend_select",
+    )
+    selected_detector = _DETECTOR_OPTIONS[selected_detector_label]
 
     _MODEL_OPTIONS = {
         "RF-DETR Medium (default, 576px)": "medium",
@@ -700,13 +712,16 @@ with tab_single:
         "RF-DETR Small (faster)": "small",
         "RF-DETR Nano (fastest, lightweight)": "nano",
     }
-    selected_model_label = st.selectbox(
-        "RF-DETR Model",
-        options=list(_MODEL_OPTIONS.keys()),
-        index=0,
-        key="rfdetr_model_select",
-    )
-    selected_model_size = _MODEL_OPTIONS[selected_model_label]
+    if selected_detector == "rfdetr":
+        selected_model_label = st.selectbox(
+            "RF-DETR Model",
+            options=list(_MODEL_OPTIONS.keys()),
+            index=0,
+            key="rfdetr_model_select",
+        )
+        selected_model_size = _MODEL_OPTIONS[selected_model_label]
+    else:
+        selected_model_size = "medium"
 
     det_threshold = st.number_input(
         "Detection confidence threshold",
@@ -772,7 +787,8 @@ with tab_single:
             resp = requests.post(
                 f"{BACKEND_URL}/detect-single",
                 files=files,
-                data={"model_size": selected_model_size, "det_threshold": str(det_threshold)},
+                data={"model_size": selected_model_size, "det_threshold": str(det_threshold),
+                      "detector": selected_detector},
                 timeout=120,
             )
             resp.raise_for_status()
@@ -836,7 +852,7 @@ with tab_single:
                     <div class="det-tooltip {tooltip_pos}">
                         <div style="font-weight:700;font-size:12px;margin-bottom:6px;color:{color};">
                             Box #{i+1}
-                            <span style="color:#9ea7be;font-weight:400;"> &middot; RF-DETR {box["det_conf"]:.2f}</span>
+                            <span style="color:#9ea7be;font-weight:400;"> &middot; det {box["det_conf"]:.2f}</span>
                         </div>
                         {brand_lines}
                     </div>
@@ -996,7 +1012,7 @@ body {{ background:transparent; font-family: -apple-system, BlinkMacSystemFont, 
                     st.info("No brands detected in this image.")
 
             with col_boxes:
-                st.markdown("##### RF-DETR Bounding Boxes")
+                st.markdown("##### Detection Bounding Boxes")
                 display_boxes = [b for b in boxes if not b.get("is_full_image")]
                 if display_boxes:
                     box_rows = []
@@ -1011,7 +1027,7 @@ body {{ background:transparent; font-family: -apple-system, BlinkMacSystemFont, 
                         })
                     st.dataframe(pd.DataFrame(box_rows), width="stretch", hide_index=True)
                 else:
-                    st.info("RF-DETR found no cigarette packs. The full image was used for detection.")
+                    st.info("No cigarette packs detected. The full image was used for detection.")
 
         except Exception as exc:
             anim_box.empty()
@@ -1340,7 +1356,7 @@ with tab_label:
         _upload_id = f"{label_image.name}_{label_image.size}"
         if st.session_state.get("_label_last_upload") != _upload_id:
             st.session_state["_label_last_upload"] = _upload_id
-            with st.spinner("Running RF-DETR detection..."):
+            with st.spinner("Running detection..."):
                 try:
                     resp = requests.post(
                         f"{BACKEND_URL}/generate-crops",

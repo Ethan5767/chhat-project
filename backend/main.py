@@ -31,6 +31,11 @@ try:
         load_classifier,
         load_rfdetr,
         reload_rfdetr,
+        load_codetr,
+        reload_codetr,
+        detect_objects,
+        DEFAULT_DETECTOR,
+        CODETR_CONF_THRESHOLD,
         reload_classifiers,
         reload_dino,
         run_pipeline,
@@ -54,6 +59,11 @@ except ImportError:
         load_classifier,
         load_rfdetr,
         reload_rfdetr,
+        load_codetr,
+        reload_codetr,
+        detect_objects,
+        DEFAULT_DETECTOR,
+        CODETR_CONF_THRESHOLD,
         reload_classifiers,
         reload_dino,
         run_pipeline,
@@ -2747,7 +2757,8 @@ def index_status():
 
 @app.post("/detect-single")
 async def detect_single(image_file: UploadFile = File(...), model_size: str = Form("medium"),
-                        det_threshold: float = Form(0.25)):
+                        det_threshold: float = Form(0.25),
+                        detector: str = Form("")):
     """Run detection on a single image. Returns per-box brand assignments for interactive UI."""
     from PIL import Image
     import base64
@@ -2772,23 +2783,22 @@ async def detect_single(image_file: UploadFile = File(...), model_size: str = Fo
     except Exception:
         raise HTTPException(status_code=400, detail="Could not open image.")
 
+    active_detector = detector if detector in ("codetr", "rfdetr") else DEFAULT_DETECTOR
+
     device = get_device()
     index, labels = load_index()
     processor, model = load_dino(device)
-    rfdetr_model = load_rfdetr(model_size=model_size)
     img_w, img_h = pil_img.size
 
-    # RF-DETR detection (use user-specified threshold, clamped to safe range)
     threshold = max(0.05, min(1.0, det_threshold))
-    detections = rfdetr_model.predict(pil_img, threshold=threshold)
+    det_results = detect_objects(pil_img, backend=active_detector, threshold=threshold,
+                                model_size=model_size)
     crops = []
     boxes_data = []
-    has_detections = detections is not None and len(detections) > 0
 
-    if has_detections:
-        class_ids = detections.class_id if hasattr(detections, "class_id") and detections.class_id is not None else None
-        for i, (box, conf) in enumerate(zip(detections.xyxy, detections.confidence)):
-            x1, y1, x2, y2 = [int(v) for v in box]
+    if det_results:
+        for det in det_results:
+            x1, y1, x2, y2 = [int(v) for v in det["xyxy"]]
             bw, bh = x2 - x1, y2 - y1
             pad_x, pad_y = int(bw * 0.10), int(bh * 0.10)
             x1 = max(0, x1 - pad_x)
@@ -2798,12 +2808,10 @@ async def detect_single(image_file: UploadFile = File(...), model_size: str = Fo
             if x2 <= x1 or y2 <= y1:
                 continue
             crops.append(pil_img.crop((x1, y1, x2, y2)))
-            pkg_type = "pack"
-            if class_ids is not None and len(class_ids) > i:
-                pkg_type = "box" if int(class_ids[i]) == 1 else "pack"
+            pkg_type = "box" if det["class_id"] == 1 else "pack"
             boxes_data.append({
                 "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-                "det_conf": round(float(conf), 3),
+                "det_conf": round(det["confidence"], 3),
                 "packaging_type": pkg_type,
                 "brands": [],
             })
@@ -2891,6 +2899,7 @@ async def detect_single(image_file: UploadFile = File(...), model_size: str = Fo
         "brands": [b for b, _ in all_sorted],
         "confidence": [round(c, 3) for _, c in all_sorted],
         "num_boxes": sum(1 for b in boxes_data if not b.get("is_full_image")),
+        "detector": active_detector,
     }
 
 
@@ -3134,16 +3143,14 @@ async def generate_crops(image_file: UploadFile = File(...)):
         raise HTTPException(status_code=400, detail="Could not open image.")
 
     device = get_device()
-    rfdetr_model = load_rfdetr()
-    detections = rfdetr_model.predict(pil_img, threshold=RFDETR_CONF_THRESHOLD)
+    det_results = detect_objects(pil_img)
 
     crop_images = []
     crop_meta = []
-    if detections is not None and len(detections) > 0:
+    if det_results:
         width, height = pil_img.size
-        class_ids = detections.class_id if hasattr(detections, "class_id") and detections.class_id is not None else None
-        for i, (box, conf) in enumerate(zip(detections.xyxy, detections.confidence)):
-            x1, y1, x2, y2 = [int(v) for v in box]
+        for i, det in enumerate(det_results):
+            x1, y1, x2, y2 = [int(v) for v in det["xyxy"]]
             bw, bh = x2 - x1, y2 - y1
             pad_x, pad_y = int(bw * 0.10), int(bh * 0.10)
             x1, y1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
@@ -3152,10 +3159,9 @@ async def generate_crops(image_file: UploadFile = File(...)):
                 continue
             crop = pil_img.crop((x1, y1, x2, y2))
             crop_images.append(crop)
-            pkg_type = "pack"
-            if class_ids is not None and len(class_ids) > i:
-                pkg_type = "box" if int(class_ids[i]) == 1 else "pack"
-            crop_meta.append({"index": i, "w": x2 - x1, "h": y2 - y1, "conf": float(conf), "packaging_type": pkg_type})
+            pkg_type = "box" if det["class_id"] == 1 else "pack"
+            crop_meta.append({"index": i, "w": x2 - x1, "h": y2 - y1,
+                              "conf": det["confidence"], "packaging_type": pkg_type})
 
     suggested_labels = []
     if crop_images:

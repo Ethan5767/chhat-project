@@ -35,6 +35,7 @@ Thumbs.db
 # Large model weights (download separately)
 rf-detr-medium.pth
 runs/
+co_detr_weights/
 backend/classifier_model/
 
 # Training data (managed separately)

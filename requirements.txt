@@ -1,5 +1,8 @@
 rfdetr[train,plus]>=1.6.0
 supervision>=0.21.0
+mmdet>=3.3.0
+mmengine>=0.10.0
+mmcv>=2.1.0
 torch>=2.2.0
 torchvision>=0.17.0
 transformers>=4.40.0

@@ -61,6 +61,12 @@ _model_load_lock = _threading.RLock()  # Thread-safe model loading
 _brand_classifier = None
 _class_mapping = None
 
+# Co-DETR globals
+CODETR_CONF_THRESHOLD = 0.35
+DEFAULT_DETECTOR = os.environ.get("CHHAT_DETECTOR_BACKEND", "codetr")
+_codetr_model = None
+_codetr_model_lock = _threading.Lock()
+
 
 def label_to_product(label: str) -> str:
     """Strip the trailing photo number to get the product name.
@@ -240,6 +246,134 @@ def reload_rfdetr(model_size: str = "medium"):
     _rfdetr_model = None
     _rfdetr_models.pop(model_size, None)
     return load_rfdetr(model_size=model_size)
+
+
+def load_codetr():
+    """Load Co-DETR Swin-L model using mmdet. Cached after first load."""
+    global _codetr_model
+    with _codetr_model_lock:
+        if _codetr_model is not None:
+            return _codetr_model
+
+        try:
+            from mmdet.apis import init_detector
+        except ImportError:
+            raise ImportError(
+                "mmdet is required for Co-DETR. Install with: "
+                "pip install mmdet mmengine mmcv"
+            )
+
+        # Find checkpoint
+        ckpt_candidates = [
+            _DATA_ROOT / "co_detr_weights" / "epoch_24.pth",
+            _PROJECT_ROOT / "co_detr_weights" / "epoch_24.pth",
+        ]
+        checkpoint = None
+        for c in ckpt_candidates:
+            if c.is_file():
+                checkpoint = str(c)
+                break
+        if checkpoint is None:
+            raise FileNotFoundError(
+                "Co-DETR checkpoint not found. Expected epoch_24.pth in "
+                "co_detr_weights/ under project root or CHHAT_DATA_ROOT."
+            )
+
+        # Find config
+        config_candidates = [
+            _BACKEND_ROOT / "co_detr_inference_config.py",
+            _PROJECT_ROOT / "backend" / "co_detr_inference_config.py",
+        ]
+        config_path = None
+        for c in config_candidates:
+            if c.is_file():
+                config_path = str(c)
+                break
+        if config_path is None:
+            raise FileNotFoundError("Co-DETR inference config not found")
+
+        device = get_device()
+        logger.info("Loading Co-DETR Swin-L from %s on %s...", checkpoint, device)
+        model = init_detector(config_path, checkpoint, device=device)
+        model.eval()
+        logger.info("Co-DETR Swin-L loaded successfully")
+
+        _codetr_model = model
+        return _codetr_model
+
+
+def reload_codetr():
+    """Force-reload Co-DETR model."""
+    global _codetr_model
+    with _codetr_model_lock:
+        _codetr_model = None
+    return load_codetr()
+
+
+def detect_objects(image: Image.Image, backend: str = None, threshold: float = None, model_size: str = "medium"):
+    """Unified detection interface. Returns list of dicts with keys:
+    xyxy (list[4]), confidence (float), class_id (int).
+
+    Args:
+        image: PIL Image
+        backend: "codetr" or "rfdetr". Defaults to DEFAULT_DETECTOR.
+        threshold: Confidence threshold. Defaults to per-detector default.
+        model_size: RF-DETR model size (ignored for Co-DETR).
+    """
+    if backend is None:
+        backend = DEFAULT_DETECTOR
+
+    if backend == "codetr":
+        if threshold is None:
+            threshold = CODETR_CONF_THRESHOLD
+        return _detect_codetr(image, threshold)
+    else:
+        if threshold is None:
+            threshold = RFDETR_CONF_THRESHOLD
+        return _detect_rfdetr(image, threshold, model_size=model_size)
+
+
+def _detect_rfdetr(image: Image.Image, threshold: float, model_size: str = "medium"):
+    """RF-DETR detection, returns normalized format."""
+    rfdetr_model = load_rfdetr(model_size=model_size)
+    detections = rfdetr_model.predict(image, threshold=threshold)
+    results = []
+    if detections is not None and len(detections) > 0:
+        class_ids = detections.class_id if hasattr(detections, "class_id") and detections.class_id is not None else None
+        for i, (box, conf) in enumerate(zip(detections.xyxy, detections.confidence)):
+            cid = 0
+            if class_ids is not None and len(class_ids) > i:
+                cid = int(class_ids[i])
+            results.append({
+                "xyxy": [float(v) for v in box],
+                "confidence": float(conf),
+                "class_id": cid,
+            })
+    return results
+
+
+def _detect_codetr(image: Image.Image, threshold: float):
+    """Co-DETR detection, returns normalized format."""
+    model = load_codetr()
+
+    img_array = np.array(image)[:, :, ::-1]  # RGB -> BGR for mmdet
+
+    from mmdet.apis import inference_detector
+    result = inference_detector(model, img_array)
+
+    pred = result.pred_instances
+    bboxes = pred.bboxes.cpu().numpy()
+    scores = pred.scores.cpu().numpy()
+
+    results = []
+    for i in range(len(scores)):
+        if scores[i] >= threshold:
+            results.append({
+                "xyxy": [float(v) for v in bboxes[i]],
+                "confidence": float(scores[i]),
+                "class_id": 0,  # Single class, always "pack"
+            })
+    return results
 
 
 def reload_classifiers():
@@ -598,6 +732,8 @@ def _detect_brands_from_image(
     device: str,
     index,
     labels: list[str],
+    detector_backend: str = None,
+    det_threshold: float = None,
 ) -> dict[str, float]:
     """Detect and classify cigarette brands in an image.
 
@@ -619,19 +755,14 @@ def _detect_brands_from_image(
     if not type_labels:
         type_labels["pack"] = labels
 
-    detections = rfdetr_model.predict(image, threshold=RFDETR_CONF_THRESHOLD)
+    det_results = detect_objects(image, backend=detector_backend, threshold=det_threshold)
     crops: list[Image.Image] = []
     crop_types: list[str] = []  # "pack" or "box" per crop
 
-    has_detections = len(detections) > 0 if detections is not None else False
-
-    if has_detections:
+    if det_results:
         width, height = image.size
-        xyxy = detections.xyxy
-        # class_id: 0 = pack (or single-class legacy), 1 = box
-        class_ids = detections.class_id if hasattr(detections, "class_id") and detections.class_id is not None else None
-        for i, box in enumerate(xyxy):
-            x1, y1, x2, y2 = [int(v) for v in box]
+        for det in det_results:
+            x1, y1, x2, y2 = [int(v) for v in det["xyxy"]]
             bw, bh = x2 - x1, y2 - y1
             pad_x, pad_y = int(bw * 0.10), int(bh * 0.10)
             x1 = max(0, x1 - pad_x)
@@ -641,13 +772,7 @@ def _detect_brands_from_image(
             if x2 <= x1 or y2 <= y1:
                 continue
             crops.append(image.crop((x1, y1, x2, y2)))
-
-            # Determine packaging type from class_id
-            if class_ids is not None and len(class_ids) > i:
-                cid = int(class_ids[i])
-                crop_types.append("box" if cid == 1 else "pack")
-            else:
-                crop_types.append("pack")
+            crop_types.append("box" if det["class_id"] == 1 else "pack")
     else:
         crops.append(image)
         crop_types.append("pack")
@@ -768,7 +893,7 @@ def _download_row_images(
     return results
 
 
-def _process_single_row(row, url_columns, id_col, df_columns, rfdetr_model, processor, model, device, index, labels, build_q12_row, images=None):
+def _process_single_row(row, url_columns, id_col, df_columns, rfdetr_model, processor, model, device, index, labels, build_q12_row, images=None, detector_backend: str = None):
     """Process a single row: download images (if not prefetched), detect brands, return result dict."""
     try:
         if images is None:
@@ -784,6 +909,7 @@ def _process_single_row(row, url_columns, id_col, df_columns, rfdetr_model, proc
                 image=image, rfdetr_model=rfdetr_model,
                 processor=processor, model=model,
                 device=device, index=index, labels=labels,
+                detector_backend=detector_backend,
             )
             for product, conf in col_best.items():
                 if conf >= MIN_OUTPUT_CONFIDENCE:
@@ -847,6 +973,7 @@ def _process_rows_batched(
     rows_with_images: list[tuple],  # [(row, images_dict), ...]
     url_columns, id_col, df_columns, rfdetr_model, processor, model,
     device, index, labels, build_q12_row,
+    detector_backend: str = None,
 ) -> list[dict]:
     """Process multiple rows at once, batching ALL crops across ALL images across ALL rows
     through a single DINOv2 + classifier pass for maximum GPU utilization."""
@@ -869,16 +996,13 @@ def _process_rows_batched(
                 col_crops[col_name] = []
                 continue
 
-            detections = rfdetr_model.predict(image, threshold=RFDETR_CONF_THRESHOLD)
-            has_det = len(detections) > 0 if detections is not None else False
+            det_results = detect_objects(image, backend=detector_backend)
 
             crops_for_col: list[tuple[Image.Image, str]] = []
-            if has_det:
+            if det_results:
                 width, height = image.size
-                xyxy = detections.xyxy
-                class_ids = detections.class_id if hasattr(detections, "class_id") and detections.class_id is not None else None
-                for i, box in enumerate(xyxy):
-                    x1, y1, x2, y2 = [int(v) for v in box]
+                for det in det_results:
+                    x1, y1, x2, y2 = [int(v) for v in det["xyxy"]]
                     bw, bh = x2 - x1, y2 - y1
                     pad_x, pad_y = int(bw * 0.10), int(bh * 0.10)
                     x1 = max(0, x1 - pad_x)
@@ -888,9 +1012,7 @@ def _process_rows_batched(
                     if x2 <= x1 or y2 <= y1:
                         continue
                     crop = image.crop((x1, y1, x2, y2))
-                    ctype = "pack"
-                    if class_ids is not None and len(class_ids) > i:
-                        ctype = "box" if int(class_ids[i]) == 1 else "pack"
+                    ctype = "box" if det["class_id"] == 1 else "pack"
                     crops_for_col.append((crop, ctype))
             else:
                 crops_for_col.append((image, "pack"))
@@ -996,7 +1118,7 @@ def _process_rows_batched(
     return result_rows
 
 
-def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]] = None) -> Path:
+def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]] = None, detector_backend: str = None) -> Path:
     """Process a CSV of image URLs and output brand/product detection in Q12A/Q12B format.
 
     Optimization: prefetches images for upcoming rows in background threads while
@@ -1034,6 +1156,9 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
     classifier, labels = load_index()
     processor, model = load_dino(device)
     rfdetr_model = load_rfdetr()
+    _active_backend = detector_backend or DEFAULT_DETECTOR
+    if _active_backend == "codetr":
+        load_codetr()
     index = classifier
 
     csv_path = Path(csv_path)
@@ -1121,6 +1246,7 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
             batch_results = _process_rows_batched(
                 rows_with_images, url_columns, id_col, df.columns,
                 rfdetr_model, processor, model, device, index, labels, build_q12_row,
+                detector_backend=_active_backend,
             )
         else:
             batch_results = []
@@ -1128,6 +1254,7 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
                 r = _process_single_row(
                     row, url_columns, id_col, df.columns, rfdetr_model,
                     processor, model, device, index, labels, build_q12_row, images,
+                    detector_backend=_active_backend,
                 )
                 batch_results.append(r)
 
