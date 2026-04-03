@@ -210,6 +210,20 @@ def main():
             f"for {args.model_size} ({lo/1e6:.0f}-{hi/1e6:.0f}M). Wrong model loaded!"
         )
 
+    # Validate resolution matches expected model size (medium=576, large=704, 2xlarge=880)
+    expected_res = {"nano": 560, "small": 560, "base": 560, "medium": 576, "large": 704, "xlarge": 880, "2xlarge": 880}
+    actual_res = getattr(model.model_config, "resolution", None) if hasattr(model, "model_config") else None
+    if actual_res and args.model_size in expected_res:
+        exp = expected_res[args.model_size]
+        print(f"[model-check] resolution={actual_res} (expected {exp} for {args.model_size})", flush=True)
+        if actual_res != exp:
+            raise RuntimeError(
+                f"Model resolution {actual_res} does not match expected {exp} "
+                f"for {args.model_size}. Wrong model loaded!"
+            )
+    else:
+        print(f"[model-check] resolution={actual_res} (no expected value to validate)", flush=True)
+
     # Write initial progress
     if args.progress_file:
         Path(args.progress_file).parent.mkdir(parents=True, exist_ok=True)
