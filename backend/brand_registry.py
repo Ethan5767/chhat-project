@@ -1,7 +1,7 @@
 """Complete brand and product registry for CHHAT cigarette detection.
 
 Single source of truth for:
-  - All 29 brands and 67 products from the client Excel
+  - All 29 brands and 75 products from the client Excel
   - Internal reference filename conventions
   - Mapping between internal names and display names
   - What exists vs what's missing in reference images
@@ -26,7 +26,7 @@ BRAND_REGISTRY = {
         ("MEVIUS OPTION PURPLE", "mevius_option_purple"),
         ("MEVIUS FREEZY DEW", "mevius_freezy_dew"),
         ("MEVIUS OPTION PURPLE SUPER SLIMS", "mevius_option_purple_super_slims"),
-        ("MEVIUS KIWAMI", "mevius_kimavi"),
+        ("MEVIUS KIWAMI", "mevius_kiwami"),
         ("MEVIUS E-SERIES BLUE", "mevius_e_series_blue"),
         ("MEVIUS MINT FLOW", "mevius_mint_flow"),
     ],
@@ -234,7 +234,11 @@ BRAND_REGISTRY = {
     "OTHERS": [
         # Granular OTHERS brands from brand book (output -> OTHERS)
         ("ANGKOR MEAS", "angkor_meas"),
-        ("ASIA STAR", "asia_star"),
+        ("ASIA STAR 1", "asia_star_1"),
+        ("ASIA STAR 2", "asia_star_2"),
+        ("ASIA STAR 3", "asia_star_3"),
+        ("ASIA STAR 4", "asia_star_4"),
+        ("ASIA STAR 5", "asia_star_5"),
         ("BLACK DEVIL", "black_devil"),
         ("CORSET", "corset"),
         ("DAVIDOFF", "davidoff"),
@@ -242,7 +246,11 @@ BRAND_REGISTRY = {
         ("DOLCE", "dolce"),
         ("DUNHILL", "dunhill"),
         ("ENGLISHMAN", "englishman"),
-        ("GALAXY", "galaxy"),
+        ("GALAXY 1", "galaxy_1"),
+        ("GALAXY 2", "galaxy_2"),
+        ("GALAXY 3", "galaxy_3"),
+        ("GALAXY 4", "galaxy_4"),
+        ("GALAXY 5", "galaxy_5"),
         ("GD", "gd"),
         ("GUDANG GARAM", "gudang_garam"),
         ("JUNE", "june"),
@@ -384,7 +392,11 @@ OUTPUT_PRODUCT_MAP = {
     "ligun": "CHINESE BRANDS",
     # OTHERS sub-brands -> OTHERS
     "angkor_meas": "OTHERS",
-    "asia_star": "OTHERS",
+    "asia_star_1": "OTHERS",
+    "asia_star_2": "OTHERS",
+    "asia_star_3": "OTHERS",
+    "asia_star_4": "OTHERS",
+    "asia_star_5": "OTHERS",
     "black_devil": "OTHERS",
     "corset": "OTHERS",
     "davidoff": "OTHERS",
@@ -392,7 +404,11 @@ OUTPUT_PRODUCT_MAP = {
     "dolce": "OTHERS",
     "dunhill": "OTHERS",
     "englishman": "OTHERS",
-    "galaxy": "OTHERS",
+    "galaxy_1": "OTHERS",
+    "galaxy_2": "OTHERS",
+    "galaxy_3": "OTHERS",
+    "galaxy_4": "OTHERS",
+    "galaxy_5": "OTHERS",
     "gd": "OTHERS",
     "gudang_garam": "OTHERS",
     "june": "OTHERS",
@@ -445,6 +461,7 @@ LEGACY_ALIASES = {
     "oris_sliver": "oris_silver",
     "cow_boy_bluberry_mint": "cow_boy_blueberry_mint",
     "esse_double_change": "esse_change",
+    "mevius_kimavi": "mevius_kiwami",
     # Old catch-all names kept as-is so existing reference images remain loadable.
     # These are treated as "unassigned" in the UI for manual reassignment.
     "cambo": "cambo_ff",

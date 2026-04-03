@@ -186,7 +186,8 @@ def train(args):
         for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.bmp"):
             image_paths.extend(type_dir.glob(ext))
             image_paths.extend(type_dir.glob(ext.upper()))
-    image_paths = sorted(set(image_paths))
+    # Deduplicate by resolved path (not name) to keep both pack/foo_1.jpg and box/foo_1.jpg
+    image_paths = sorted(set(p.resolve() for p in image_paths))
 
     if not image_paths:
         print(f"No reference images found in {REFERENCES_DIR}/pack/ or {REFERENCES_DIR}/box/")

@@ -362,12 +362,16 @@ def _get_stopped_pod(job_type: str) -> dict | None:
     return None
 
 
-def _get_reusable_pod(job_type: str) -> dict | None:
-    """Get any registered pod (running or stopped) for the given job type."""
+def _get_reusable_pod(job_type: str, fallback_types: list[str] | None = None) -> tuple[dict, str] | None:
+    """Get any registered pod for this job type, or fallback types.
+
+    Returns (entry, matched_job_type) or None.
+    """
     reg = _load_pod_registry()
-    entry = reg.get(job_type)
-    if entry and entry.get("pod_id"):
-        return entry
+    for jt in [job_type] + (fallback_types or []):
+        entry = reg.get(jt)
+        if entry and entry.get("pod_id"):
+            return (entry, jt)
     return None
 
 
@@ -502,7 +506,8 @@ def _runpod_resume(api_key: str, pod_id: str, gpu_count: int = 1) -> dict | None
         return None
 
 
-def _try_resume_pod(api_key: str, job_type: str, job_id: str, ssh_key: str) -> tuple[str, str, str, str] | None:
+def _try_resume_pod(api_key: str, job_type: str, job_id: str, ssh_key: str,
+                    fallback_job_types: list[str] | None = None) -> tuple[str, str, str, str] | None:
     """Try to reuse an existing pod for this job type (running or stopped).
 
     Returns (pod_id, pod_host_id, ssh_host, ssh_port) if successful, None if not.
@@ -511,9 +516,10 @@ def _try_resume_pod(api_key: str, job_type: str, job_id: str, ssh_key: str) -> t
     import time as _time
 
     # First check for any registered pod (running or stopped)
-    entry = _get_reusable_pod(job_type)
-    if not entry:
+    result = _get_reusable_pod(job_type, fallback_types=fallback_job_types)
+    if not result:
         return None
+    entry, matched_type = result
 
     pod_id = entry["pod_id"]
     pod_status = entry.get("status", "unknown")
@@ -527,7 +533,7 @@ def _try_resume_pod(api_key: str, job_type: str, job_id: str, ssh_key: str) -> t
 
     if not live_pod:
         _log_runpod(f"[{job_id}] Registered pod {pod_id} no longer exists, clearing registry")
-        _unregister_pod(job_type)
+        _unregister_pod(matched_type)
         return None
 
     live_status = (live_pod.get("desiredStatus") or "").upper()
@@ -535,19 +541,19 @@ def _try_resume_pod(api_key: str, job_type: str, job_id: str, ssh_key: str) -> t
 
     if live_status == "RUNNING":
         # Pod is already running -- reuse directly (no resume needed)
-        _log_runpod(f"[{job_id}] Found RUNNING pod {pod_id} for {job_type}, reusing directly")
+        _log_runpod(f"[{job_id}] Found RUNNING {matched_type} pod {pod_id} for {job_type}, reusing directly")
     elif live_status == "EXITED":
         # Pod is stopped -- resume it
-        _log_runpod(f"[{job_id}] Found stopped pod {pod_id} for {job_type}, attempting resume...")
+        _log_runpod(f"[{job_id}] Found stopped {matched_type} pod {pod_id} for {job_type}, attempting resume...")
         resumed = _runpod_resume(api_key, pod_id)
         if not resumed:
             _log_runpod(f"[{job_id}] Resume failed, will create new pod")
-            _unregister_pod(job_type)
+            _unregister_pod(matched_type)
             return None
         new_host_id = (resumed.get("machine") or {}).get("podHostId", new_host_id)
     else:
         _log_runpod(f"[{job_id}] Pod {pod_id} in unexpected state {live_status}, clearing registry")
-        _unregister_pod(job_type)
+        _unregister_pod(matched_type)
         return None
 
     # Wait for SSH port to become available
@@ -569,12 +575,16 @@ def _try_resume_pod(api_key: str, job_type: str, job_id: str, ssh_key: str) -> t
         _time.sleep(10)
 
     if not ssh_host:
-        _log_runpod(f"[{job_id}] SSH not available after resume, terminating stale pod")
-        try:
-            _runpod_gql(api_key, f'mutation {{ podTerminate(input: {{ podId: "{pod_id}" }}) }}')
-        except Exception:
-            pass
-        _unregister_pod(job_type)
+        _log_runpod(f"[{job_id}] SSH not available after resume")
+        if matched_type == job_type:
+            _log_runpod(f"[{job_id}] Terminating stale pod {pod_id}")
+            try:
+                _runpod_gql(api_key, f'mutation {{ podTerminate(input: {{ podId: "{pod_id}" }}) }}')
+            except Exception:
+                pass
+        else:
+            _log_runpod(f"[{job_id}] Not terminating cross-type {matched_type} pod {pod_id}")
+        _unregister_pod(matched_type)
         return None
 
     # Quick SSH test
@@ -589,21 +599,23 @@ def _try_resume_pod(api_key: str, job_type: str, job_id: str, ssh_key: str) -> t
             pass
         _time.sleep(5)
     else:
-        _log_runpod(f"[{job_id}] SSH test failed after resume, terminating stale pod")
-        try:
-            _runpod_gql(api_key, f'mutation {{ podTerminate(input: {{ podId: "{pod_id}" }}) }}')
-        except Exception:
-            pass
-        _unregister_pod(job_type)
+        _log_runpod(f"[{job_id}] SSH test failed after resume")
+        if matched_type == job_type:
+            _log_runpod(f"[{job_id}] Terminating stale pod {pod_id}")
+            try:
+                _runpod_gql(api_key, f'mutation {{ podTerminate(input: {{ podId: "{pod_id}" }}) }}')
+            except Exception:
+                pass
+        else:
+            _log_runpod(f"[{job_id}] Not terminating cross-type {matched_type} pod {pod_id}")
+        _unregister_pod(matched_type)
         return None
 
-    # Update registry
-    reg = _load_pod_registry()
-    if job_type in reg:
-        reg[job_type]["status"] = "running"
-        reg[job_type]["pod_host_id"] = new_host_id
-        reg[job_type]["last_used"] = datetime.utcnow().isoformat()
-        _save_pod_registry(reg)
+    # Re-register pod under the new job type (handles cross-type reuse)
+    if matched_type != job_type:
+        _log_runpod(f"[{job_id}] Cross-type reuse: {matched_type} -> {job_type}")
+        _unregister_pod(matched_type)
+    _register_pod(job_type, pod_id, entry.get("gpu_type", ""), new_host_id)
 
     _log_runpod(f"[{job_id}] Resumed pod {pod_id} successfully")
     return (pod_id, new_host_id, ssh_host, ssh_port)
@@ -831,7 +843,7 @@ def _paramiko_proxy_upload(pod_id: str, pod_host_id: str, key: str,
         for attempt in range(1, 4):
             r = _paramiko_proxy_exec(
                 pod_id, pod_host_id, key,
-                f"curl -sS -L --retry 3 --retry-delay 5 -o '{remote}' '{url}'",
+                f"wget -q --timeout=120 --tries=3 --wait=5 -O '{remote}' '{url}'",
                 timeout=max(timeout, 600),
             )
             if r.returncode != 0:
@@ -1022,15 +1034,13 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
             deploy_rounds, deploy_pause = _classifier_deploy_retry_settings()
             # Fastest GPUs first for batch inference
             batch_gpu_chain = [
-                "NVIDIA H100 80GB HBM3",
-                "NVIDIA H100 PCIe",
                 "NVIDIA A100-SXM4-80GB",
                 "NVIDIA A100 80GB PCIe",
                 "NVIDIA A100-SXM4-40GB",
+                "NVIDIA GeForce RTX 4090",
                 "NVIDIA L40S",
                 "NVIDIA L40",
                 "NVIDIA RTX A6000",
-                "NVIDIA GeForce RTX 4090",
                 "NVIDIA RTX A5000",
                 "NVIDIA GeForce RTX 4080",
                 "NVIDIA GeForce RTX 3090",
@@ -1184,17 +1194,28 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
                 (_DATA_ROOT / "classifier_model" / "dinov2_finetuned_full.pth",
                  "/workspace/chhat-project/backend/classifier_model/dinov2_finetuned_full.pth"),
             ]
-            # RF-DETR checkpoint
-            rfdetr_ckpt = _DATA_ROOT / "runs" / "checkpoint_best_ema.pth"
-            if not rfdetr_ckpt.exists():
-                rfdetr_ckpt = _BACKEND_ROOT.parent / "runs" / "checkpoint_best_ema.pth"
-            if rfdetr_ckpt.exists():
-                model_uploads.append((rfdetr_ckpt, "/workspace/chhat-project/runs/checkpoint_best_ema.pth"))
+            # RF-DETR checkpoint -- search size-specific dir first (large/, medium/), then root
+            rfdetr_ckpt = None
+            for _ckpt_dir in [_DATA_ROOT / "runs" / "large", _DATA_ROOT / "runs" / "medium",
+                              _DATA_ROOT / "runs", _BACKEND_ROOT.parent / "runs"]:
+                _candidate = _ckpt_dir / "checkpoint_best_ema.pth"
+                if _candidate.exists():
+                    rfdetr_ckpt = _candidate
+                    break
+            if rfdetr_ckpt:
+                # Upload to size-specific dir so _find_best_checkpoint() finds it
+                ckpt_subdir = rfdetr_ckpt.parent.name  # "large", "medium", or "runs"
+                if ckpt_subdir in ("large", "medium", "xlarge", "2xlarge"):
+                    remote_ckpt = f"/workspace/chhat-project/runs/{ckpt_subdir}/checkpoint_best_ema.pth"
+                else:
+                    remote_ckpt = "/workspace/chhat-project/runs/checkpoint_best_ema.pth"
+                model_uploads.append((rfdetr_ckpt, remote_ckpt))
+                _log_runpod(f"gpu-batch: RF-DETR checkpoint: {rfdetr_ckpt} -> {remote_ckpt}")
 
             # Create remote dirs
             _ssh_cmd(ssh_host, ssh_port, ssh_key,
                      "mkdir -p /workspace/chhat-project/backend/classifier_model/pack "
-                     "/workspace/chhat-project/runs",
+                     "/workspace/chhat-project/runs/large /workspace/chhat-project/runs/medium",
                      timeout=15, pod_id=pod_id, pod_host_id=pod_host_id)
 
             for local_p, remote_p in model_uploads:
@@ -1420,7 +1441,8 @@ def run_dinov2_finetune_gpu_job(
 
         # --- Try resuming a stopped pod first ---
         is_resumed = False
-        resumed = _try_resume_pod(api_key, "dinov2", job_id, ssh_key)
+        resumed = _try_resume_pod(api_key, "dinov2", job_id, ssh_key,
+                                  fallback_job_types=["classifier"])
         if resumed:
             pod_id, pod_host_id, ssh_host, ssh_port = resumed
             _log_runpod(f"[{job_id}] Using resumed pod {pod_id}")
@@ -1791,7 +1813,8 @@ def run_classifier_training_runpod_job(
 
         # --- Try resuming a stopped pod first ---
         is_resumed = False
-        resumed = _try_resume_pod(api_key, "classifier", job_id, ssh_key)
+        resumed = _try_resume_pod(api_key, "classifier", job_id, ssh_key,
+                                  fallback_job_types=["dinov2"])
         if resumed:
             pod_id, pod_host_id, ssh_host, ssh_port = resumed
             _log_runpod(f"[{job_id}] Using resumed pod {pod_id}")
@@ -1951,23 +1974,36 @@ def run_classifier_training_runpod_job(
         _log_runpod("classifier-gpu: references uploaded + extracted OK")
 
         # Upload finetuned DINOv2 weights so classifier trains on matching embeddings
-        dino_ft_path = _DATA_ROOT / "classifier_model" / "dinov2_finetuned_full.pth"
-        if dino_ft_path.is_file():
-            _log_runpod("classifier-gpu: uploading finetuned DINOv2 backbone to pod…")
-            remote_cls_dir = "/workspace/chhat-project/backend/classifier_model"
-            _ssh_cmd(ssh_host, ssh_port, ssh_key, f"mkdir -p {remote_cls_dir}",
-                     timeout=15, pod_id=pod_id, pod_host_id=pod_host_id)
-            up_dino = _scp_to(
-                ssh_host, ssh_port, ssh_key, str(dino_ft_path),
-                f"{remote_cls_dir}/dinov2_finetuned_full.pth",
-                timeout=600, pod_id=pod_id, pod_host_id=pod_host_id,
-            )
-            if up_dino.returncode != 0:
-                _log_runpod(f"classifier-gpu: WARNING failed to upload finetuned DINOv2: {(up_dino.stderr or '')[:300]}")
-            else:
-                _log_runpod("classifier-gpu: finetuned DINOv2 uploaded OK")
+        remote_cls_dir = "/workspace/chhat-project/backend/classifier_model"
+        remote_dino_path = f"{remote_cls_dir}/dinov2_finetuned_full.pth"
+        # Check if weights already exist on pod (e.g. from a prior DINOv2 job on same pod)
+        dino_on_pod = _ssh_cmd(
+            ssh_host, ssh_port, ssh_key,
+            f"test -f {remote_dino_path} && stat -c %s {remote_dino_path} || echo MISSING",
+            timeout=15, pod_id=pod_id, pod_host_id=pod_host_id,
+        )
+        clean_out = _strip_ansi(dino_on_pod.stdout or "")
+        size_match = re.search(r'\b(\d{4,})\b', clean_out) if "MISSING" not in clean_out else None
+        dino_size = int(size_match.group(1)) if size_match else 0
+        if dino_size > 1000:
+            _log_runpod(f"classifier-gpu: finetuned DINOv2 already on pod ({dino_size // 1048576}MB), skipping upload")
         else:
-            _log_runpod("classifier-gpu: no finetuned DINOv2 found, training with base weights")
+            dino_ft_path = _DATA_ROOT / "classifier_model" / "dinov2_finetuned_full.pth"
+            if dino_ft_path.is_file():
+                _log_runpod("classifier-gpu: uploading finetuned DINOv2 backbone to pod...")
+                _ssh_cmd(ssh_host, ssh_port, ssh_key, f"mkdir -p {remote_cls_dir}",
+                         timeout=15, pod_id=pod_id, pod_host_id=pod_host_id)
+                up_dino = _scp_to(
+                    ssh_host, ssh_port, ssh_key, str(dino_ft_path),
+                    remote_dino_path,
+                    timeout=600, pod_id=pod_id, pod_host_id=pod_host_id,
+                )
+                if up_dino.returncode != 0:
+                    _log_runpod(f"classifier-gpu: WARNING failed to upload finetuned DINOv2: {(up_dino.stderr or '')[:300]}")
+                else:
+                    _log_runpod("classifier-gpu: finetuned DINOv2 uploaded OK")
+            else:
+                _log_runpod("classifier-gpu: no finetuned DINOv2 found, training with base weights")
 
         # Kill zombie GPU processes and verify CUDA before training
         _log_runpod("classifier-gpu: clearing zombie GPU processes and verifying CUDA…")
@@ -2263,8 +2299,6 @@ def run_rfdetr_training_runpod_job(
                 gpu_candidates = [
                     "NVIDIA A100-SXM4-80GB",
                     "NVIDIA A100 80GB PCIe",
-                    "NVIDIA H100 80GB HBM3",
-                    "NVIDIA H100 PCIe",
                 ]
             else:
                 gpu_candidates = [
@@ -2712,7 +2746,8 @@ def index_status():
 
 
 @app.post("/detect-single")
-async def detect_single(image_file: UploadFile = File(...), model_size: str = Form("medium")):
+async def detect_single(image_file: UploadFile = File(...), model_size: str = Form("medium"),
+                        det_threshold: float = Form(0.25)):
     """Run detection on a single image. Returns per-box brand assignments for interactive UI."""
     from PIL import Image
     import base64
@@ -2743,8 +2778,9 @@ async def detect_single(image_file: UploadFile = File(...), model_size: str = Fo
     rfdetr_model = load_rfdetr(model_size=model_size)
     img_w, img_h = pil_img.size
 
-    # RF-DETR detection
-    detections = rfdetr_model.predict(pil_img, threshold=RFDETR_CONF_THRESHOLD)
+    # RF-DETR detection (use user-specified threshold, clamped to safe range)
+    threshold = max(0.05, min(1.0, det_threshold))
+    detections = rfdetr_model.predict(pil_img, threshold=threshold)
     crops = []
     boxes_data = []
     has_detections = detections is not None and len(detections) > 0
@@ -3109,7 +3145,7 @@ async def generate_crops(image_file: UploadFile = File(...)):
         for i, (box, conf) in enumerate(zip(detections.xyxy, detections.confidence)):
             x1, y1, x2, y2 = [int(v) for v in box]
             bw, bh = x2 - x1, y2 - y1
-            pad_x, pad_y = int(bw * 0.05), int(bh * 0.05)
+            pad_x, pad_y = int(bw * 0.10), int(bh * 0.10)
             x1, y1 = max(0, x1 - pad_x), max(0, y1 - pad_y)
             x2, y2 = min(width, x2 + pad_x), min(height, y2 + pad_y)
             if x2 <= x1 or y2 <= y1:
@@ -3178,7 +3214,7 @@ async def generate_crops(image_file: UploadFile = File(...)):
                 suggested_labels.append({
                     "internal_name": best_product,
                     "brand": best_brand,
-                    "confidence": round(brand_conf[best_brand], 3),
+                    "confidence": round(best_conf, 3),
                 })
         except Exception:
             suggested_labels = [{"internal_name": "", "brand": "", "confidence": 0.0}] * len(crop_images)
@@ -3844,7 +3880,7 @@ def train_classifier_endpoint(
     batch_size: int = 64,
     embed_batch_size: int = 8,
     lr: float = 0.001,
-    packaging_type: str = "pack",
+    packaging_type: str = "all",
     version: str = "",
     force: bool = False,
     use_runpod: bool = False,

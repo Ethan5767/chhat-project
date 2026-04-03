@@ -44,9 +44,11 @@ _PROJECT_ROOT = _BACKEND_ROOT.parent
 _RFDETR_CHECKPOINT_DIR = _DATA_ROOT / "runs" if (_DATA_ROOT / "runs").exists() else _PROJECT_ROOT / "runs"
 
 DOWNLOAD_TIMEOUT = 15
-RFDETR_CONF_THRESHOLD = 0.15
+RFDETR_CONF_THRESHOLD = 0.35
 MIN_OUTPUT_CONFIDENCE = 0.75
 CLASSIFIER_TOP_K = 5
+
+import threading as _threading
 
 _dino_processor = None
 _dino_model = None
@@ -54,6 +56,7 @@ _rfdetr_model = None
 _rfdetr_models: dict[str, object] = {}  # model_size -> loaded model instance
 # Per-type classifiers: {"pack": (classifier, mapping), "box": (classifier, mapping)}
 _classifiers: dict[str, tuple] = {}
+_model_load_lock = _threading.RLock()  # Thread-safe model loading
 # Legacy single-classifier aliases (for backward compat)
 _brand_classifier = None
 _class_mapping = None
@@ -95,24 +98,15 @@ class BrandClassifier(nn.Module):
 def _aggregate_to_products(label_scores: dict[str, float]) -> dict[str, float]:
     """Aggregate per-reference-photo scores to per-product scores.
 
-    For each product, keeps the best confidence and boosts it based on
-    how many distinct reference photos matched (more photos = more evidence).
+    For each product, keeps the highest confidence score across all matching
+    reference photos.
     """
     product_best: dict[str, float] = {}
-    product_hits: dict[str, int] = {}
 
     for label, conf in label_scores.items():
         product = label_to_product(label)
         if conf > product_best.get(product, 0.0):
             product_best[product] = conf
-        product_hits[product] = product_hits.get(product, 0) + 1
-
-    # Boost confidence when multiple reference photos match the same product
-    for product in product_best:
-        hits = product_hits[product]
-        if hits >= 2:
-            boost = min(1.15, 1.0 + 0.015 * (hits - 1))
-            product_best[product] = min(1.0, product_best[product] * boost)
 
     return product_best
 
@@ -250,10 +244,11 @@ def reload_rfdetr(model_size: str = "medium"):
 
 def reload_classifiers():
     """Force-reload all brand classifiers. Call after classifier or DINOv2 training."""
-    global _classifiers, _brand_classifier, _class_mapping
+    global _classifiers, _brand_classifier, _class_mapping, _cached_type_labels
     _classifiers = {}
     _brand_classifier = None
     _class_mapping = None
+    _cached_type_labels = None  # Reset so batch pipeline picks up new labels
     device = get_device()
     for pkg_type in PACKAGING_TYPES:
         try:
@@ -420,51 +415,58 @@ def load_classifier(device: str = None, packaging_type: str = "pack"):
     """Load the trained brand classifier and class mapping for a packaging type."""
     global _classifiers, _brand_classifier, _class_mapping
 
-    if packaging_type in _classifiers:
-        return _classifiers[packaging_type]
+    with _model_load_lock:
+        if packaging_type in _classifiers:
+            return _classifiers[packaging_type]
 
-    type_dir = CLASSIFIER_BASE_DIR / packaging_type
-    weights_path = type_dir / "best_classifier.pth"
-    mapping_path = type_dir / "class_mapping.json"
+        type_dir = CLASSIFIER_BASE_DIR / packaging_type
+        weights_path = type_dir / "best_classifier.pth"
+        mapping_path = type_dir / "class_mapping.json"
 
-    if not weights_path.exists() or not mapping_path.exists():
-        # Fallback: check legacy flat structure (pre-migration)
-        legacy_weights = CLASSIFIER_BASE_DIR / "best_classifier.pth"
-        legacy_mapping = CLASSIFIER_BASE_DIR / "class_mapping.json"
-        if packaging_type == "pack" and legacy_weights.exists() and legacy_mapping.exists():
-            weights_path = legacy_weights
-            mapping_path = legacy_mapping
-        else:
-            raise FileNotFoundError(
-                f"Missing {packaging_type} classifier model. Expected {weights_path} and {mapping_path}. "
-                f"Run 'python brand_classifier.py --packaging-type {packaging_type}' or /build-index first."
+        if not weights_path.exists() or not mapping_path.exists():
+            # Fallback: check legacy flat structure (pre-migration)
+            legacy_weights = CLASSIFIER_BASE_DIR / "best_classifier.pth"
+            legacy_mapping = CLASSIFIER_BASE_DIR / "class_mapping.json"
+            if packaging_type == "pack" and legacy_weights.exists() and legacy_mapping.exists():
+                weights_path = legacy_weights
+                mapping_path = legacy_mapping
+            else:
+                raise FileNotFoundError(
+                    f"Missing {packaging_type} classifier model. Expected {weights_path} and {mapping_path}. "
+                    f"Run 'python brand_classifier.py --packaging-type {packaging_type}' or /build-index first."
+                )
+
+        with mapping_path.open("r", encoding="utf-8") as f:
+            mapping = json.load(f)
+
+        num_classes = mapping["num_classes"]
+        embed_dim = mapping["embed_dim"]
+        hidden_dim = mapping.get("hidden_dim", 512)
+        idx_to_label = mapping.get("idx_to_label", {})
+        if len(idx_to_label) != num_classes:
+            raise ValueError(
+                f"Class mapping mismatch for {packaging_type}: idx_to_label has {len(idx_to_label)} "
+                f"entries but num_classes={num_classes}. Retrain with /train-classifier."
             )
 
-    with mapping_path.open("r", encoding="utf-8") as f:
-        mapping = json.load(f)
+        classifier = BrandClassifier(embed_dim, num_classes, hidden_dim)
 
-    num_classes = mapping["num_classes"]
-    embed_dim = mapping["embed_dim"]
-    hidden_dim = mapping.get("hidden_dim", 512)
+        if device is None:
+            device = get_device()
+        state = torch.load(weights_path, map_location=device, weights_only=True)
+        classifier.load_state_dict(state)
+        classifier.to(device)
+        classifier.eval()
 
-    classifier = BrandClassifier(embed_dim, num_classes, hidden_dim)
+        _classifiers[packaging_type] = (classifier, mapping)
 
-    if device is None:
-        device = get_device()
-    state = torch.load(weights_path, map_location=device, weights_only=True)
-    classifier.load_state_dict(state)
-    classifier.to(device)
-    classifier.eval()
+        # Keep legacy aliases pointing to pack classifier
+        if packaging_type == "pack":
+            _brand_classifier = classifier
+            _class_mapping = mapping
 
-    _classifiers[packaging_type] = (classifier, mapping)
-
-    # Keep legacy aliases pointing to pack classifier
-    if packaging_type == "pack":
-        _brand_classifier = classifier
-        _class_mapping = mapping
-
-    logger.info("Loaded %s brand classifier: %d classes", packaging_type, num_classes)
-    return classifier, mapping
+        logger.info("Loaded %s brand classifier: %d classes", packaging_type, num_classes)
+        return classifier, mapping
 
 
 def classify_embeddings(
@@ -825,19 +827,20 @@ _cached_type_labels: Optional[dict] = None
 def _get_type_labels_cached(labels):
     """Cache type labels across batches to avoid reloading every call."""
     global _cached_type_labels
-    if _cached_type_labels is not None:
-        return _cached_type_labels
-    type_labels = {}
-    for pkg_type in PACKAGING_TYPES:
-        try:
-            _, pkg_labels = load_index(packaging_type=pkg_type)
-            type_labels[pkg_type] = pkg_labels
-        except FileNotFoundError:
-            pass
-    if not type_labels:
-        type_labels["pack"] = labels
-    _cached_type_labels = type_labels
-    return type_labels
+    with _model_load_lock:
+        if _cached_type_labels is not None:
+            return _cached_type_labels
+        type_labels = {}
+        for pkg_type in PACKAGING_TYPES:
+            try:
+                _, pkg_labels = load_index(packaging_type=pkg_type)
+                type_labels[pkg_type] = pkg_labels
+            except FileNotFoundError:
+                pass
+        if not type_labels:
+            type_labels["pack"] = labels
+        _cached_type_labels = type_labels
+        return type_labels
 
 
 def _process_rows_batched(
@@ -1044,13 +1047,13 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
     else:
         logger.info("No image cache found, will download from network")
 
-    df = pd.read_csv(csv_path)
+    df = pd.read_csv(csv_path, encoding="utf-8-sig")
     original_len = len(df)
     url_columns = get_url_columns(df)
     if not url_columns:
         raise ValueError(
             "No URL columns found. Columns should contain 'photo', 'link', 'image', or 'url' in the header, "
-            "or have at least 30% of rows containing http(s) URLs."
+            "or have at least 1 URL in the first 50 rows."
         )
 
     process_len = original_len if BATCH_MODE is None else min(BATCH_MODE, original_len)
@@ -1062,7 +1065,7 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
     completed_rows: list[dict] = []
     if out_path.exists():
         try:
-            existing_df = pd.read_csv(out_path)
+            existing_df = pd.read_csv(out_path, encoding="utf-8-sig")
             start_row = len(existing_df)
             completed_rows = existing_df.to_dict("records")
             logger.info("Resuming from row %d (%d rows already done)", start_row, start_row)
@@ -1136,7 +1139,7 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
         if batch_end % 100 < batch_size:
             gc.collect()
 
-        if batch_end % SAVE_INTERVAL < batch_size or batch_end == process_len:
+        if batch_end % SAVE_INTERVAL == 0 or batch_end == process_len:
             _flush(completed_rows)
 
         if progress_cb:

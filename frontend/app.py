@@ -692,8 +692,8 @@ with tab_single:
         st.warning("No brand classifier found. Run `python brand_classifier.py` first or use the **Reference Index** tab to train one.")
 
     _MODEL_OPTIONS = {
-        "RF-DETR Medium (default)": "medium",
-        "RF-DETR Large (704px, higher accuracy)": "large",
+        "RF-DETR Medium (default, 576px)": "medium",
+        "RF-DETR Large (704px)": "large",
         "RF-DETR 2XLarge (880px, highest accuracy)": "2xlarge",
         "RF-DETR XLarge (700px)": "xlarge",
         "RF-DETR Base (560px, balanced)": "base",
@@ -707,6 +707,14 @@ with tab_single:
         key="rfdetr_model_select",
     )
     selected_model_size = _MODEL_OPTIONS[selected_model_label]
+
+    det_threshold = st.number_input(
+        "Detection confidence threshold",
+        min_value=0.05, max_value=1.0, value=0.25, step=0.05,
+        format="%.2f",
+        help="RF-DETR boxes below this confidence are hidden. Lower = more boxes, higher = fewer but more confident.",
+        key="det_conf_threshold",
+    )
 
     img_file = st.file_uploader(
         "Upload an image",
@@ -764,7 +772,7 @@ with tab_single:
             resp = requests.post(
                 f"{BACKEND_URL}/detect-single",
                 files=files,
-                data={"model_size": selected_model_size},
+                data={"model_size": selected_model_size, "det_threshold": str(det_threshold)},
                 timeout=120,
             )
             resp.raise_for_status()
@@ -1110,7 +1118,7 @@ with tab_index:
                         filenames = ref_data.get("filenames", []) if ref_data else []
                         if not filenames:
                             st.caption(f"No {ref_type} reference images yet for this product.")
-                        else:
+                        if filenames:
                             st.caption(f"{len(filenames)} {ref_type} reference images")
 
                             # Persistent selection across pages
@@ -1228,32 +1236,33 @@ with tab_index:
                                             st.success(f"Moved {moved} images to {move_brand} / {move_product_display}")
                                             st.rerun()
 
-                                st.markdown("---")
-                                st.markdown(f"**Add new reference image to {picked_product_display}:**")
-                                upload_ref = st.file_uploader(
-                                    "Upload reference image",
-                                    type=["jpg", "jpeg", "png", "webp", "bmp"],
-                                    key=f"upload_ref_{ref_type}_{picked_internal}",
-                                )
-                                if upload_ref:
-                                    if st.button("Add to references", key=f"upload_ref_btn_{ref_type}_{picked_internal}"):
-                                        try:
-                                            resp = requests.post(
-                                                f"{BACKEND_URL}/add-reference",
-                                                files={"image_file": (upload_ref.name, upload_ref.getvalue(), upload_ref.type or "image/jpeg")},
-                                                data={"product_name": picked_internal, "packaging_type": ref_type},
-                                                timeout=15,
-                                            )
-                                            resp.raise_for_status()
-                                            result = resp.json()
-                                            st.success(f"Added as {ref_type}/{result['filename']}")
-                                            _fetch_reference_listing.clear()
-                                            _fetch_brand_hierarchy.clear()
-                                            st.rerun()
-                                        except Exception as exc:
-                                            st.error(f"Failed: {exc}")
                     except Exception as exc:
                         st.caption(f"Could not load references: {exc}")
+
+                    st.markdown("---")
+                    st.markdown(f"**Add new reference image to {picked_product_display}:**")
+                    upload_ref = st.file_uploader(
+                        "Upload reference image",
+                        type=["jpg", "jpeg", "png", "webp", "bmp"],
+                        key=f"upload_ref_{ref_type}_{picked_internal}",
+                    )
+                    if upload_ref:
+                        if st.button("Add to references", key=f"upload_ref_btn_{ref_type}_{picked_internal}"):
+                            try:
+                                resp = requests.post(
+                                    f"{BACKEND_URL}/add-reference",
+                                    files={"image_file": (upload_ref.name, upload_ref.getvalue(), upload_ref.type or "image/jpeg")},
+                                    data={"product_name": picked_internal, "packaging_type": ref_type},
+                                    timeout=15,
+                                )
+                                resp.raise_for_status()
+                                result = resp.json()
+                                st.success(f"Added as {ref_type}/{result['filename']}")
+                                _fetch_reference_listing.clear()
+                                _fetch_brand_hierarchy.clear()
+                                st.rerun()
+                            except Exception as exc:
+                                st.error(f"Failed: {exc}")
 
         st.markdown("---")
 
@@ -1552,9 +1561,10 @@ with tab_train:
         cls_embed_batch = st.number_input("Embed batch size", value=8, min_value=1, max_value=64, key="cls_embed_batch")
         cls_packaging_type = st.selectbox(
             "Packaging type",
-            options=["pack", "box"],
+            options=["all", "pack", "box"],
             index=0,
             key="cls_packaging_type",
+            help="'all' trains one classifier on both pack and box references (recommended)",
         )
         cls_use_runpod = st.checkbox(
             "Run on RunPod GPU (faster; needs RUNPOD_API_KEY + SSH key on API server)",

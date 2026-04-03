@@ -130,21 +130,31 @@ class BrandClassifier(nn.Module):
 
 
 def train_classifier(args):
-    pkg_type = getattr(args, "packaging_type", "pack")
-    REFERENCES_DIR = REFERENCES_BASE_DIR / pkg_type
-    OUTPUT_DIR = OUTPUT_BASE_DIR / pkg_type
+    pkg_type = getattr(args, "packaging_type", "all")
+    if pkg_type == "all":
+        # Unified classifier: load from both pack/ and box/ directories, save as pack classifier
+        scan_dirs = [REFERENCES_BASE_DIR / t for t in PACKAGING_TYPES]
+        OUTPUT_DIR = OUTPUT_BASE_DIR / "pack"
+    else:
+        scan_dirs = [REFERENCES_BASE_DIR / pkg_type]
+        OUTPUT_DIR = OUTPUT_BASE_DIR / pkg_type
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     # 1. Collect reference images and labels
-    print(f"Scanning {pkg_type} reference images from {REFERENCES_DIR}...")
+    print(f"Scanning {pkg_type} reference images from {[str(d) for d in scan_dirs]}...")
     image_paths = []
-    for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.bmp"):
-        image_paths.extend(REFERENCES_DIR.glob(ext))
-        image_paths.extend(REFERENCES_DIR.glob(ext.upper()))
-    image_paths = sorted(set(image_paths))
+    for scan_dir in scan_dirs:
+        if not scan_dir.exists():
+            print(f"  Skipping missing directory: {scan_dir}")
+            continue
+        for ext in ("*.jpg", "*.jpeg", "*.png", "*.webp", "*.bmp"):
+            image_paths.extend(scan_dir.glob(ext))
+            image_paths.extend(scan_dir.glob(ext.upper()))
+    # Deduplicate by resolved path (not name) to keep both pack/foo_1.jpg and box/foo_1.jpg
+    image_paths = sorted(set(p.resolve() for p in image_paths))
 
     if not image_paths:
-        print(f"No reference images found in {REFERENCES_DIR}")
+        print(f"No reference images found in {[str(d) for d in scan_dirs]}")
         sys.exit(1)
 
     # Parse labels
@@ -181,10 +191,16 @@ def train_classifier(args):
             prefix = "dino."
             dino_state = {k[len(prefix):]: v for k, v in state.items() if k.startswith(prefix)}
             if dino_state:
-                dino_model.load_state_dict(dino_state, strict=False)
-                print(f"Loaded finetuned DINOv2 backbone from {DINO_FINETUNED_FULL_PATH}")
+                incomp = dino_model.load_state_dict(dino_state, strict=False)
+                print(f"Loaded finetuned DINOv2 backbone from {DINO_FINETUNED_FULL_PATH} "
+                      f"(missing={len(incomp.missing_keys)} unexpected={len(incomp.unexpected_keys)})")
             else:
-                print(f"WARNING: Finetuned checkpoint has no 'dino.*' keys, using base weights")
+                all_keys = list(state.keys())[:5]
+                print(f"CRITICAL: Finetuned checkpoint has no 'dino.*' keys!")
+                print(f"  Actual keys: {all_keys}...")
+                print(f"  Classifier will train on BASE embeddings but inference uses FINETUNED.")
+                print(f"  This causes an embedding mismatch. Retrain DINOv2 or check checkpoint.")
+                sys.exit(1)
         except Exception as exc:
             print(f"WARNING: Could not load finetuned DINOv2: {exc}, using base weights")
     else:
@@ -196,6 +212,9 @@ def train_classifier(args):
     skipped = len(image_paths) - len(valid_paths)
     if skipped > 0:
         print(f"  Skipped {skipped} corrupt/unreadable image(s); training on {len(valid_paths)} images")
+    if len(valid_paths) == 0:
+        print("ERROR: No valid images after filtering. Cannot train.")
+        sys.exit(1)
 
     # Re-derive labels from the paths that were actually loaded (parallel with embeddings)
     valid_labels_str = [label_from_filename(p.name) for p in valid_paths]
@@ -224,7 +243,10 @@ def train_classifier(args):
                 X, y, test_size=0.15, random_state=42
             )
     else:
-        X_train, X_val, y_train, y_val = X, X, y, y
+        # Single class: still split to avoid validating on training data
+        X_train, X_val, y_train, y_val = train_test_split(
+            X, y, test_size=0.15, random_state=42
+        )
 
     print(f"Train: {len(X_train)} samples, Val: {len(X_val)} samples")
 
@@ -349,7 +371,7 @@ def main():
     parser.add_argument("--lr", type=float, default=0.001, help="Learning rate")
     parser.add_argument("--patience", type=int, default=20, help="Early stopping patience")
     parser.add_argument("--progress-file", type=str, default="", help="Path to write progress JSON for UI polling")
-    parser.add_argument("--packaging-type", type=str, default="pack", choices=["pack", "box"], help="Which packaging type to train classifier for")
+    parser.add_argument("--packaging-type", type=str, default="all", choices=["pack", "box", "all"], help="Which packaging type to train classifier for ('all' merges pack+box)")
     args = parser.parse_args()
     train_classifier(args)
 
