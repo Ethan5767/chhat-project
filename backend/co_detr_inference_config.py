@@ -1,25 +1,12 @@
 """Co-DETR Swin-L inference config for cigarette detection.
 
 Derived from codetr_swinl_o365_same_trainset.py (training config).
-Only model definition + test pipeline kept. All training config removed.
+Only model definition + test pipeline kept. All training/dynamic config removed.
+
+NOTE: This file is parsed by mmengine Config.fromfile() which uses exec() with
+lazy imports. Do NOT use os.environ, Path, or any dynamic Python here.
+Checkpoint resolution is handled in pipeline.py load_codetr().
 """
-import os
-from pathlib import Path
-
-_BACKEND_ROOT = Path(__file__).resolve().parent
-_DATA_ROOT = Path(os.environ.get("CHHAT_DATA_ROOT", str(_BACKEND_ROOT)))
-_PROJECT_ROOT = _BACKEND_ROOT.parent
-
-# Resolve checkpoint path
-_ckpt_candidates = [
-    _DATA_ROOT / "co_detr_weights" / "epoch_24.pth",
-    _PROJECT_ROOT / "co_detr_weights" / "epoch_24.pth",
-]
-CODETR_CHECKPOINT = None
-for _c in _ckpt_candidates:
-    if _c.is_file():
-        CODETR_CHECKPOINT = str(_c)
-        break
 
 # Register Co-DETR custom modules with mmdet
 custom_imports = dict(
