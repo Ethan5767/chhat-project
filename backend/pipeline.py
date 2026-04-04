@@ -294,7 +294,15 @@ def load_codetr():
 
         device = get_device()
         logger.info("Loading Co-DETR Swin-L from %s on %s...", checkpoint, device)
-        model = init_detector(config_path, checkpoint, device=device)
+        # PyTorch 2.6+ defaults weights_only=True which breaks mmengine checkpoints
+        # that contain HistoryBuffer objects. Temporarily patch torch.load.
+        import functools
+        _orig_torch_load = torch.load
+        torch.load = functools.partial(_orig_torch_load, weights_only=False)
+        try:
+            model = init_detector(config_path, checkpoint, device=device)
+        finally:
+            torch.load = _orig_torch_load
         model.eval()
         logger.info("Co-DETR Swin-L loaded successfully")
 
