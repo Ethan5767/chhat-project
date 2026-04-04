@@ -201,3 +201,24 @@ test_pipeline = [
          meta_keys=('img_id', 'img_path', 'ori_shape', 'img_shape',
                     'scale_factor'))
 ]
+
+# init_detector requires test_dataloader even for single-image inference
+test_dataloader = dict(
+    batch_size=1,
+    num_workers=0,
+    persistent_workers=False,
+    drop_last=False,
+    sampler=dict(type='DefaultSampler', shuffle=False),
+    dataset=dict(
+        type='CocoDataset',
+        metainfo=dict(classes=('cigarette',)),
+        data_root='',
+        ann_file='',
+        data_prefix=dict(img=''),
+        test_mode=True,
+        pipeline=test_pipeline))
+
+test_evaluator = dict(
+    type='CocoMetric',
+    metric='bbox',
+    format_only=False)
