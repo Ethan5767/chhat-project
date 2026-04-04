@@ -727,7 +727,7 @@ with tab_single:
         "Detection confidence threshold",
         min_value=0.05, max_value=1.0, value=0.25, step=0.05,
         format="%.2f",
-        help="RF-DETR boxes below this confidence are hidden. Lower = more boxes, higher = fewer but more confident.",
+        help="Detection boxes below this confidence are hidden. Lower = more boxes, higher = fewer but more confident.",
         key="det_conf_threshold",
     )
 

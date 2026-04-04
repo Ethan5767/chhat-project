@@ -1155,10 +1155,12 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
 
     classifier, labels = load_index()
     processor, model = load_dino(device)
-    rfdetr_model = load_rfdetr()
     _active_backend = detector_backend or DEFAULT_DETECTOR
     if _active_backend == "codetr":
         load_codetr()
+        rfdetr_model = None
+    else:
+        rfdetr_model = load_rfdetr()
     index = classifier
 
     csv_path = Path(csv_path)
