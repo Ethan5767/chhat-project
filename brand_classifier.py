@@ -59,50 +59,66 @@ def pad_to_square(img: Image.Image) -> Image.Image:
     return padded
 
 
+def _load_single_image(p: Path):
+    """Load and pad a single image. Returns (path, image) or (path, None) on error."""
+    try:
+        return (p, pad_to_square(Image.open(p).convert("RGB")))
+    except Exception as exc:
+        print(f"  Warning: skipping corrupt image {p}: {exc}")
+        return (p, None)
+
+
 def compute_embeddings(image_paths: list[Path], processor, model, device: str, batch_size: int = 16) -> tuple[np.ndarray, list[Path]]:
     """Pre-compute DINOv2 embeddings for all images. No gradient needed.
 
     Returns a tuple of (embeddings, valid_paths) where valid_paths contains only
     the paths that were successfully loaded. Corrupt or unreadable images are
     skipped so that embeddings and paths stay aligned.
+
+    Uses a thread pool for parallel image loading to avoid CPU-bound I/O
+    starving the GPU.
     """
+    from concurrent.futures import ThreadPoolExecutor
+
     all_vecs = []
     valid_paths: list[Path] = []
     model.eval()
     model.to(device)
 
-    for i in range(0, len(image_paths), batch_size):
-        batch_paths = image_paths[i:i + batch_size]
-        imgs = []
-        batch_valid_paths: list[Path] = []
-        for p in batch_paths:
-            try:
-                img = pad_to_square(Image.open(p).convert("RGB"))
-                imgs.append(img)
-                batch_valid_paths.append(p)
-            except Exception as exc:
-                print(f"  Warning: skipping corrupt image {p}: {exc}")
+    num_workers = 8 if device == "cuda" else 2
+    with ThreadPoolExecutor(max_workers=num_workers) as pool:
+        for i in range(0, len(image_paths), batch_size):
+            batch_paths = image_paths[i:i + batch_size]
 
-        if not imgs:
-            continue
+            # Load images in parallel
+            results = list(pool.map(_load_single_image, batch_paths))
+            imgs = []
+            batch_valid_paths: list[Path] = []
+            for p, img in results:
+                if img is not None:
+                    imgs.append(img)
+                    batch_valid_paths.append(p)
 
-        with torch.no_grad():
-            inputs = processor(images=imgs, return_tensors="pt")
-            inputs = {k: v.to(device) for k, v in inputs.items()}
-            outputs = model(**inputs)
-            cls_tokens = outputs.last_hidden_state[:, 0, :]
-            patch_means = outputs.last_hidden_state[:, 1:, :].mean(dim=1)
-            combined = torch.cat([cls_tokens, patch_means], dim=1)  # (N, 1536)
-            vecs = combined.cpu().numpy().astype(np.float32)
+            if not imgs:
+                continue
 
-        # L2 normalize
-        norms = np.linalg.norm(vecs, axis=1, keepdims=True)
-        norms = np.where(norms == 0, 1.0, norms)
-        vecs = vecs / norms
-        all_vecs.append(vecs)
-        valid_paths.extend(batch_valid_paths)
+            with torch.no_grad():
+                inputs = processor(images=imgs, return_tensors="pt")
+                inputs = {k: v.to(device) for k, v in inputs.items()}
+                outputs = model(**inputs)
+                cls_tokens = outputs.last_hidden_state[:, 0, :]
+                patch_means = outputs.last_hidden_state[:, 1:, :].mean(dim=1)
+                combined = torch.cat([cls_tokens, patch_means], dim=1)  # (N, 1536)
+                vecs = combined.cpu().numpy().astype(np.float32)
 
-        print(f"  Embedded {len(valid_paths)}/{len(image_paths)} images", end="\r")
+            # L2 normalize
+            norms = np.linalg.norm(vecs, axis=1, keepdims=True)
+            norms = np.where(norms == 0, 1.0, norms)
+            vecs = vecs / norms
+            all_vecs.append(vecs)
+            valid_paths.extend(batch_valid_paths)
+
+            print(f"  Embedded {len(valid_paths)}/{len(image_paths)} images", end="\r", flush=True)
 
     print()
     if not all_vecs:
