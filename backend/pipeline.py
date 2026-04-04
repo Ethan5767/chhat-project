@@ -265,8 +265,8 @@ def load_codetr():
 
         # Find checkpoint
         ckpt_candidates = [
-            _DATA_ROOT / "co_detr_weights" / "epoch_24.pth",
-            _PROJECT_ROOT / "co_detr_weights" / "epoch_24.pth",
+            _DATA_ROOT / "co_detr_weights" / "epoch_36.pth",
+            _PROJECT_ROOT / "co_detr_weights" / "epoch_36.pth",
         ]
         checkpoint = None
         for c in ckpt_candidates:
@@ -275,7 +275,7 @@ def load_codetr():
                 break
         if checkpoint is None:
             raise FileNotFoundError(
-                "Co-DETR checkpoint not found. Expected epoch_24.pth in "
+                "Co-DETR checkpoint not found. Expected epoch_36.pth in "
                 "co_detr_weights/ under project root or CHHAT_DATA_ROOT."
             )
 

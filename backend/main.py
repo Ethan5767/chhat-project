@@ -1222,10 +1222,26 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
                 model_uploads.append((rfdetr_ckpt, remote_ckpt))
                 _log_runpod(f"gpu-batch: RF-DETR checkpoint: {rfdetr_ckpt} -> {remote_ckpt}")
 
+            # Co-DETR checkpoint -- needed when DEFAULT_DETECTOR=codetr
+            codetr_ckpt = None
+            for _codetr_dir in [_DATA_ROOT / "co_detr_weights",
+                                _BACKEND_ROOT.parent / "co_detr_weights"]:
+                _candidate = _codetr_dir / "epoch_36.pth"
+                if _candidate.exists():
+                    codetr_ckpt = _candidate
+                    break
+            if codetr_ckpt:
+                model_uploads.append((codetr_ckpt,
+                                      "/workspace/chhat-project/co_detr_weights/epoch_36.pth"))
+                _log_runpod(f"gpu-batch: Co-DETR checkpoint: {codetr_ckpt}")
+            else:
+                _log_runpod("gpu-batch: WARNING no Co-DETR checkpoint found (skip if using rfdetr)")
+
             # Create remote dirs
             _ssh_cmd(ssh_host, ssh_port, ssh_key,
                      "mkdir -p /workspace/chhat-project/backend/classifier_model/pack "
-                     "/workspace/chhat-project/runs/large /workspace/chhat-project/runs/medium",
+                     "/workspace/chhat-project/runs/large /workspace/chhat-project/runs/medium "
+                     "/workspace/chhat-project/co_detr_weights",
                      timeout=15, pod_id=pod_id, pod_host_id=pod_host_id)
 
             for local_p, remote_p in model_uploads:
