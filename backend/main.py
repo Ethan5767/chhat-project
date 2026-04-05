@@ -1394,7 +1394,7 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path, registry_key: str = "batch
                 raise RuntimeError(f"mmdet install failed on pod: {verify.stdout[-300:]}")
             _log_runpod(f"gpu-batch: mmdet installed OK: {(verify.stdout or '').strip()}")
         else:
-            _log_runpod(f"gpu-batch: mmdet already installed: {(mmdet_check.stdout or '').strip()}")
+            _log_runpod(f"gpu-batch: deps already installed: {(dep_check.stdout or '').strip()}")
 
         # Run pipeline on pod
         update_progress(job_id, 30, 100, "Running detection pipeline on GPU...")
