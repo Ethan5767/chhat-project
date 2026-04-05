@@ -1315,7 +1315,7 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path, registry_key: str = "batch
                 _log_runpod(f"gpu-batch: image cache found ({len(all_cache)} total, {len(cache_files)} needed for this CSV), creating tarball…")
                 import tarfile
                 import tempfile
-                tar_path = Path(tempfile.gettempdir()) / "image_cache.tar.gz"
+                tar_path = Path(tempfile.gettempdir()) / f"image_cache_{job_id[:8]}.tar.gz"
                 with tarfile.open(tar_path, "w:gz") as tar:
                     for img_file in cache_files:
                         tar.add(str(img_file), arcname=f"image_cache/{img_file.name}")
