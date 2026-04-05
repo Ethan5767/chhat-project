@@ -362,26 +362,45 @@ def _detect_rfdetr(image: Image.Image, threshold: float, model_size: str = "medi
 
 def _detect_codetr(image: Image.Image, threshold: float):
     """Co-DETR detection, returns normalized format."""
-    model = load_codetr()
+    return _detect_codetr_batch([image], threshold)[0]
 
-    img_array = np.array(image)[:, :, ::-1]  # RGB -> BGR for mmdet
+
+def _detect_codetr_batch(images: list[Image.Image], threshold: float) -> list[list[dict]]:
+    """Batch Co-DETR detection. Returns list of detection lists (one per image)."""
+    model = load_codetr()
+    img_arrays = [np.array(img)[:, :, ::-1] for img in images]  # RGB -> BGR
 
     from mmdet.apis import inference_detector
-    result = inference_detector(model, img_array)
+    batch_results = inference_detector(model, img_arrays)
 
-    pred = result.pred_instances
-    bboxes = pred.bboxes.cpu().numpy()
-    scores = pred.scores.cpu().numpy()
+    all_detections = []
+    for result in batch_results:
+        pred = result.pred_instances
+        bboxes = pred.bboxes.cpu().numpy()
+        scores = pred.scores.cpu().numpy()
+        dets = []
+        for i in range(len(scores)):
+            if scores[i] >= threshold:
+                dets.append({
+                    "xyxy": [float(v) for v in bboxes[i]],
+                    "confidence": float(scores[i]),
+                    "class_id": 0,
+                })
+        all_detections.append(dets)
+    return all_detections
 
-    results = []
-    for i in range(len(scores)):
-        if scores[i] >= threshold:
-            results.append({
-                "xyxy": [float(v) for v in bboxes[i]],
-                "confidence": float(scores[i]),
-                "class_id": 0,  # Single class, always "pack"
-            })
-    return results
+
+def detect_objects_batch(images: list[Image.Image], backend: str = None,
+                         threshold: float = None) -> list[list[dict]]:
+    """Batch detection interface. Returns list of detection lists (one per image)."""
+    if backend is None:
+        backend = DEFAULT_DETECTOR
+    if backend == "codetr":
+        return _detect_codetr_batch(images, threshold or CODETR_CONF_THRESHOLD)
+    else:
+        # RF-DETR doesn't support batch natively, fall back to sequential
+        t = threshold or RFDETR_CONF_THRESHOLD
+        return [_detect_rfdetr(img, t) for img in images]
 
 
 def reload_classifiers():
@@ -988,12 +1007,35 @@ def _process_rows_batched(
 
     type_labels = _get_type_labels_cached(labels)
 
-    # Phase 1: RF-DETR detection on all images, collect all crops
-    # Structure: for each row, for each col, list of (crop, crop_type)
+    # Phase 1: Batch detection on all images, then collect crops
+    # First pass: collect all images for batch detection
+    batch_images: list[Image.Image] = []
+    image_to_rowcol: list[tuple[int, str]] = []  # (row_idx, col_name)
+
+    for row_idx, (row, images) in enumerate(rows_with_images):
+        for col in url_columns:
+            col_name = str(col)
+            image = images.get(col_name) if images else None
+            if image is not None:
+                batch_images.append(image)
+                image_to_rowcol.append((row_idx, col_name))
+
+    # Batch detect all images at once (single GPU call)
+    if batch_images:
+        all_det_results = detect_objects_batch(batch_images, backend=detector_backend)
+    else:
+        all_det_results = []
+
+    # Build detection lookup: (row_idx, col_name) -> detections
+    det_lookup: dict[tuple[int, str], list[dict]] = {}
+    for img_idx, (row_idx, col_name) in enumerate(image_to_rowcol):
+        det_lookup[(row_idx, col_name)] = all_det_results[img_idx]
+
+    # Second pass: extract crops from detections
     row_col_crops: list[dict[str, list[tuple[Image.Image, str]]]] = []
     all_crops: list[Image.Image] = []
     all_crop_types: list[str] = []
-    crop_to_rowcol: list[tuple[int, str, int]] = []  # (row_idx, col_name, crop_idx_within_col)
+    crop_to_rowcol: list[tuple[int, str, int]] = []
 
     for row_idx, (row, images) in enumerate(rows_with_images):
         col_crops: dict[str, list[tuple[Image.Image, str]]] = {}
@@ -1004,7 +1046,7 @@ def _process_rows_batched(
                 col_crops[col_name] = []
                 continue
 
-            det_results = detect_objects(image, backend=detector_backend)
+            det_results = det_lookup.get((row_idx, col_name), [])
 
             crops_for_col: list[tuple[Image.Image, str]] = []
             if det_results:
