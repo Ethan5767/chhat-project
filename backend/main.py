@@ -982,7 +982,7 @@ def _scp_from(host: str, port: int, key: str, remote: str, local: str, timeout: 
     )
 
 
-def run_pipeline_gpu_job(job_id: str, csv_path: Path):
+def run_pipeline_gpu_job(job_id: str, csv_path: Path, registry_key: str = "batch"):
     """Process a CSV batch on a RunPod GPU pod. Creates pod, uploads, runs, downloads, terminates."""
     import os
     import time as _time
@@ -1028,7 +1028,7 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
 
         # --- Try resuming a stopped pod first ---
         is_resumed = False
-        resumed = _try_resume_pod(api_key, "batch", job_id, ssh_key)
+        resumed = _try_resume_pod(api_key, registry_key, job_id, ssh_key)
         if resumed:
             pod_id, pod_host_id, ssh_host, ssh_port = resumed
             _log_runpod(f"[{job_id}] Using resumed pod {pod_id}")
@@ -1105,7 +1105,7 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
             cost_hr = pod.get("costPerHr", 0)
             _log_runpod(f"gpu-batch: pod created id={pod_id} host={pod_host_id} ~${cost_hr}/hr template={RUNPOD_TEMPLATE} gpu={gpu_id}")
             update_progress(job_id, 5, 100, f"Pod created ({pod_id[:8]}..., ${cost_hr}/hr). Waiting for SSH...")
-            _register_pod("batch", pod_id, gpu_id, pod_host_id)
+            _register_pod(registry_key, pod_id, gpu_id, pod_host_id)
 
             # 2. Wait for SSH port
             ssh_host = ssh_port = None
@@ -1474,6 +1474,133 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
             else:
                 # Keep pod running for follow-up tasks (annotation, etc.)
                 _log_runpod(f"gpu-batch: pod {pod_id} left running for follow-up use (stop manually via /runpod/pods)")
+
+
+def run_pipeline_parallel_job(job_id: str, csv_path: Path, num_pods: int):
+    """Split a CSV across multiple RunPod GPU pods and process in parallel."""
+    import pandas as _pd
+    import time as _time
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+
+    _log_runpod(f"parallel-batch job={job_id[:8]}… csv={csv_path.name} pods={num_pods}")
+    start_time = datetime.now(timezone.utc)
+    _append_batch_history({
+        "job_id": job_id, "filename": csv_path.name, "status": "running_gpu",
+        "start_time": start_time.isoformat(), "end_time": None,
+        "rows": None, "error": None,
+    })
+
+    try:
+        # 1. Split CSV into chunks
+        df = _pd.read_csv(csv_path, encoding="utf-8-sig")
+        total_rows = len(df)
+        chunk_size = (total_rows + num_pods - 1) // num_pods  # ceil division
+        chunks = []
+        for i in range(num_pods):
+            start = i * chunk_size
+            end = min(start + chunk_size, total_rows)
+            if start >= total_rows:
+                break
+            chunk_df = df.iloc[start:end]
+            chunk_path = csv_path.parent / f"{csv_path.stem}_chunk{i}.csv"
+            chunk_df.to_csv(chunk_path, index=False, encoding="utf-8-sig")
+            chunks.append(chunk_path)
+            _log_runpod(f"parallel-batch: chunk {i}: rows {start}-{end} ({len(chunk_df)} rows) -> {chunk_path.name}")
+
+        actual_pods = len(chunks)
+        _log_runpod(f"parallel-batch: {total_rows} rows split into {actual_pods} chunks")
+        update_progress(job_id, 5, 100, f"Split into {actual_pods} chunks. Creating pods...")
+
+        # 2. Run each chunk on its own pod in parallel
+        chunk_results: dict[int, Path | None] = {}
+        chunk_errors: dict[int, str] = {}
+
+        def _run_chunk(chunk_idx: int, chunk_csv: Path) -> Path:
+            """Run a single chunk on its own pod. Uses run_pipeline_gpu_job internally."""
+            chunk_job_id = f"{job_id}_chunk{chunk_idx}"
+            with jobs_lock:
+                jobs[chunk_job_id] = {"status": "running", "progress": 0, "total": 100, "message": ""}
+            _log_runpod(f"parallel-batch: starting chunk {chunk_idx} ({chunk_csv.name})")
+            run_pipeline_gpu_job(chunk_job_id, chunk_csv, registry_key=f"batch_{chunk_idx}")
+            # Check result
+            with jobs_lock:
+                status = jobs.get(chunk_job_id, {}).get("status", "error")
+            if status == "error":
+                err = jobs.get(chunk_job_id, {}).get("error", "unknown")
+                raise RuntimeError(f"Chunk {chunk_idx} failed: {err}")
+            # Find the result file
+            result_file = RESULTS_DIR / f"{chunk_job_id}_{chunk_csv.stem}_results.csv"
+            if not result_file.exists():
+                # Try alternate naming
+                for f in RESULTS_DIR.glob(f"{chunk_job_id}*results*.csv"):
+                    result_file = f
+                    break
+            if not result_file.exists():
+                raise RuntimeError(f"Chunk {chunk_idx} result file not found")
+            _log_runpod(f"parallel-batch: chunk {chunk_idx} done -> {result_file.name}")
+            return result_file
+
+        with ThreadPoolExecutor(max_workers=actual_pods) as pool:
+            futures = {
+                pool.submit(_run_chunk, i, chunk): i
+                for i, chunk in enumerate(chunks)
+            }
+            for future in as_completed(futures):
+                idx = futures[future]
+                try:
+                    chunk_results[idx] = future.result()
+                except Exception as exc:
+                    chunk_errors[idx] = str(exc)
+                    _log_runpod(f"parallel-batch: chunk {idx} error: {exc}")
+
+        if chunk_errors:
+            failed = ", ".join(f"chunk{k}" for k in sorted(chunk_errors.keys()))
+            _log_runpod(f"parallel-batch: {len(chunk_errors)} chunks failed: {failed}")
+
+        # 3. Merge results in original order
+        update_progress(job_id, 90, 100, "Merging results...")
+        merged_dfs = []
+        for i in range(actual_pods):
+            if i in chunk_results and chunk_results[i] and chunk_results[i].exists():
+                merged_dfs.append(_pd.read_csv(chunk_results[i], encoding="utf-8-sig"))
+            else:
+                _log_runpod(f"parallel-batch: WARNING chunk {i} has no results, skipping")
+
+        if not merged_dfs:
+            raise RuntimeError("All chunks failed — no results to merge")
+
+        merged = _pd.concat(merged_dfs, ignore_index=True)
+        merged_path = RESULTS_DIR / f"{job_id}_{csv_path.stem}_results.csv"
+        merged.to_csv(merged_path, index=False, encoding="utf-8-sig")
+        _save_result_meta(job_id, merged_path)
+
+        elapsed = (datetime.now(timezone.utc) - start_time).total_seconds()
+        _log_runpod(f"parallel-batch: complete job={job_id[:8]}… rows={len(merged)} "
+                    f"pods={actual_pods} elapsed={elapsed:.0f}s ({elapsed/60:.1f}min)")
+
+        with jobs_lock:
+            jobs[job_id]["status"] = "done"
+        _update_batch_history(job_id, {
+            "status": "done", "end_time": datetime.now(timezone.utc).isoformat(),
+            "rows": len(merged),
+        })
+        update_progress(job_id, 100, 100, f"Done! {len(merged)} rows processed on {actual_pods} pods")
+
+        # Clean up chunk files
+        for chunk in chunks:
+            chunk.unlink(missing_ok=True)
+
+    except Exception as exc:
+        import traceback
+        tb = traceback.format_exc()
+        _log_runpod(f"parallel-batch: ERROR job={job_id[:8]}… {tb}")
+        with jobs_lock:
+            jobs[job_id]["status"] = "error"
+            jobs[job_id]["error"] = str(exc)
+        _update_batch_history(job_id, {
+            "status": "error", "end_time": datetime.now(timezone.utc).isoformat(),
+            "error": tb,
+        })
 
 
 def run_dinov2_finetune_gpu_job(
@@ -2765,6 +2892,31 @@ async def run_pipeline_endpoint(csv_file: UploadFile = File(...), use_gpu: str =
     else:
         threading.Thread(target=run_pipeline_job, args=(job_id, save_path), daemon=True).start()
     return {"job_id": job_id, "gpu": gpu}
+
+
+@app.post("/run-pipeline-parallel")
+async def run_pipeline_parallel_endpoint(
+    csv_file: UploadFile = File(...),
+    num_pods: int = Form(3),
+):
+    """Run batch pipeline in parallel across multiple RunPod GPU pods."""
+    if not csv_file.filename.lower().endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Only .csv files are accepted.")
+    if num_pods < 1 or num_pods > 10:
+        raise HTTPException(status_code=400, detail="num_pods must be 1-10.")
+
+    UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+    save_path = UPLOADS_DIR / csv_file.filename
+    data = await csv_file.read()
+    save_path.write_bytes(data)
+
+    job_id = create_job()
+    threading.Thread(
+        target=run_pipeline_parallel_job,
+        args=(job_id, save_path, num_pods),
+        daemon=True,
+    ).start()
+    return {"job_id": job_id, "gpu": True, "num_pods": num_pods}
 
 
 @app.get("/progress/{job_id}")
