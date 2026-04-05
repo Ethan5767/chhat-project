@@ -1470,8 +1470,12 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path, registry_key: str = "batch
             if job_status == "error":
                 _log_runpod(f"gpu-batch: pod {pod_id} left running (job errored — terminate manually when done)")
             else:
-                # Keep pod running for follow-up tasks (annotation, etc.)
-                _log_runpod(f"gpu-batch: pod {pod_id} left running for follow-up use (stop manually via /runpod/pods)")
+                try:
+                    _runpod_stop(api_key, pod_id)
+                    _mark_pod_stopped(registry_key)
+                    _log_runpod(f"gpu-batch: pod {pod_id} stopped for reuse")
+                except Exception as stop_exc:
+                    _log_runpod(f"gpu-batch: podStop failed ({stop_exc}), pod left running")
 
 
 def run_pipeline_parallel_job(job_id: str, csv_path: Path, num_pods: int):
