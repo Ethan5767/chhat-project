@@ -1045,17 +1045,15 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path, registry_key: str = "batch
             deploy_rounds, deploy_pause = _classifier_deploy_retry_settings()
             # Fastest GPUs first for batch inference
             batch_gpu_chain = [
-                "NVIDIA A100-SXM4-80GB",
-                "NVIDIA A100 80GB PCIe",
-                "NVIDIA A100-SXM4-40GB",
                 "NVIDIA GeForce RTX 4090",
+                "NVIDIA GeForce RTX 3090",
+                "NVIDIA RTX A5000",
+                "NVIDIA RTX A6000",
+                "NVIDIA GeForce RTX 4080",
                 "NVIDIA L40S",
                 "NVIDIA L40",
-                "NVIDIA RTX A6000",
-                "NVIDIA RTX A5000",
-                "NVIDIA GeForce RTX 4080",
-                "NVIDIA GeForce RTX 3090",
                 "NVIDIA L4",
+                "NVIDIA A100-SXM4-80GB",  # overkill for batch inference, use only as fallback
             ]
             pod = None
             gpu_id = batch_gpu_chain[0]
