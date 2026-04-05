@@ -1366,14 +1366,21 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
             raise RuntimeError("CUDA not available on pod — aborting to avoid CPU pipeline")
         _log_runpod(f"gpu-batch: {(cuda_chk.stdout or '').strip()}")
 
-        # 6b. Ensure Co-DETR deps (mmdet/mmengine/mmcv) are installed
-        _log_runpod("gpu-batch: verifying Co-DETR dependencies on pod…")
-        mmdet_check = _ssh_cmd(ssh_host, ssh_port, ssh_key,
+        # 6b. Ensure all pipeline deps are installed (transformers, mmdet, etc.)
+        _log_runpod("gpu-batch: verifying pipeline dependencies on pod…")
+        dep_check = _ssh_cmd(ssh_host, ssh_port, ssh_key,
             "cd /workspace/chhat-project && source .venv/bin/activate && "
-            "python -c 'import mmdet; print(mmdet.__version__)' 2>&1",
+            "python -c 'import transformers; import mmdet; print(transformers.__version__, mmdet.__version__)' 2>&1",
             timeout=30, pod_id=pod_id, pod_host_id=pod_host_id)
-        if mmdet_check.returncode != 0 or not re.search(r'\d+\.\d+', mmdet_check.stdout or ""):
-            _log_runpod("gpu-batch: mmdet not found, installing (builds mmcv from source ~10-30 min)…")
+        if dep_check.returncode != 0 or not re.search(r'\d+\.\d+', dep_check.stdout or ""):
+            _log_runpod("gpu-batch: deps missing, installing (mmcv builds from source ~10-30 min)…")
+            # Install non-mmcv deps first (fast)
+            _ssh_cmd(ssh_host, ssh_port, ssh_key,
+                     "cd /workspace/chhat-project && source .venv/bin/activate && "
+                     "pip install transformers faiss-cpu supervision scikit-learn "
+                     "pandas Pillow numpy requests python-multipart boto3 openpyxl python-dotenv",
+                     timeout=300, pod_id=pod_id, pod_host_id=pod_host_id)
+            # Install mmcv/mmdet/mmengine (slow - mmcv compiles CUDA ops)
             _ssh_cmd(ssh_host, ssh_port, ssh_key,
                      "cd /workspace/chhat-project && source .venv/bin/activate && "
                      "pip install --upgrade setuptools && "
