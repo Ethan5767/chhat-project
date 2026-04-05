@@ -230,6 +230,18 @@ All issues discovered 2026-04-05. Every item below caused a job failure when mis
 
 9. **Server OOM with Co-DETR**: Co-DETR Swin-L + DINOv2 together use ~8.7 GB RAM. The 16 GB server swap-thrashes and OOM-kills annotation scripts. Run Co-DETR batch processing on RunPod GPU, not the server.
 
+### RunPod GPU Batch: Additional Issues Found 2026-04-05
+
+10. **`pip install --upgrade pip` causes I/O errors**: RunPod container disk gets `OSError: [Errno 5] Input/output error` when pip upgrades itself from 24.0 to 26.0.1. **Do NOT upgrade pip** in bootstrap -- template pip works fine.
+
+11. **`requirements.txt || true` swallows critical failures**: The bootstrap used `pip install -r requirements.txt || true` which silently fails on mmcv, but also skips `transformers` and other deps listed after it. **Fix**: install non-mmcv deps explicitly (transformers, faiss-cpu, supervision, etc.) instead of via requirements.txt. Install mmcv/mmdet/mmengine separately.
+
+12. **`transformers` not installed = pipeline import fails**: `from transformers import AutoImageProcessor, AutoModel` is the first import in pipeline.py. If transformers isn't installed, the pipeline crashes immediately with `ModuleNotFoundError`. Bootstrap must install it explicitly.
+
+13. **Resumed pod from failed bootstrap has partial state**: If bootstrap crashes mid-way (e.g. pip I/O error), the pod has a cloned repo but missing deps. The resumed path skips bootstrap (only does git pull). The mmdet check step catches mmcv/mmdet, but transformers/faiss/etc. won't be checked. The bootstrap must be idempotent and complete.
+
+14. **Git `--depth 1` clone can't switch branches**: `git fetch origin co-detr-migration && git checkout co-detr-migration` fails on a depth-1 clone of `main` because the branch ref doesn't exist locally. For resumed pods from old clones, upload files directly (co_detr module, config) rather than relying on branch switch.
+
 ### URL Column Detection (`get_url_columns`)
 - Client CSVs have sparse image columns (some only 2-5% of rows have URLs)
 - Old 30% threshold missed most image columns; lowered to 1 URL in first 50 rows
