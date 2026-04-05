@@ -248,6 +248,7 @@ RUNPOD_API_URL = "https://api.runpod.io/graphql"
 RUNPOD_GPU_ID = "NVIDIA A100 80GB PCIe"
 RUNPOD_TEMPLATE = "runpod-torch-v240"
 RUNPOD_REPO = "https://github.com/Ethan5767/chhat-project.git"
+RUNPOD_REPO_BRANCH = "co-detr-migration"
 
 
 CLASSIFIER_GPU_FALLBACK_CHAIN = [
@@ -1156,7 +1157,7 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
                 _log_runpod("gpu-batch: cloning repo + bootstrap on pod (may take several minutes)")
                 update_progress(job_id, 18, 100, "Cloning repository and installing dependencies...")
                 r = _ssh_cmd(ssh_host, ssh_port, ssh_key,
-                              f"cd /workspace && git clone --depth 1 {RUNPOD_REPO} && cd chhat-project && bash runpod/bootstrap_training_pod.sh",
+                              f"cd /workspace && git clone --depth 1 -b {RUNPOD_REPO_BRANCH} {RUNPOD_REPO} && cd chhat-project && bash runpod/bootstrap_training_pod.sh",
                               timeout=1200, pod_id=pod_id, pod_host_id=pod_host_id)
                 if r.returncode != 0:
                     raise RuntimeError(f"Bootstrap failed: {r.stdout[-500:]}")
@@ -1165,35 +1166,73 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
                 _log_runpod("gpu-batch: repo exists on pod; git pull")
                 _ssh_cmd(ssh_host, ssh_port, ssh_key, "cd /workspace/chhat-project && git pull", timeout=60, pod_id=pod_id, pod_host_id=pod_host_id)
         else:
-            # Quick git pull on resumed pod
+            # Ensure correct branch + pull on resumed pod
             _ssh_cmd(ssh_host, ssh_port, ssh_key,
-                     "cd /workspace/chhat-project && git pull --ff-only",
-                     timeout=60, pod_id=pod_id, pod_host_id=pod_host_id)
+                     f"cd /workspace/chhat-project && git fetch origin {RUNPOD_REPO_BRANCH} && "
+                     f"git checkout {RUNPOD_REPO_BRANCH} && git pull --ff-only",
+                     timeout=120, pod_id=pod_id, pod_host_id=pod_host_id)
 
-        # 4b. Upload optimised pipeline.py from server to pod (overrides git version)
-        local_pipeline = _BACKEND_ROOT / "pipeline.py"
-        if local_pipeline.exists():
-            _log_runpod("gpu-batch: uploading server pipeline.py to pod…")
-            up_pl = _scp_to(ssh_host, ssh_port, ssh_key, str(local_pipeline),
-                            "/workspace/chhat-project/backend/pipeline.py",
-                            timeout=120, pod_id=pod_id, pod_host_id=pod_host_id)
-            if up_pl.returncode == 0:
-                _log_runpod("gpu-batch: pipeline.py uploaded OK")
-            else:
-                _log_runpod(f"gpu-batch: WARNING pipeline.py upload failed, using git version")
+        # 4b. Upload optimised pipeline.py + inference config from server to pod
+        for _upload_name, _remote_path in [
+            ("pipeline.py", "/workspace/chhat-project/backend/pipeline.py"),
+            ("co_detr_inference_config.py", "/workspace/chhat-project/backend/co_detr_inference_config.py"),
+        ]:
+            local_file = _BACKEND_ROOT / _upload_name
+            if local_file.exists():
+                _log_runpod(f"gpu-batch: uploading server {_upload_name} to pod…")
+                up_pl = _scp_to(ssh_host, ssh_port, ssh_key, str(local_file),
+                                _remote_path, timeout=120, pod_id=pod_id, pod_host_id=pod_host_id)
+                if up_pl.returncode == 0:
+                    _log_runpod(f"gpu-batch: {_upload_name} uploaded OK")
+                else:
+                    _log_runpod(f"gpu-batch: WARNING {_upload_name} upload failed, using git version")
+
+        # 4c. Upload Co-DETR custom module (backend/co_detr/) if not present on pod
+        co_detr_check = _ssh_cmd(ssh_host, ssh_port, ssh_key,
+            "test -d /workspace/chhat-project/backend/co_detr && echo CO_DETR_OK || echo CO_DETR_MISSING",
+            timeout=15, pod_id=pod_id, pod_host_id=pod_host_id)
+        if "CO_DETR_MISSING" in (co_detr_check.stdout or ""):
+            co_detr_dir = _BACKEND_ROOT / "co_detr"
+            if co_detr_dir.is_dir():
+                import tarfile as _tarfile
+                import tempfile as _tempfile
+                co_detr_tar = Path(_tempfile.gettempdir()) / "co_detr.tar.gz"
+                with _tarfile.open(co_detr_tar, "w:gz") as tar:
+                    for f in co_detr_dir.glob("*.py"):
+                        tar.add(str(f), arcname=f"co_detr/{f.name}")
+                _log_runpod(f"gpu-batch: uploading Co-DETR module ({co_detr_tar.stat().st_size // 1024} KB)…")
+                up = _scp_to(ssh_host, ssh_port, ssh_key, str(co_detr_tar),
+                             "/workspace/chhat-project/backend/co_detr.tar.gz",
+                             timeout=120, pod_id=pod_id, pod_host_id=pod_host_id)
+                if up.returncode == 0:
+                    _ssh_cmd(ssh_host, ssh_port, ssh_key,
+                             "cd /workspace/chhat-project/backend && tar --no-same-owner -xzf co_detr.tar.gz && rm co_detr.tar.gz",
+                             timeout=30, pod_id=pod_id, pod_host_id=pod_host_id)
+                    _log_runpod("gpu-batch: Co-DETR module uploaded OK")
+                else:
+                    _log_runpod("gpu-batch: WARNING Co-DETR module upload failed")
+                co_detr_tar.unlink(missing_ok=True)
 
         update_progress(job_id, 25, 100, "Uploading CSV...")
         _log_runpod(f"gpu-batch: uploading CSV ({csv_path.name})")
 
         # 5. Upload CSV
         remote_csv_path = f"/workspace/chhat-project/backend/uploads/{csv_path.name}"
+        _ssh_cmd(ssh_host, ssh_port, ssh_key,
+                 "mkdir -p /workspace/chhat-project/backend/uploads",
+                 timeout=15, pod_id=pod_id, pod_host_id=pod_host_id)
         r = _scp_to(ssh_host, ssh_port, ssh_key, str(csv_path),
                      remote_csv_path, timeout=120, pod_id=pod_id, pod_host_id=pod_host_id)
         if r.returncode != 0:
             raise RuntimeError(f"CSV upload failed: {r.stderr[:200]}")
 
-        # 5b. Upload model weights needed for inference (skip on resumed pod -- already present)
-        if not is_resumed:
+        # 5b. Upload model weights if missing (even resumed pods may lack them if prior job errored)
+        _weights_present = _ssh_cmd(ssh_host, ssh_port, ssh_key,
+            "test -f /workspace/chhat-project/backend/classifier_model/pack/best_classifier.pth "
+            "&& test -f /workspace/chhat-project/co_detr_weights/finetuned_epoch12.pth "
+            "&& echo WEIGHTS_OK || echo WEIGHTS_MISSING",
+            timeout=15, pod_id=pod_id, pod_host_id=pod_host_id)
+        if "WEIGHTS_MISSING" in (_weights_present.stdout or ""):
             _log_runpod("gpu-batch: uploading model weights to pod…")
             model_uploads = [
                 # (local_path, remote_dir, filename)
@@ -1315,6 +1354,31 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
             _log_runpod(f"gpu-batch: WARNING CUDA check failed: {(cuda_chk.stdout or cuda_chk.stderr or '')[:300]}")
             raise RuntimeError("CUDA not available on pod — aborting to avoid CPU pipeline")
         _log_runpod(f"gpu-batch: {(cuda_chk.stdout or '').strip()}")
+
+        # 6b. Ensure Co-DETR deps (mmdet/mmengine/mmcv) are installed
+        _log_runpod("gpu-batch: verifying Co-DETR dependencies on pod…")
+        mmdet_check = _ssh_cmd(ssh_host, ssh_port, ssh_key,
+            "cd /workspace/chhat-project && source .venv/bin/activate && "
+            "python -c 'import mmdet; print(mmdet.__version__)' 2>&1",
+            timeout=30, pod_id=pod_id, pod_host_id=pod_host_id)
+        if mmdet_check.returncode != 0 or not re.search(r'\d+\.\d+', mmdet_check.stdout or ""):
+            _log_runpod("gpu-batch: mmdet not found, installing (builds mmcv from source ~10-30 min)…")
+            _ssh_cmd(ssh_host, ssh_port, ssh_key,
+                     "cd /workspace/chhat-project && source .venv/bin/activate && "
+                     "pip install --upgrade setuptools && "
+                     "pip install mmcv==2.1.0 --no-build-isolation && "
+                     "pip install mmdet==3.3.0 mmengine==0.10.7",
+                     timeout=2400, pod_id=pod_id, pod_host_id=pod_host_id)
+            # Verify
+            verify = _ssh_cmd(ssh_host, ssh_port, ssh_key,
+                "cd /workspace/chhat-project && source .venv/bin/activate && "
+                "python -c 'import mmdet; print(mmdet.__version__)'",
+                timeout=30, pod_id=pod_id, pod_host_id=pod_host_id)
+            if verify.returncode != 0:
+                raise RuntimeError(f"mmdet install failed on pod: {verify.stdout[-300:]}")
+            _log_runpod(f"gpu-batch: mmdet installed OK: {(verify.stdout or '').strip()}")
+        else:
+            _log_runpod(f"gpu-batch: mmdet already installed: {(mmdet_check.stdout or '').strip()}")
 
         # Run pipeline on pod
         update_progress(job_id, 30, 100, "Running detection pipeline on GPU...")

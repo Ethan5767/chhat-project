@@ -4,17 +4,13 @@ This file provides guidance to Claude Code when working in the rf-detr-cigarette
 
 ## Project Overview
 
-Cigarette brand detection system for CHHAT. Dual-detector backend (Co-DETR Swin-L or RF-DETR) for object detection and DINOv2 + linear classifier for brand classification. Backend is FastAPI, frontend is Streamlit.
+Cigarette brand detection system for CHHAT. Uses RF-DETR-Medium for object detection and DINOv2 + linear classifier for brand classification. Backend is FastAPI, frontend is Streamlit.
 
 ## Architecture
 
-- **Detection**: Dual-detector system, selectable via UI or `CHHAT_DETECTOR_BACKEND` env var:
-  - **Co-DETR Swin-L** (default): mmdetection-based, mAP=0.837, checkpoint at `co_detr_weights/epoch_24.pth` (~2.8GB, .gitignored). Single class ("cigarette").
-  - **RF-DETR**: rfdetr pip package, multiple sizes (nano to 2xlarge), checkpoint at `runs/checkpoint_best_ema.pth`. Two classes (pack, box).
+- **Detection**: RF-DETR-Medium fine-tuned on cigarette pack dataset (checkpoint at `runs/checkpoint_best_ema.pth`)
 - **Classification**: DINOv2-base (frozen or fine-tuned) backbone + per-packaging-type linear classifiers
-- **Pipeline flow**: Image -> detect packs (Co-DETR or RF-DETR) -> crop -> DINOv2 embed -> classifier predict -> output
-- **Co-DETR model code**: `backend/co_detr/` (5 files from mmdet CO_DETR project)
-- **Co-DETR config**: `backend/co_detr_inference_config.py`
+- **Pipeline flow**: Image -> RF-DETR detect packs -> crop -> DINOv2 embed -> classifier predict -> output
 - **Packaging types**: pack, box (separate classifiers per type)
 - **Brand registry**: 29 brands, 68 products defined in `backend/brand_registry.py` (single source of truth)
 
@@ -42,9 +38,7 @@ python brand_classifier.py --packaging-type pack --epochs 100
 | File | Purpose |
 |------|---------|
 | `backend/main.py` | FastAPI server, all endpoints, RunPod GPU job orchestration |
-| `backend/pipeline.py` | Detection + classification pipeline (dual-detector) |
-| `backend/co_detr_inference_config.py` | Co-DETR Swin-L mmdet inference config |
-| `backend/co_detr/` | Co-DETR model code (CoDETR, CoDINOHead, etc.) |
+| `backend/pipeline.py` | Detection + classification pipeline |
 | `backend/brand_registry.py` | Brand/product definitions (source of truth) |
 | `backend/output_format.py` | CSV output column mappings (Q12A/Q12B) |
 | `brand_classifier.py` | DINOv2 classifier training script |
@@ -192,6 +186,49 @@ These issues were discovered and fixed. Document here to avoid repeating them:
 - Must be registered in RunPod account settings (Settings > SSH Public Keys)
 - When server IP changes, the key is already on the server but may need re-registering in RunPod dashboard
 - Pod SSH auth uses paramiko through `ssh.runpod.io` proxy with `podHostId` as username
+
+### RunPod GPU Batch: Directory & Dependency Issues
+- **`backend/uploads/` must be created before CSV upload**: The `mkdir -p` for uploads dir must happen BEFORE `_scp_to` for the CSV, not after (in the image cache step)
+- **Weight upload must check, not assume**: Resumed pods may lack weights if a prior job errored mid-upload. Always `test -f` the classifier weight on the pod before skipping upload
+- **Co-DETR needs mmdet/mmengine/mmcv**: These are NOT pre-installed on RunPod templates. The batch job must verify `import mmdet` and install if missing before running the pipeline
+- **Image cache upload must filter by CSV**: Only upload cached images whose IDs appear in the CSV URLs, not the entire 26k+ cache. Parse `?ID=(\d+)` from CSV URL columns to build needed set
+
+### mmcv Installation on RunPod (CRITICAL)
+- **`mim install mmcv` and `pip install mmcv` fail** on RunPod pods due to `pkg_resources` missing in pip's build isolation environment (setuptools 82.0+ deprecated it)
+- **Fix**: `pip install mmcv==2.1.0 --no-build-isolation` — uses venv's setuptools instead of isolated build env
+- **Alternative**: `PIP_NO_BUILD_ISOLATION=1 mim install mmcv==2.1.0`
+- mmcv builds from source for torch 2.4.1+cu124 (no prebuilt wheels available) — takes 10-30 min compiling CUDA ops
+- The Co-DETR training pod (H200) used the same env (Python 3.11.10, torch 2.4.1+cu124) and had mmcv working, confirming compatibility
+- **Bootstrap script** (`runpod/bootstrap_training_pod.sh`) must use `--no-build-isolation` for mmcv install
+- The batch job clone must use `co-detr-migration` branch (not `main`) since Co-DETR configs and mmdet bootstrap are only on that branch (`RUNPOD_REPO_BRANCH = "co-detr-migration"`)
+
+### Co-DETR Training Results
+- Trained on H200 GPU: 36 epochs on 1266 images (1043 main + 223 Chhat), single class "cigarette"
+- Epoch 36: mAP 0.770, mAP@50 0.980, mAP@75 0.835
+- Config: `co_detr_weights/codetr_swinl_o365_combined.py` (Swin-L backbone, Objects365+COCO pretrained)
+- Inference config: `backend/co_detr_inference_config.py` (must be in git repo for pods)
+- **Batch job must upload** `co_detr_inference_config.py` alongside `pipeline.py` to the pod — it's not in the git `main` branch
+
+### RunPod GPU Batch: Co-DETR Full Setup Checklist
+All issues discovered 2026-04-05. Every item below caused a job failure when missed:
+
+1. **Clone from `co-detr-migration` branch** (not `main`): `backend/co_detr/` module, `co_detr_inference_config.py`, and mmdet bootstrap only exist on this branch. Set `RUNPOD_REPO_BRANCH = "co-detr-migration"` and use `-b {RUNPOD_REPO_BRANCH}` in git clone.
+
+2. **Upload `backend/co_detr/` module to pod**: Even after cloning the right branch, resumed pods from older clones (main branch) won't have it. The batch job must `test -d backend/co_detr` and upload as tarball if missing. This module contains the custom Co-DETR model definitions (codetr.py, transformer.py, etc.) required by `custom_imports` in the inference config.
+
+3. **Upload `co_detr_inference_config.py` alongside `pipeline.py`**: The batch job uploads server's pipeline.py to override git version, but must also upload the inference config. Both go to `backend/` on the pod.
+
+4. **`mkdir -p backend/uploads/` before CSV upload**: The uploads dir doesn't exist after a fresh clone. Must create it before `_scp_to` for the CSV file, not after (the image cache step also needs it but runs later).
+
+5. **Check weights exist, don't assume resumed = has weights**: Use `test -f` on pod for classifier + Co-DETR checkpoint before skipping upload. A prior job may have errored mid-upload leaving the pod without weights.
+
+6. **Install mmcv with `--no-build-isolation`**: `pip install mmcv==2.1.0 --no-build-isolation` (takes 10-30 min compiling CUDA ops). Standard pip install fails due to `pkg_resources` missing in build isolation with setuptools 82.0+. The batch job must check `import mmdet` and install if missing, with a 2400s timeout.
+
+7. **Filter image cache by CSV**: Only tar+upload cached images whose IDs appear in the CSV URLs. Without filtering, it tries to upload all 26k+ images (10+ GB tarball).
+
+8. **`CHHAT_DATA_ROOT` not set in direct script runs**: The systemd drop-in sets `CHHAT_DATA_ROOT=/opt/chhat-data` for the backend service, but running scripts directly via `nohup python ...` doesn't inherit it. Always pass `CHHAT_DATA_ROOT=/opt/chhat-data` when running scripts outside systemd.
+
+9. **Server OOM with Co-DETR**: Co-DETR Swin-L + DINOv2 together use ~8.7 GB RAM. The 16 GB server swap-thrashes and OOM-kills annotation scripts. Run Co-DETR batch processing on RunPod GPU, not the server.
 
 ### URL Column Detection (`get_url_columns`)
 - Client CSVs have sparse image columns (some only 2-5% of rows have URLs)

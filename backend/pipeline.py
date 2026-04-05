@@ -62,7 +62,7 @@ _brand_classifier = None
 _class_mapping = None
 
 # Co-DETR globals
-CODETR_CONF_THRESHOLD = 0.35
+CODETR_CONF_THRESHOLD = 0.05
 DEFAULT_DETECTOR = os.environ.get("CHHAT_DETECTOR_BACKEND", "codetr")
 _codetr_model = None
 _codetr_model_lock = _threading.Lock()
@@ -265,8 +265,8 @@ def load_codetr():
 
         # Find checkpoint
         ckpt_candidates = [
-            _DATA_ROOT / "co_detr_weights" / "epoch_36.pth",
-            _PROJECT_ROOT / "co_detr_weights" / "epoch_36.pth",
+            _DATA_ROOT / "co_detr_weights" / "finetuned_epoch12.pth",
+            _PROJECT_ROOT / "co_detr_weights" / "finetuned_epoch12.pth",
         ]
         checkpoint = None
         for c in ckpt_candidates:
@@ -275,7 +275,7 @@ def load_codetr():
                 break
         if checkpoint is None:
             raise FileNotFoundError(
-                "Co-DETR checkpoint not found. Expected epoch_36.pth in "
+                "Co-DETR checkpoint not found. Expected finetuned_epoch12.pth in "
                 "co_detr_weights/ under project root or CHHAT_DATA_ROOT."
             )
 
@@ -1225,6 +1225,10 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
     for i in range(start_row, min(start_row + PREFETCH_AHEAD * batch_size, process_len)):
         _submit_prefetch(i)
 
+    import time as _time_mod
+    _pipeline_start = _time_mod.monotonic()
+    _last_log_time = _pipeline_start
+
     row_idx = start_row
     while row_idx < process_len:
         # Collect a batch of rows with their prefetched images
@@ -1278,6 +1282,19 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
 
         if batch_end % SAVE_INTERVAL == 0 or batch_end == process_len:
             _flush(completed_rows)
+
+        # Timing log every row
+        _now = _time_mod.monotonic()
+        _elapsed = _now - _pipeline_start
+        _row_time = _now - _last_log_time
+        _rows_done = batch_end - start_row
+        _avg = _elapsed / _rows_done if _rows_done else 0
+        _remaining = (process_len - batch_end) * _avg
+        logger.info(
+            "Row %d/%d done (%.1fs this batch, %.1fs avg/row, %.0fs elapsed, ~%.0fs remaining)",
+            batch_end, process_len, _row_time, _avg, _elapsed, _remaining,
+        )
+        _last_log_time = _now
 
         if progress_cb:
             progress_cb(batch_end, process_len, f"Processed row {batch_end}/{process_len}")

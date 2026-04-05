@@ -13,9 +13,9 @@ python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null \
   || pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 # Install remaining deps
 pip install --extra-index-url https://download.pytorch.org/whl/cu124 -r requirements.txt || true
-# mmcv needs openmim for prebuilt wheels (building from source takes 30+ min)
-pip install openmim
-mim install mmcv>=2.1.0
+# mmcv: no prebuilt wheels for torch 2.4+cu124; --no-build-isolation fixes pkg_resources error
+pip install --upgrade setuptools openmim
+pip install mmcv==2.1.0 --no-build-isolation
 # Verify mmdet stack
 python -c "import mmdet; import mmengine; import mmcv; print(f'mmdet={mmdet.__version__} mmengine={mmengine.__version__} mmcv={mmcv.__version__}')"
 # Extras not in requirements.txt
