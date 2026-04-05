@@ -2963,6 +2963,65 @@ def download_endpoint(job_id: str):
     return FileResponse(path=str(path), filename=path.name, media_type="text/csv")
 
 
+@app.get("/download-partial/{job_id}")
+def download_partial_endpoint(job_id: str):
+    """Download partial results from a running GPU batch job.
+
+    The pipeline saves every 50 rows to a results CSV on the pod.
+    This endpoint fetches that partial file from the pod even while
+    the job is still running.
+    """
+    # First check if a completed result already exists locally
+    local_path = _load_result_meta(job_id)
+    if local_path and local_path.exists():
+        return FileResponse(path=str(local_path), filename=local_path.name, media_type="text/csv")
+
+    # Try to download partial results from the running pod
+    api_key = _get_runpod_api_key()
+    if not api_key:
+        raise HTTPException(status_code=500, detail="RUNPOD_API_KEY not set")
+
+    # Find the pod for this job (check all batch registry keys)
+    reg = _load_pod_registry()
+    pod_info = None
+    for key, entry in reg.items():
+        if key.startswith("batch") and entry.get("status") == "running":
+            pod_info = entry
+            break
+    if not pod_info:
+        raise HTTPException(status_code=404, detail="No running batch pod found")
+
+    pod_id = pod_info["pod_id"]
+    pod_host_id = pod_info["pod_host_id"]
+    ssh_key = str(Path.home() / ".ssh" / "runpod_ed25519")
+
+    # Find the CSV name from batch history
+    history = _load_batch_history()
+    csv_stem = None
+    for h in history:
+        if h.get("job_id", "").startswith(job_id[:8]):
+            csv_stem = Path(h.get("filename", "")).stem
+            break
+    if not csv_stem:
+        raise HTTPException(status_code=404, detail="Job not found in batch history")
+
+    remote_path = f"/workspace/chhat-project/backend/uploads/{csv_stem}_results.csv"
+    local_partial = RESULTS_DIR / f"{job_id}_partial_results.csv"
+
+    try:
+        r = _scp_from("", 0, ssh_key, remote_path, str(local_partial),
+                       timeout=120, pod_id=pod_id, pod_host_id=pod_host_id)
+        if r.returncode != 0:
+            raise HTTPException(status_code=404, detail="Partial results not available yet (pipeline may still be starting)")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch partial results: {exc}")
+
+    if not local_partial.exists() or local_partial.stat().st_size < 10:
+        raise HTTPException(status_code=404, detail="Partial results file is empty")
+
+    return FileResponse(path=str(local_partial), filename=f"{csv_stem}_partial_results.csv", media_type="text/csv")
+
+
 @app.get("/batch-history")
 def batch_history(limit: int = 50):
     """List past batch processing jobs with status and download info."""
