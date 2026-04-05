@@ -1265,13 +1265,13 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
             codetr_ckpt = None
             for _codetr_dir in [_DATA_ROOT / "co_detr_weights",
                                 _BACKEND_ROOT.parent / "co_detr_weights"]:
-                _candidate = _codetr_dir / "epoch_36.pth"
+                _candidate = _codetr_dir / "finetuned_epoch12.pth"
                 if _candidate.exists():
                     codetr_ckpt = _candidate
                     break
             if codetr_ckpt:
                 model_uploads.append((codetr_ckpt,
-                                      "/workspace/chhat-project/co_detr_weights/epoch_36.pth"))
+                                      "/workspace/chhat-project/co_detr_weights/finetuned_epoch12.pth"))
                 _log_runpod(f"gpu-batch: Co-DETR checkpoint: {codetr_ckpt}")
             else:
                 _log_runpod("gpu-batch: WARNING no Co-DETR checkpoint found (skip if using rfdetr)")
@@ -1302,8 +1302,19 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
                     local_cache_dir = fallback_cache
                     _log_runpod(f"gpu-batch: using fallback cache at {fallback_cache}")
             if local_cache_dir.is_dir() and any(local_cache_dir.glob("*.jpg")):
-                cache_files = list(local_cache_dir.glob("*.jpg"))
-                _log_runpod(f"gpu-batch: image cache found ({len(cache_files)} images), creating tarball…")
+                # Only include cached images whose IDs appear in the CSV URLs
+                import re as _re_mod
+                import pandas as _pd_cache
+                csv_df = _pd_cache.read_csv(csv_path, encoding="utf-8-sig")
+                needed_ids: set[str] = set()
+                for col in csv_df.columns:
+                    for val in csv_df[col].dropna().astype(str):
+                        m = _re_mod.search(r'[?&]ID=(\d+)', val, _re_mod.IGNORECASE)
+                        if m:
+                            needed_ids.add(m.group(1))
+                all_cache = list(local_cache_dir.glob("*.jpg"))
+                cache_files = [f for f in all_cache if f.stem in needed_ids]
+                _log_runpod(f"gpu-batch: image cache found ({len(all_cache)} total, {len(cache_files)} needed for this CSV), creating tarball…")
                 import tarfile
                 import tempfile
                 tar_path = Path(tempfile.gettempdir()) / "image_cache.tar.gz"
