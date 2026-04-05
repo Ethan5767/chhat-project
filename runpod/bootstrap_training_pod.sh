@@ -7,7 +7,7 @@ cd "$ROOT" || { echo "ERROR: Cannot cd to $ROOT"; exit 1; }
 python3 -m venv --system-site-packages .venv || { echo "ERROR: venv creation failed"; exit 1; }
 source .venv/bin/activate || { echo "ERROR: venv activation failed"; exit 1; }
 
-python -m pip install --upgrade pip
+# Skip pip upgrade -- template pip works fine; upgrading can cause I/O errors on container disk
 # Template already has PyTorch+CUDA; only install if missing
 python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null \
   || pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
