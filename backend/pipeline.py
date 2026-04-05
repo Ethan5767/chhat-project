@@ -45,7 +45,7 @@ _RFDETR_CHECKPOINT_DIR = _DATA_ROOT / "runs" if (_DATA_ROOT / "runs").exists() e
 
 DOWNLOAD_TIMEOUT = 15
 RFDETR_CONF_THRESHOLD = 0.35
-MIN_OUTPUT_CONFIDENCE = 0.75
+MIN_OUTPUT_CONFIDENCE = 0.80
 CLASSIFIER_TOP_K = 5
 
 import threading as _threading
@@ -62,7 +62,7 @@ _brand_classifier = None
 _class_mapping = None
 
 # Co-DETR globals
-CODETR_CONF_THRESHOLD = 0.05
+CODETR_CONF_THRESHOLD = 0.10
 DEFAULT_DETECTOR = os.environ.get("CHHAT_DETECTOR_BACKEND", "codetr")
 _codetr_model = None
 _codetr_model_lock = _threading.Lock()
@@ -1226,12 +1226,19 @@ def run_pipeline(csv_path, progress_cb: Optional[Callable[[int, int, str], None]
 
     df = pd.read_csv(csv_path, encoding="utf-8-sig")
     original_len = len(df)
-    url_columns = get_url_columns(df)
-    if not url_columns:
+    all_url_columns = get_url_columns(df)
+    if not all_url_columns:
         raise ValueError(
             "No URL columns found. Columns should contain 'photo', 'link', 'image', or 'url' in the header, "
             "or have at least 1 URL in the first 50 rows."
         )
+    # Only process Q30 (shelf/product photos) for detection. Q33 (store exterior) adds false positives.
+    # Q33 columns are still preserved in the output CSV.
+    url_columns = [c for c in all_url_columns if "q33" not in str(c).lower()]
+    if not url_columns:
+        url_columns = all_url_columns  # fallback if no Q30 columns found
+    logger.info("Detection columns: %s (skipped store photos: %s)",
+                url_columns, [c for c in all_url_columns if c not in url_columns])
 
     process_len = original_len if BATCH_MODE is None else min(BATCH_MODE, original_len)
     out_path = csv_path.parent / f"{csv_path.stem}_results.csv"

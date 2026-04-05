@@ -1472,14 +1472,8 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path):
             if job_status == "error":
                 _log_runpod(f"gpu-batch: pod {pod_id} left running (job errored — terminate manually when done)")
             else:
-                try:
-                    _runpod_stop(api_key, pod_id)
-                    _mark_pod_stopped("batch")
-                    _log_runpod(f"gpu-batch: pod {pod_id} stopped for reuse")
-                except Exception as stop_exc:
-                    _log_runpod(f"gpu-batch: podStop failed ({stop_exc}), terminating instead")
-                    _runpod_gql(api_key, f'mutation {{ podTerminate(input: {{ podId: "{pod_id}" }}) }}')
-                    _unregister_pod("batch")
+                # Keep pod running for follow-up tasks (annotation, etc.)
+                _log_runpod(f"gpu-batch: pod {pod_id} left running for follow-up use (stop manually via /runpod/pods)")
 
 
 def run_dinov2_finetune_gpu_job(
