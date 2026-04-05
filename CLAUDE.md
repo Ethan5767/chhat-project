@@ -242,6 +242,18 @@ All issues discovered 2026-04-05. Every item below caused a job failure when mis
 
 14. **Git `--depth 1` clone can't switch branches**: `git fetch origin co-detr-migration && git checkout co-detr-migration` fails on a depth-1 clone of `main` because the branch ref doesn't exist locally. For resumed pods from old clones, upload files directly (co_detr module, config) rather than relying on branch switch.
 
+15. **Batch `inference_detector` with image list causes 5h+ stalls**: mmdet's `inference_detector([img1, img2, ...])` with 24+ images causes extreme slowdown on Co-DETR Swin-L. Sequential per-image detection completes 100 rows in 12 min; batch detection stalled for 5+ hours. **Always use sequential detection** (call `detect_objects()` per image, not `detect_objects_batch()`).
+
+16. **Q33 store exterior photos add false positives**: Q33 columns contain store exterior/wide shots. At low detection thresholds (0.05-0.10), Co-DETR detects random objects as cigarette packs in these images. **Fix**: exclude Q33 columns from detection (`url_columns = [c for c in all_url_columns if "q33" not in str(c).lower()]`). Q33 values are still preserved in the output CSV.
+
+17. **Annotation script on pod needs DO Spaces env vars**: The annotation script (`scripts/visualize_detections.py`) uploads annotated images to DO Spaces. Pod doesn't have `.env`. Pass env vars inline: `DO_SPACES_KEY=... DO_SPACES_SECRET=... DO_SPACES_ENDPOINT=... DO_SPACES_BUCKET=... python scripts/visualize_detections.py`. Do NOT pass `CHHAT_DATA_ROOT` -- pod uses default `backend/` path.
+
+18. **mmdet version check must use regex, not string match**: `python -c 'import mmdet; print(mmdet.__version__)'` prints `3.3.0` not the word "mmdet". Check with `re.search(r'\d+\.\d+', stdout)` not `"mmdet" in stdout`.
+
+19. **Pod must stay running after batch for follow-up tasks**: Skip `_runpod_stop()` after successful batch completion. The annotation script needs the pod running with models loaded. Stop manually via `/runpod/pods` endpoint when done.
+
+20. **Kill stale processes before reusing pod**: A pod left running from a failed/stuck job may have old Python processes holding GPU memory. The batch job's zombie-kill step (nvidia-smi query + kill) handles GPU processes, but the old Paramiko session's process may not show in nvidia-smi. Check `ps aux | grep python` and kill stale pipeline processes before starting a new run.
+
 ### URL Column Detection (`get_url_columns`)
 - Client CSVs have sparse image columns (some only 2-5% of rows have URLs)
 - Old 30% threshold missed most image columns; lowered to 1 URL in first 50 rows
