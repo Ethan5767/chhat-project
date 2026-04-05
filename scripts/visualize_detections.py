@@ -259,8 +259,8 @@ def main():
         for img_idx, (col_name, image) in enumerate(row_images):
             dets = detect_objects(image, backend="codetr", threshold=CODETR_CONF_THRESHOLD)
 
-            crop_labels = []
-            crop_confidences = []
+            # Batch all crops for this image
+            all_crops = []
             width, height = image.size
             for det in dets:
                 x1, y1, x2, y2 = [int(v) for v in det["xyxy"]]
@@ -270,19 +270,20 @@ def main():
                 cy1 = max(0, y1 - pad_y)
                 cx2 = min(width, x2 + pad_x)
                 cy2 = min(height, y2 + pad_y)
-                crop = image.crop((cx1, cy1, cx2, cy2))
+                all_crops.append(image.crop((cx1, cy1, cx2, cy2)))
 
-                vecs = embed_images_batch([crop], processor, dino_model, device)
+            crop_labels = []
+            crop_confidences = []
+            if all_crops:
+                vecs = embed_images_batch(all_crops, processor, dino_model, device)
                 cls_results = classify_embeddings(vecs, device, top_k=1, packaging_type="pack")
-                if cls_results and cls_results[0]:
-                    label = cls_results[0][0][0]
-                    cls_conf = cls_results[0][0][1]
-                    label = label.replace("_", " ").upper()
-                else:
-                    label = "UNKNOWN"
-                    cls_conf = 0.0
-                crop_labels.append(label)
-                crop_confidences.append(cls_conf)
+                for cr in cls_results:
+                    if cr and cr[0]:
+                        crop_labels.append(cr[0][0].replace("_", " ").upper())
+                        crop_confidences.append(cr[0][1])
+                    else:
+                        crop_labels.append("UNKNOWN")
+                        crop_confidences.append(0.0)
 
             annotated = annotate_image(image, dets, crop_labels, crop_confidences)
 
