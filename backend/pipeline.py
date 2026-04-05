@@ -1007,31 +1007,7 @@ def _process_rows_batched(
 
     type_labels = _get_type_labels_cached(labels)
 
-    # Phase 1: Batch detection on all images, then collect crops
-    # First pass: collect all images for batch detection
-    batch_images: list[Image.Image] = []
-    image_to_rowcol: list[tuple[int, str]] = []  # (row_idx, col_name)
-
-    for row_idx, (row, images) in enumerate(rows_with_images):
-        for col in url_columns:
-            col_name = str(col)
-            image = images.get(col_name) if images else None
-            if image is not None:
-                batch_images.append(image)
-                image_to_rowcol.append((row_idx, col_name))
-
-    # Batch detect all images at once (single GPU call)
-    if batch_images:
-        all_det_results = detect_objects_batch(batch_images, backend=detector_backend)
-    else:
-        all_det_results = []
-
-    # Build detection lookup: (row_idx, col_name) -> detections
-    det_lookup: dict[tuple[int, str], list[dict]] = {}
-    for img_idx, (row_idx, col_name) in enumerate(image_to_rowcol):
-        det_lookup[(row_idx, col_name)] = all_det_results[img_idx]
-
-    # Second pass: extract crops from detections
+    # Phase 1: Detection on all images, collect all crops
     row_col_crops: list[dict[str, list[tuple[Image.Image, str]]]] = []
     all_crops: list[Image.Image] = []
     all_crop_types: list[str] = []
@@ -1046,7 +1022,7 @@ def _process_rows_batched(
                 col_crops[col_name] = []
                 continue
 
-            det_results = det_lookup.get((row_idx, col_name), [])
+            det_results = detect_objects(image, backend=detector_backend)
 
             crops_for_col: list[tuple[Image.Image, str]] = []
             if det_results:
