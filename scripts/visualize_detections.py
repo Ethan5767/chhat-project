@@ -119,7 +119,7 @@ def annotate_image(image: Image.Image, detections: list, crop_labels: list,
     entries = []
     for i, (det, label, cls_conf) in enumerate(zip(detections, crop_labels, crop_confidences)):
         det_conf = det["confidence"]
-        entries.append(f"#{i+1}  {label}  (cls: {cls_conf:.0%}, det: {det_conf:.0%})")
+        entries.append(f"#{i+1}  {label}")
 
     # Calculate legend panel height
     line_height = legend_font_size + 8
@@ -202,6 +202,7 @@ def main():
     parser.add_argument("--input", required=True, help="Original pipeline input CSV")
     parser.add_argument("--results", required=True, help="Pipeline results CSV")
     parser.add_argument("--output", required=True, help="Output CSV with annotation URLs")
+    parser.add_argument("--s3-prefix", default="annotations/batch", help="S3 key prefix for uploaded images")
     args = parser.parse_args()
 
     from dotenv import load_dotenv
@@ -287,7 +288,7 @@ def main():
 
             annotated = annotate_image(image, dets, crop_labels, crop_confidences)
 
-            s3_key = f"annotations/50missed/{serial}_{col_name}.jpg"
+            s3_key = f"{args.s3_prefix}/{serial}_{col_name}.jpg"
             url = upload_to_spaces(annotated, s3_key, s3, bucket)
             row_annotated_urls.append(url)
             logger.info(f"  {col_name}: {len(dets)} detections -> {url}")
