@@ -916,16 +916,21 @@ def _paramiko_proxy_download(pod_id: str, pod_host_id: str, key: str,
             "put_object", Params={"Bucket": bucket, "Key": s3_key}, ExpiresIn=3600,
         )
         _log_runpod(f"  DO Spaces: pod uploading {Path(remote).name}…")
-        r = _paramiko_proxy_exec(
-            pod_id, pod_host_id, key,
-            f"curl -s -X PUT -T '{remote}' '{put_url}'",
-            timeout=timeout,
-        )
-        if r.returncode != 0:
-            return subprocess.CompletedProcess(
-                args=["do-spaces-download", remote, local], returncode=1,
-                stdout=r.stdout, stderr=f"pod curl upload failed: {r.stderr}",
+        # Retry curl PUT up to 3 times (can fail transiently on some pods)
+        for dl_attempt in range(1, 4):
+            r = _paramiko_proxy_exec(
+                pod_id, pod_host_id, key,
+                f"curl -sS -X PUT -T '{remote}' --retry 3 --retry-delay 5 '{put_url}'",
+                timeout=timeout,
             )
+            if r.returncode == 0:
+                break
+            _log_runpod(f"  DO Spaces: curl PUT attempt {dl_attempt}/3 failed rc={r.returncode}")
+            if dl_attempt == 3:
+                return subprocess.CompletedProcess(
+                    args=["do-spaces-download", remote, local], returncode=1,
+                    stdout=r.stdout, stderr=f"pod curl upload failed after 3 attempts: {r.stderr}",
+                )
         _log_runpod(f"  DO Spaces: downloading {Path(remote).name} to server…")
         s3.download_file(bucket, s3_key, local)
         _log_runpod(f"  DO Spaces: download done")
@@ -2334,10 +2339,12 @@ def run_classifier_training_runpod_job(
             _log_runpod(f"classifier-gpu: brand_classifier exited rc={r_bc.returncode}")
             raise RuntimeError(f"Brand classifier on pod failed:\n{(r_bc.stdout or '')[-3500:]}")
 
-        out_sub = _DATA_ROOT / "classifier_model" / packaging_type
+        # "all" packaging type saves to "pack" dir (see brand_classifier.py line 153)
+        save_dir = "pack" if packaging_type == "all" else packaging_type
+        out_sub = _DATA_ROOT / "classifier_model" / save_dir
         out_sub.mkdir(parents=True, exist_ok=True)
         for fname in ("best_classifier.pth", "classifier.pth", "class_mapping.json"):
-            remote_p = f"/workspace/chhat-project/backend/classifier_model/{packaging_type}/{fname}"
+            remote_p = f"/workspace/chhat-project/backend/classifier_model/{save_dir}/{fname}"
             local_p = str(out_sub / fname)
             _log_runpod(f"classifier-gpu: downloading {packaging_type}/{fname} from pod…")
             dl = _scp_from(ssh_host, ssh_port, ssh_key, remote_p, local_p, timeout=600, pod_id=pod_id, pod_host_id=pod_host_id)
@@ -3064,9 +3071,9 @@ def index_status():
 
 
 @app.post("/detect-single")
-async def detect_single(image_file: UploadFile = File(...), model_size: str = Form("medium"),
-                        det_threshold: float = Form(0.25),
-                        detector: str = Form("")):
+def detect_single(image_file: UploadFile = File(...), model_size: str = Form("medium"),
+                  det_threshold: float = Form(0.25),
+                  detector: str = Form("")):
     """Run detection on a single image. Returns per-box brand assignments for interactive UI."""
     from PIL import Image
     import base64
@@ -3085,7 +3092,7 @@ async def detect_single(image_file: UploadFile = File(...), model_size: str = Fo
             CLASSIFIER_TOP_K,
         )
 
-    data = await image_file.read()
+    data = image_file.file.read()
     try:
         pil_img = Image.open(io.BytesIO(data)).convert("RGB")
     except Exception:
@@ -3429,7 +3436,7 @@ def download_roboflow_coco(url: str = Form(...), clean: bool = Form(False)):
 
 
 @app.post("/generate-crops")
-async def generate_crops(image_file: UploadFile = File(...)):
+def generate_crops(image_file: UploadFile = File(...)):
     """Run RF-DETR on an image, classify each crop, and return for labeling."""
     from PIL import Image
     import base64
@@ -3444,7 +3451,7 @@ async def generate_crops(image_file: UploadFile = File(...)):
         )
         from brand_registry import get_brand, resolve_internal_name
 
-    data = await image_file.read()
+    data = image_file.file.read()
     try:
         pil_img = Image.open(io.BytesIO(data)).convert("RGB")
     except Exception:

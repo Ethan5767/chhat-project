@@ -8,11 +8,16 @@ Cigarette brand detection system for CHHAT. Uses RF-DETR-Medium for object detec
 
 ## Architecture
 
-- **Detection**: RF-DETR-Medium fine-tuned on cigarette pack dataset (checkpoint at `runs/checkpoint_best_ema.pth`)
-- **Classification**: DINOv2-base (frozen or fine-tuned) backbone + per-packaging-type linear classifiers
-- **Pipeline flow**: Image -> RF-DETR detect packs -> crop -> DINOv2 embed -> classifier predict -> output
+- **Detection**: Co-DETR Swin-L (default) or RF-DETR-Medium for object detection
+- **Classification**: DINOv2-base (fine-tuned) backbone + per-packaging-type linear classifiers
+- **Pipeline flow**: Image -> Co-DETR detect packs -> crop -> DINOv2 embed -> classifier predict -> output
 - **Packaging types**: pack, box (separate classifiers per type)
-- **Brand registry**: 29 brands, 68 products defined in `backend/brand_registry.py` (single source of truth)
+- **Brand registry**: 29 brands, 68+ products defined in `backend/brand_registry.py` (single source of truth)
+- **Current thresholds**: `CODETR_CONF_THRESHOLD=0.10`, `MIN_OUTPUT_CONFIDENCE=0.80`
+- **Q33 excluded**: Store exterior photos (Q33 columns) are excluded from detection to reduce false positives
+- **Co-DETR checkpoint**: `co_detr_weights/finetuned_epoch12.pth` (3.6 GB, trained on H200)
+- **DINOv2 backbone**: `classifier_model/dinov2_finetuned_full.pth` (334 MB, fine-tuned on pack refs)
+- **Classifier**: `classifier_model/pack/best_classifier.pth` (102 classes, ~94% val_acc)
 
 ## Build & Run
 
@@ -259,3 +264,115 @@ All issues discovered 2026-04-05. Every item below caused a job failure when mis
 - Old 30% threshold missed most image columns; lowered to 1 URL in first 50 rows
 - Also checks first row for descriptor text like "Photo Link" or "Q32 Photo Link"
 - Must preserve ALL Q30/Q33 columns in output even if not detected as URL columns
+
+## How to Run a Batch Processing Job
+
+### Step 1: Prepare the CSV
+- Input format: `Respondent.Serial,Q6,Q30_1,Q30_2,Q30_3,Q33_1,Q33_2,Q33_3`
+- If Excel, skip header/descriptor rows: `df = pd.read_excel(file, header=0); df = df.iloc[1:]`
+- For parallel processing, split into N chunks or use `/run-pipeline-parallel`
+
+### Step 2: Single Pod Processing
+```bash
+# Upload CSV to server
+scp input.csv root@134.209.96.41:/tmp/input.csv
+
+# Restart backend (picks up latest code)
+ssh root@134.209.96.41 'systemctl restart chhat-backend'
+
+# Trigger batch (wait ~10s for backend to load)
+ssh root@134.209.96.41 'sleep 10 && curl -s -X POST "http://127.0.0.1:8000/run-pipeline" -F "csv_file=@/tmp/input.csv" -F "use_gpu=true"'
+```
+
+### Step 3: Parallel Processing (Multiple Pods)
+```bash
+# Upload full CSV
+scp full_batch.csv root@134.209.96.41:/tmp/full_batch.csv
+
+# Trigger with N pods (splits CSV automatically)
+ssh root@134.209.96.41 'sleep 10 && curl -s -X POST "http://127.0.0.1:8000/run-pipeline-parallel" -F "csv_file=@/tmp/full_batch.csv" -F "num_pods=5"'
+```
+- Each chunk gets its own pod (registry keys: `batch_0` through `batch_4`)
+- Default GPU: RTX 4090 (~$0.59/hr), falls back to RTX 3090/A5000/A6000
+- Pods stop automatically after each chunk completes
+- Results merged into single CSV when all chunks done
+
+### Step 4: Monitor Progress
+- **Server logs**: `ssh root@134.209.96.41 'journalctl -u chhat-backend -f'`
+- **Row counts on pods**: SSH to each pod and `wc -l /workspace/chhat-project/backend/uploads/*results*`
+- **Pod status**: `curl RunPod GraphQL API` to check GPU utilization and uptime
+- **Partial results**: `GET /download-partial/{job_id}` fetches in-progress CSV from pod
+- **Speed**: RTX 4090 processes ~160 rows/min, RTX 3090 ~60 rows/min
+
+### Step 5: Download Results
+```bash
+# Results auto-downloaded to server at job completion
+# Find result file:
+ssh root@134.209.96.41 'ls -la /opt/chhat-data/uploads/results/*{job_id}*'
+
+# Download to local:
+scp root@134.209.96.41:/opt/chhat-data/uploads/results/result_file.csv ./
+```
+
+### Expected Timelines
+- **Pod bootstrap** (fresh pod): ~20-30 min (git clone + mmcv compile)
+- **Pod resume** (existing pod): ~2 min (SSH + upload files)
+- **mmcv compile on pod**: ~30-40 min (builds CUDA ops from source)
+- **Pipeline processing**: ~160 rows/min on RTX 4090, ~60 rows/min on RTX 3090
+- **5k rows on 1 pod**: ~30 min pipeline
+- **24k rows on 5 pods**: ~2.5 hours total (including bootstrap)
+
+## How to Run Annotation (Bounding Box Images)
+
+### After batch processing completes:
+1. Resume the pod (or use one that's still running)
+2. Upload annotation script + patch S3 prefix
+3. Run annotation with DO Spaces env vars inline
+4. Download annotated CSV when done
+
+```bash
+# On server, run the annotation helper script:
+ssh root@134.209.96.41 'cd /opt/chhat-project && source .venv/bin/activate && python scripts/run_annotation_on_pod.py'
+```
+
+- Annotation re-runs detection + classification on each image to draw bounding boxes
+- Uploads annotated images to DO Spaces: `annotations/{prefix}/{serial}_{col}.jpg`
+- Uses `--s3_prefix` arg to avoid overwriting between batches
+- Speed: ~8 rows/min (slower than batch due to image drawing + S3 upload)
+- 1000 rows takes ~2 hours
+
+## How to Retrain Models
+
+### DINOv2 Fine-tuning (run first - classifier depends on it)
+```bash
+ssh root@134.209.96.41 'curl -s -X POST "http://127.0.0.1:8000/finetune-dinov2?use_runpod=true"'
+```
+- Creates RunPod pod, uploads references, trains 30 epochs
+- Downloads `dinov2_finetuned_full.pth` to server
+- ~15-20 min total on RTX 4090
+
+### Brand Classifier Training (run after DINOv2)
+```bash
+ssh root@134.209.96.41 'curl -s -X POST "http://127.0.0.1:8000/train-classifier?use_runpod=true"'
+```
+- Creates RunPod pod, uploads references + DINOv2 weights, trains 100 epochs (early stops ~30-50)
+- Downloads `best_classifier.pth` + `class_mapping.json` to server
+- **Known issue**: `packaging_type=all` saves to `pack/` dir (not `all/`). Fixed in main.py download path.
+- ~15-20 min total on RTX 4090
+
+### After retraining:
+- Models auto-reload on server (`reload_dino + reload_classifiers`)
+- Next batch processing uses updated models automatically
+
+## Box vs Pack Detection Status
+
+- **Co-DETR**: Single-class "cigarette" detector. Returns all detections as `class_id=0` (pack). Cannot distinguish pack from box.
+- **RF-DETR**: 2-class detector (`cigarette_box=0`, `cigarette_pack=1`). CAN distinguish but lower mAP than Co-DETR.
+- **Box classifier**: Does NOT exist. `/references/box/` is empty. When RF-DETR detects a box, falls back to pack classifier.
+- **To fix boxes**: Need box reference images + train box classifier + either retrain Co-DETR with 2 classes or use RF-DETR for pack/box routing.
+
+## Parallel Processing Race Conditions
+
+- **Image cache tarball**: Each parallel thread must use unique temp path (`/tmp/image_cache_{job_id}.tar.gz`) to avoid overwriting
+- **Pod registry**: Each parallel chunk uses unique key (`batch_0`, `batch_1`, etc.)
+- **DO Spaces transfers**: Multiple simultaneous uploads work fine (each uses unique S3 key)
