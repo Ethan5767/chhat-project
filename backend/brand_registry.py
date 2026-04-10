@@ -392,6 +392,7 @@ OUTPUT_PRODUCT_MAP = {
     "ligun": "CHINESE BRANDS",
     # OTHERS sub-brands -> OTHERS
     "angkor_meas": "OTHERS",
+    "asia_star": "OTHERS",  # catch label_to_product stripping suffix
     "asia_star_1": "OTHERS",
     "asia_star_2": "OTHERS",
     "asia_star_3": "OTHERS",
@@ -404,6 +405,7 @@ OUTPUT_PRODUCT_MAP = {
     "dolce": "OTHERS",
     "dunhill": "OTHERS",
     "englishman": "OTHERS",
+    "galaxy": "OTHERS",  # catch label_to_product stripping suffix
     "galaxy_1": "OTHERS",
     "galaxy_2": "OTHERS",
     "galaxy_3": "OTHERS",
@@ -426,6 +428,7 @@ OUTPUT_PRODUCT_MAP = {
     "richsons": "OTHERS",
     "saigon": "OTHERS",
     "teton": "OTHERS",
+    "texas": "OTHERS",  # catch label_to_product stripping suffix
     "texas_5": "OTHERS",
     "thang_long": "OTHERS",
     "vibe": "OTHERS",
