@@ -1797,7 +1797,7 @@ def run_dinov2_finetune_gpu_job(
                 # Ephemeral RunPod pod only (not production server):
                 br = _ssh_cmd(
                     ssh_host, ssh_port, ssh_key,
-                    f"cd /workspace && rm -rf chhat-project && git clone --depth 1 {RUNPOD_REPO} chhat-project "
+                    f"cd /workspace && rm -rf chhat-project && git clone --depth 1 -b {RUNPOD_REPO_BRANCH} {RUNPOD_REPO} chhat-project "
                     f"&& cd chhat-project && bash runpod/bootstrap_training_pod.sh",
                     timeout=1200, pod_id=pod_id, pod_host_id=pod_host_id,
                 )
@@ -2254,7 +2254,7 @@ def run_classifier_training_runpod_job(
                 _log_runpod("classifier-gpu: repo missing on pod — clone + bootstrap (long)")
                 br = _ssh_cmd(
                     ssh_host, ssh_port, ssh_key,
-                    f"cd /workspace && rm -rf chhat-project && git clone --depth 1 {RUNPOD_REPO} chhat-project "
+                    f"cd /workspace && rm -rf chhat-project && git clone --depth 1 -b {RUNPOD_REPO_BRANCH} {RUNPOD_REPO} chhat-project "
                     f"&& cd chhat-project && bash runpod/bootstrap_training_pod.sh",
                     timeout=1200, pod_id=pod_id, pod_host_id=pod_host_id,
                 )
@@ -2735,7 +2735,7 @@ def run_rfdetr_training_runpod_job(
                 _log_runpod("rfdetr-gpu: repo missing on pod -- clone + bootstrap (long)")
                 br = _ssh_cmd(
                     ssh_host, ssh_port, ssh_key,
-                    f"cd /workspace && rm -rf chhat-project && git clone --depth 1 {RUNPOD_REPO} chhat-project "
+                    f"cd /workspace && rm -rf chhat-project && git clone --depth 1 -b {RUNPOD_REPO_BRANCH} {RUNPOD_REPO} chhat-project "
                     f"&& cd chhat-project && bash runpod/bootstrap_training_pod.sh",
                     timeout=1200, pod_id=pod_id, pod_host_id=pod_host_id,
                 )
