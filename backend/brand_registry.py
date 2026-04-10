@@ -276,6 +276,8 @@ BRAND_REGISTRY = {
         ("YELLOW ELEPHANT", "yellow_elephant"),
         ("ZEST YOGO", "zest_yogo"),
         ("ZOUK", "zouk"),
+        ("RAM", "ram"),
+        ("MILES", "miles"),
     ],
     # ─── Unassigned (old catch-all "others" prefixes pending manual reassignment) ───
     "UNASSIGNED": [
@@ -437,6 +439,8 @@ OUTPUT_PRODUCT_MAP = {
     "yellow_elephant": "OTHERS",
     "zest_yogo": "OTHERS",
     "zouk": "OTHERS",
+    "ram": "OTHERS",
+    "miles": "OTHERS",
     # Unassigned (old catch-all prefixes) -> map to parent OTHERS column in output
     "esse_other": "ESSE OTHERS",
     "fine_other": "FINE OTHERS",

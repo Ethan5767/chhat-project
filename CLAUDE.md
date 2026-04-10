@@ -13,7 +13,7 @@ Cigarette brand detection system for CHHAT. Uses RF-DETR-Medium for object detec
 - **Pipeline flow**: Image -> Co-DETR detect packs -> crop -> DINOv2 embed -> classifier predict -> output
 - **Packaging types**: pack, box (separate classifiers per type)
 - **Brand registry**: 29 brands, 68+ products defined in `backend/brand_registry.py` (single source of truth)
-- **Current thresholds**: `CODETR_CONF_THRESHOLD=0.10`, `MIN_OUTPUT_CONFIDENCE=0.80`
+- **Current thresholds**: `CODETR_CONF_THRESHOLD=0.10`, `MIN_OUTPUT_CONFIDENCE=0.80`, `CLASSIFIER_TOP_K=1`
 - **Q33 excluded**: Store exterior photos (Q33 columns) are excluded from detection to reduce false positives
 - **Co-DETR checkpoint**: `co_detr_weights/finetuned_epoch12.pth` (3.6 GB, trained on H200)
 - **DINOv2 backbone**: `classifier_model/dinov2_finetuned_full.pth` (334 MB, fine-tuned on pack refs)
