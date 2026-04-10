@@ -343,15 +343,17 @@ ssh root@134.209.96.41 'cd /opt/chhat-project && source .venv/bin/activate && py
 
 ## How to Retrain Models
 
-### DINOv2 Fine-tuning (run first - classifier depends on it)
+### DINOv2 Fine-tuning + Classifier (single command, same pod)
 ```bash
 ssh root@134.209.96.41 'curl -s -X POST "http://127.0.0.1:8000/finetune-dinov2?use_runpod=true"'
 ```
-- Creates RunPod pod, uploads references, trains 30 epochs
-- Downloads `dinov2_finetuned_full.pth` to server
-- ~15-20 min total on RTX 4090
+- Creates ONE RunPod pod, uploads references, trains DINOv2 (30 epochs)
+- Then automatically trains brand classifier (100 epochs) on the SAME pod
+- Downloads both `dinov2_finetuned_full.pth` and `best_classifier.pth` to server
+- If classifier training fails, DINOv2 weights are still saved (non-fatal)
+- ~30-40 min total on RTX 4090
 
-### Brand Classifier Training (run after DINOv2)
+### Brand Classifier Training (standalone, if needed separately)
 ```bash
 ssh root@134.209.96.41 'curl -s -X POST "http://127.0.0.1:8000/train-classifier?use_runpod=true"'
 ```
@@ -359,6 +361,7 @@ ssh root@134.209.96.41 'curl -s -X POST "http://127.0.0.1:8000/train-classifier?
 - Downloads `best_classifier.pth` + `class_mapping.json` to server
 - **Known issue**: `packaging_type=all` saves to `pack/` dir (not `all/`). Fixed in main.py download path.
 - ~15-20 min total on RTX 4090
+- Only needed if you want to retrain classifier without retraining DINOv2
 
 ### After retraining:
 - Models auto-reload on server (`reload_dino + reload_classifiers`)

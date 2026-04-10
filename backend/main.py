@@ -1924,6 +1924,82 @@ def run_dinov2_finetune_gpu_job(
                 raise RuntimeError(f"Download {fname} from pod failed: {(dl.stderr or '')[:400]}")
             _log_runpod(f"dino-gpu: saved {local_p}")
 
+        # --- Phase 2: Train classifier on the SAME pod ---
+        # DINOv2 finetuned weights are already on the pod from the training run above.
+        # References are already extracted. No new uploads needed.
+        _log_runpod("dino-gpu: starting classifier training on same pod (Phase 2)…")
+        with _training_lock:
+            _training_jobs[job_id]["progress"] = {
+                "epoch": 0,
+                "total_epochs": 100,
+                "status": "training_classifier",
+                "note": "DINOv2 done, now training brand classifier on same pod",
+            }
+            _training_jobs[job_id]["last_update"] = _now_iso()
+
+        cls_progress_remote = f"/tmp/classifier_progress_{job_id}.json"
+        cls_cmd = (
+            f"cd /workspace/chhat-project && source .venv/bin/activate && "
+            f"CUDA_VISIBLE_DEVICES=0 "
+            f"python brand_classifier.py --epochs 100 --batch-size 64 "
+            f"--embed-batch-size 8 --lr 0.001 "
+            f"--packaging-type all --progress-file {cls_progress_remote}"
+        )
+
+        cls_stop_poll = threading.Event()
+        cls_poll_state = {"last_epoch": -1}
+
+        def _poll_cls_progress():
+            while not cls_stop_poll.wait(12):
+                try:
+                    pr = _ssh_cmd(
+                        ssh_host, ssh_port, ssh_key,
+                        f"cat {cls_progress_remote} 2>/dev/null || true",
+                        timeout=25, pod_id=pod_id, pod_host_id=pod_host_id,
+                    )
+                    raw = _strip_ansi(pr.stdout or "")
+                    json_match = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
+                    if json_match:
+                        data = json.loads(json_match.group())
+                        data["note"] = "Phase 2: classifier training"
+                        with _training_lock:
+                            _training_jobs[job_id]["progress"] = data
+                            _training_jobs[job_id]["last_update"] = _now_iso()
+                        ep = int(data.get("epoch", 0) or 0)
+                        if ep != cls_poll_state["last_epoch"]:
+                            cls_poll_state["last_epoch"] = ep
+                            va = data.get("val_acc", 0)
+                            _log_runpod(f"dino-gpu: classifier progress epoch={ep}/100 val_acc={va}")
+                except Exception:
+                    pass
+
+        cls_poller = threading.Thread(target=_poll_cls_progress, daemon=True)
+        cls_poller.start()
+
+        r_cls = _ssh_cmd(ssh_host, ssh_port, ssh_key, cls_cmd, timeout=8 * 3600, pod_id=pod_id, pod_host_id=pod_host_id)
+        cls_stop_poll.set()
+        cls_poller.join(timeout=8)
+
+        if r_cls.returncode != 0:
+            _log_runpod(f"dino-gpu: classifier training failed rc={r_cls.returncode}, DINOv2 weights already saved")
+            _log_runpod(f"dino-gpu: classifier stderr: {(r_cls.stdout or '')[-1500:]}")
+            # Don't raise -- DINOv2 succeeded, classifier can be retrained separately
+        else:
+            _log_runpod("dino-gpu: classifier training on pod finished rc=0")
+            # Download classifier weights
+            save_dir = "pack"  # "all" packaging type saves to "pack" dir
+            cls_out = _DATA_ROOT / "classifier_model" / save_dir
+            cls_out.mkdir(parents=True, exist_ok=True)
+            for fname in ("best_classifier.pth", "classifier.pth", "class_mapping.json"):
+                remote_p = f"/workspace/chhat-project/backend/classifier_model/{save_dir}/{fname}"
+                local_p = str(cls_out / fname)
+                _log_runpod(f"dino-gpu: downloading classifier {fname} from pod…")
+                dl = _scp_from(ssh_host, ssh_port, ssh_key, remote_p, local_p, timeout=600, pod_id=pod_id, pod_host_id=pod_host_id)
+                if dl.returncode != 0:
+                    _log_runpod(f"dino-gpu: WARNING download classifier {fname} failed (non-fatal)")
+                else:
+                    _log_runpod(f"dino-gpu: saved {local_p}")
+
         with _training_lock:
             completed_version = _training_jobs[job_id].get("version", DEFAULT_TRAINING_VERSION)
             _training_jobs[job_id]["status"] = "done"
@@ -1932,7 +2008,7 @@ def run_dinov2_finetune_gpu_job(
                 "epoch": epochs,
                 "total_epochs": epochs,
                 "status": "complete",
-                "note": "Weights saved under backend/classifier_model/",
+                "note": "DINOv2 + classifier weights saved under backend/classifier_model/",
             }
 
         try:
@@ -1954,7 +2030,7 @@ def run_dinov2_finetune_gpu_job(
             "next_version": next_version,
             **_metrics_from_progress(_training_jobs[job_id].get("progress", {})),
         })
-        _log_runpod(f"dino-gpu: job DONE job={job_id[:8]}… next_version={next_version}")
+        _log_runpod(f"dino-gpu: job DONE (DINOv2 + classifier) job={job_id[:8]}… next_version={next_version}")
 
     except Exception:
         err = traceback.format_exc()
