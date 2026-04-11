@@ -1531,7 +1531,7 @@ def run_pipeline_parallel_job(job_id: str, csv_path: Path, num_pods: int):
                     "queue": queue.Queue(),
                 }
             _log_runpod(f"parallel-batch: starting chunk {chunk_idx} ({chunk_csv.name})")
-            run_pipeline_gpu_job(chunk_job_id, chunk_csv, registry_key=f"batch_{chunk_idx}")
+            run_pipeline_gpu_job(chunk_job_id, chunk_csv, registry_key=f"batch_{job_id}_{chunk_idx}")
             # Check result
             with jobs_lock:
                 status = jobs.get(chunk_job_id, {}).get("status", "error")
