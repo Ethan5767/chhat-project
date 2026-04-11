@@ -377,5 +377,23 @@ ssh root@134.209.96.41 'curl -s -X POST "http://127.0.0.1:8000/train-classifier?
 ## Parallel Processing Race Conditions
 
 - **Image cache tarball**: Each parallel thread must use unique temp path (`/tmp/image_cache_{job_id}.tar.gz`) to avoid overwriting
-- **Pod registry**: Each parallel chunk uses unique key (`batch_0`, `batch_1`, etc.)
+- **Pod registry**: Keys are namespaced by job_id (`batch_{job_id}_{chunk_idx}`). Previously used non-namespaced keys (`batch_0`) which caused concurrent jobs to share pods -- one job would stop the pod before the other could download results.
 - **DO Spaces transfers**: Multiple simultaneous uploads work fine (each uses unique S3 key)
+- **NEVER run two parallel batch jobs simultaneously** unless the pod sharing fix is verified. Each job must get its own isolated pods.
+
+## Known Issues and Lessons Learned (2026-04-11)
+
+### Parallel Batch Pod Sharing Bug (FIXED)
+- **Bug**: Two concurrent `run-pipeline-parallel` jobs used the same registry keys (`batch_0`, `batch_1`), causing the second job to reuse the first job's RUNNING pods. When the second job finished first, it stopped the shared pod, killing the first job's result download.
+- **Fix**: Registry keys now include parent job_id: `batch_{job_id}_{chunk_idx}` (commit e73e0dc)
+- **Prevention**: Always run batch jobs sequentially, or verify pod isolation before running in parallel
+
+### DINOv2/Classifier/RF-DETR Git Clone Missing Branch Flag (FIXED)
+- **Bug**: `run_dinov2_finetune_gpu_job`, `run_classifier_training_runpod_job`, and `run_rfdetr_training_runpod_job` cloned `main` branch instead of `co-detr-migration` because `-b {RUNPOD_REPO_BRANCH}` was missing from git clone commands
+- **Fix**: Added `-b {RUNPOD_REPO_BRANCH}` to all three training job git clones (commit 6935d1d)
+- The batch GPU job (line 1163) already had the correct flag
+
+### CLASSIFIER_TOP_K False Positives (FIXED)
+- **Bug**: `CLASSIFIER_TOP_K=5` kept all top-5 predictions per crop, allowing secondary low-confidence predictions to leak through as false positives after DINOv2 retraining shifted probability distributions
+- **Fix**: Changed to `CLASSIFIER_TOP_K=1` -- only top-1 prediction per crop for production output (commit 6b2c622)
+- The `/detect-crops` labeling endpoint retains `top_k=10` for human review
