@@ -1169,35 +1169,76 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path, registry_key: str = "batch
                           f"ls /workspace/chhat-project/train.py 2>/dev/null && echo REPO_EXISTS || echo NEED_CLONE",
                           timeout=30, pod_id=pod_id, pod_host_id=pod_host_id)
             if "NEED_CLONE" in r.stdout:
-                _log_runpod("gpu-batch: cloning repo + bootstrap on pod (may take several minutes)")
-                update_progress(job_id, 18, 100, "Cloning repository and installing dependencies...")
-                r = _ssh_cmd(ssh_host, ssh_port, ssh_key,
-                              f"cd /workspace && git clone --depth 1 -b {RUNPOD_REPO_BRANCH} {RUNPOD_REPO} && cd chhat-project && bash runpod/bootstrap_training_pod.sh",
-                              timeout=2400, pod_id=pod_id, pod_host_id=pod_host_id)
-                if r.returncode != 0:
-                    raise RuntimeError(f"Bootstrap failed: {r.stdout[-500:]}")
-                # Bootstrap rc=0 alone isn't enough -- the SSH proxy can drop
-                # idle channels mid mmcv-compile and the rc still parses as 0.
-                # Verify mmcv actually imports before moving on; if not, retry
-                # the slow deps install once with a longer timeout.
+                _log_runpod("gpu-batch: cloning repo on pod")
+                update_progress(job_id, 18, 100, "Cloning repository...")
+                # Step 1: clone repo (fast — no SSH idle risk)
+                rc = _ssh_cmd(ssh_host, ssh_port, ssh_key,
+                              f"cd /workspace && git clone --depth 1 -b {RUNPOD_REPO_BRANCH} {RUNPOD_REPO}",
+                              timeout=300, pod_id=pod_id, pod_host_id=pod_host_id)
+                if rc.returncode != 0:
+                    raise RuntimeError(f"Repo clone failed: {(rc.stdout or '')[-500:]} {(rc.stderr or '')[-300:]}")
+
+                # Step 2: launch bootstrap detached + poll for completion.
+                # This avoids RunPod's ssh.runpod.io proxy idle-cutting the channel
+                # during mmcv's ~30-min silent CUDA compile (which previously caused
+                # rc=255 false-failures even after the marker fix).
+                _log_runpod("gpu-batch: launching bootstrap in background, will poll for completion (~25-40 min)")
+                update_progress(job_id, 19, 100, "Bootstrapping pod (mmcv compile, ~30 min)...")
+                _ssh_cmd(ssh_host, ssh_port, ssh_key,
+                         "cd /workspace/chhat-project && "
+                         "rm -f /tmp/bootstrap.log /tmp/bootstrap.pid /tmp/bootstrap.done && "
+                         "nohup bash -c 'bash runpod/bootstrap_training_pod.sh > /tmp/bootstrap.log 2>&1; "
+                         "echo $? > /tmp/bootstrap.done' >/dev/null 2>&1 < /dev/null & "
+                         "echo $! > /tmp/bootstrap.pid && sleep 1 && cat /tmp/bootstrap.pid",
+                         timeout=30, pod_id=pod_id, pod_host_id=pod_host_id)
+
+                import time as _bs_time
+                bootstrap_deadline = _bs_time.monotonic() + 2700  # 45 min
+                last_log_size = 0
+                while _bs_time.monotonic() < bootstrap_deadline:
+                    poll = _ssh_cmd(ssh_host, ssh_port, ssh_key,
+                                    "if [ -f /tmp/bootstrap.done ]; then "
+                                    "  echo DONE_RC=$(cat /tmp/bootstrap.done); "
+                                    "elif kill -0 $(cat /tmp/bootstrap.pid 2>/dev/null) 2>/dev/null; then "
+                                    "  echo RUNNING; wc -l /tmp/bootstrap.log 2>/dev/null; "
+                                    "  find /tmp/pip-install-*/mmcv*/build -name '*.o' 2>/dev/null | wc -l | "
+                                    "    awk '{print \"MMCV_OBJ_FILES=\"$1}'; "
+                                    "else echo DEAD; tail -20 /tmp/bootstrap.log 2>/dev/null; fi",
+                                    timeout=45, pod_id=pod_id, pod_host_id=pod_host_id)
+                    out = poll.stdout or ""
+                    if "DONE_RC=" in out:
+                        rc_match = re.search(r'DONE_RC=(\d+)', out)
+                        bootstrap_rc = int(rc_match.group(1)) if rc_match else 1
+                        if bootstrap_rc != 0:
+                            tail = _ssh_cmd(ssh_host, ssh_port, ssh_key,
+                                            "tail -50 /tmp/bootstrap.log",
+                                            timeout=30, pod_id=pod_id, pod_host_id=pod_host_id)
+                            raise RuntimeError(f"Bootstrap script failed rc={bootstrap_rc}: {(tail.stdout or '')[-800:]}")
+                        break
+                    elif "DEAD" in out:
+                        raise RuntimeError(f"Bootstrap process died unexpectedly without writing rc: {out[-500:]}")
+                    # Still RUNNING — log occasional progress
+                    obj_match = re.search(r'MMCV_OBJ_FILES=(\d+)', out)
+                    log_size_match = re.search(r'(\d+) /tmp/bootstrap.log', out)
+                    if obj_match or log_size_match:
+                        new_log_size = int(log_size_match.group(1)) if log_size_match else 0
+                        if new_log_size != last_log_size:
+                            obj_count = obj_match.group(1) if obj_match else "?"
+                            _log_runpod(f"gpu-batch: bootstrap progress (mmcv .o files={obj_count}, log lines={new_log_size})")
+                            last_log_size = new_log_size
+                    _bs_time.sleep(45)
+                else:
+                    raise RuntimeError("Bootstrap timed out after 45 min waiting for /tmp/bootstrap.done")
+
+                # Step 3: verify mmcv importable (defense in depth)
                 v = _ssh_cmd(ssh_host, ssh_port, ssh_key,
                              "cd /workspace/chhat-project && source .venv/bin/activate && "
                              "python -c 'import mmcv,mmdet,mmengine; "
                              "print(\"BOOTSTRAP_OK\", mmcv.__version__, mmdet.__version__, mmengine.__version__)' 2>&1",
                              timeout=60, pod_id=pod_id, pod_host_id=pod_host_id)
                 if "BOOTSTRAP_OK" not in (v.stdout or ""):
-                    _log_runpod("gpu-batch: bootstrap returned but mmcv/mmdet not importable; retrying deps install (up to ~40 min)")
-                    rr = _ssh_cmd(ssh_host, ssh_port, ssh_key,
-                                  "cd /workspace/chhat-project && source .venv/bin/activate && "
-                                  "pip install --upgrade setuptools && "
-                                  "pip install mmengine==0.10.7 mmdet==3.3.0 && "
-                                  "pip install mmcv==2.1.0 --no-build-isolation && "
-                                  "python -c 'import mmcv,mmdet,mmengine; "
-                                  "print(\"BOOTSTRAP_OK\", mmcv.__version__)'",
-                                  timeout=2400, pod_id=pod_id, pod_host_id=pod_host_id)
-                    if rr.returncode != 0 or "BOOTSTRAP_OK" not in (rr.stdout or ""):
-                        raise RuntimeError(f"Bootstrap deps install failed after retry: {(rr.stdout or '')[-500:]}")
-                _log_runpod("gpu-batch: bootstrap finished (mmcv import verified)")
+                    raise RuntimeError(f"Bootstrap completed but mmcv/mmdet not importable: {(v.stdout or '')[-500:]}")
+                _log_runpod(f"gpu-batch: bootstrap finished (mmcv import verified): {(v.stdout or '').strip()[-200:]}")
             else:
                 _log_runpod("gpu-batch: repo exists on pod; git pull")
                 _ssh_cmd(ssh_host, ssh_port, ssh_key, "cd /workspace/chhat-project && git pull", timeout=60, pod_id=pod_id, pod_host_id=pod_host_id)
