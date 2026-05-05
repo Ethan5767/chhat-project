@@ -784,8 +784,12 @@ def _paramiko_proxy_exec(pod_id: str, pod_host_id: str, key: str, command: str,
         channel.close()
         full_output = "".join(out_chunks)
 
-        # Extract exit code from marker, stripping ANSI codes
-        exit_code = 0
+        # Extract exit code from marker, stripping ANSI codes.
+        # If marker is missing, the SSH channel closed before the command
+        # finished -- treat as failure so the orchestrator doesn't mistake
+        # a silent disconnect (e.g., RunPod proxy idle-cut during a long
+        # mmcv compile) for success.
+        exit_code = None
         for line in full_output.splitlines():
             clean = _strip_ansi(line).strip()
             if clean.startswith(marker):
@@ -794,6 +798,14 @@ def _paramiko_proxy_exec(pod_id: str, pod_host_id: str, key: str, command: str,
                 if match:
                     exit_code = int(match.group(1))
                 break
+
+        if exit_code is None:
+            return subprocess.CompletedProcess(
+                args=["paramiko", command], returncode=255,
+                stdout=full_output,
+                stderr="paramiko: end-of-command marker not found in output "
+                       "(SSH channel likely disconnected before command finished)",
+            )
 
         return subprocess.CompletedProcess(
             args=["paramiko", command], returncode=exit_code,
@@ -1161,10 +1173,31 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path, registry_key: str = "batch
                 update_progress(job_id, 18, 100, "Cloning repository and installing dependencies...")
                 r = _ssh_cmd(ssh_host, ssh_port, ssh_key,
                               f"cd /workspace && git clone --depth 1 -b {RUNPOD_REPO_BRANCH} {RUNPOD_REPO} && cd chhat-project && bash runpod/bootstrap_training_pod.sh",
-                              timeout=1200, pod_id=pod_id, pod_host_id=pod_host_id)
+                              timeout=2400, pod_id=pod_id, pod_host_id=pod_host_id)
                 if r.returncode != 0:
                     raise RuntimeError(f"Bootstrap failed: {r.stdout[-500:]}")
-                _log_runpod("gpu-batch: bootstrap finished")
+                # Bootstrap rc=0 alone isn't enough -- the SSH proxy can drop
+                # idle channels mid mmcv-compile and the rc still parses as 0.
+                # Verify mmcv actually imports before moving on; if not, retry
+                # the slow deps install once with a longer timeout.
+                v = _ssh_cmd(ssh_host, ssh_port, ssh_key,
+                             "cd /workspace/chhat-project && source .venv/bin/activate && "
+                             "python -c 'import mmcv,mmdet,mmengine; "
+                             "print(\"BOOTSTRAP_OK\", mmcv.__version__, mmdet.__version__, mmengine.__version__)' 2>&1",
+                             timeout=60, pod_id=pod_id, pod_host_id=pod_host_id)
+                if "BOOTSTRAP_OK" not in (v.stdout or ""):
+                    _log_runpod("gpu-batch: bootstrap returned but mmcv/mmdet not importable; retrying deps install (up to ~40 min)")
+                    rr = _ssh_cmd(ssh_host, ssh_port, ssh_key,
+                                  "cd /workspace/chhat-project && source .venv/bin/activate && "
+                                  "pip install --upgrade setuptools && "
+                                  "pip install mmengine==0.10.7 mmdet==3.3.0 && "
+                                  "pip install mmcv==2.1.0 --no-build-isolation && "
+                                  "python -c 'import mmcv,mmdet,mmengine; "
+                                  "print(\"BOOTSTRAP_OK\", mmcv.__version__)'",
+                                  timeout=2400, pod_id=pod_id, pod_host_id=pod_host_id)
+                    if rr.returncode != 0 or "BOOTSTRAP_OK" not in (rr.stdout or ""):
+                        raise RuntimeError(f"Bootstrap deps install failed after retry: {(rr.stdout or '')[-500:]}")
+                _log_runpod("gpu-batch: bootstrap finished (mmcv import verified)")
             else:
                 _log_runpod("gpu-batch: repo exists on pod; git pull")
                 _ssh_cmd(ssh_host, ssh_port, ssh_key, "cd /workspace/chhat-project && git pull", timeout=60, pod_id=pod_id, pod_host_id=pod_host_id)
