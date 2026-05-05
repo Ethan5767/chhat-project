@@ -1180,30 +1180,47 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path, registry_key: str = "batch
 
                 # Step 2: launch bootstrap detached + poll for completion.
                 # This avoids RunPod's ssh.runpod.io proxy idle-cutting the channel
-                # during mmcv's ~30-min silent CUDA compile (which previously caused
-                # rc=255 false-failures even after the marker fix).
+                # during mmcv's ~30-min silent CUDA compile.
+                # NOTE: do NOT use && chains around the nohup line — bash parses
+                # `A && B && nohup ... & C` as `(A && B && nohup ...) & C`, which
+                # races + breaks $! capture. Use newlines/semicolons instead.
                 _log_runpod("gpu-batch: launching bootstrap in background, will poll for completion (~25-40 min)")
                 update_progress(job_id, 19, 100, "Bootstrapping pod (mmcv compile, ~30 min)...")
-                _ssh_cmd(ssh_host, ssh_port, ssh_key,
-                         "cd /workspace/chhat-project && "
-                         "rm -f /tmp/bootstrap.log /tmp/bootstrap.pid /tmp/bootstrap.done && "
-                         "nohup bash -c 'bash runpod/bootstrap_training_pod.sh > /tmp/bootstrap.log 2>&1; "
-                         "echo $? > /tmp/bootstrap.done' >/dev/null 2>&1 < /dev/null & "
-                         "echo $! > /tmp/bootstrap.pid && sleep 1 && cat /tmp/bootstrap.pid",
-                         timeout=30, pod_id=pod_id, pod_host_id=pod_host_id)
+                launch_script = (
+                    "cd /workspace/chhat-project; "
+                    "rm -f /tmp/bootstrap.log /tmp/bootstrap.pid /tmp/bootstrap.done; "
+                    "setsid nohup bash -c 'bash runpod/bootstrap_training_pod.sh > /tmp/bootstrap.log 2>&1; "
+                    "echo $? > /tmp/bootstrap.done' </dev/null >/dev/null 2>&1 & "
+                    "BS_PID=$!; "
+                    "echo $BS_PID > /tmp/bootstrap.pid; "
+                    "sleep 2; "
+                    "echo LAUNCHED_PID=$BS_PID; "
+                    "echo SCRIPT_PROCS=$(pgrep -fc bootstrap_training_pod)"
+                )
+                launch = _ssh_cmd(ssh_host, ssh_port, ssh_key, launch_script,
+                                  timeout=30, pod_id=pod_id, pod_host_id=pod_host_id)
+                if "LAUNCHED_PID=" not in (launch.stdout or "") or "SCRIPT_PROCS=0" in (launch.stdout or ""):
+                    raise RuntimeError(f"Failed to launch bootstrap script: {(launch.stdout or '')[-500:]}")
+                _log_runpod(f"gpu-batch: bootstrap launched, polling every 45s for /tmp/bootstrap.done")
 
                 import time as _bs_time
                 bootstrap_deadline = _bs_time.monotonic() + 2700  # 45 min
                 last_log_size = 0
+                consecutive_missing = 0  # tolerate brief gaps where script is between processes
                 while _bs_time.monotonic() < bootstrap_deadline:
+                    # Poll uses pgrep against the script NAME, not the launcher PID,
+                    # because nohup/setsid wrappers exit quickly while bash continues.
                     poll = _ssh_cmd(ssh_host, ssh_port, ssh_key,
                                     "if [ -f /tmp/bootstrap.done ]; then "
                                     "  echo DONE_RC=$(cat /tmp/bootstrap.done); "
-                                    "elif kill -0 $(cat /tmp/bootstrap.pid 2>/dev/null) 2>/dev/null; then "
-                                    "  echo RUNNING; wc -l /tmp/bootstrap.log 2>/dev/null; "
-                                    "  find /tmp/pip-install-*/mmcv*/build -name '*.o' 2>/dev/null | wc -l | "
-                                    "    awk '{print \"MMCV_OBJ_FILES=\"$1}'; "
-                                    "else echo DEAD; tail -20 /tmp/bootstrap.log 2>/dev/null; fi",
+                                    "elif pgrep -f bootstrap_training_pod >/dev/null 2>&1 || "
+                                    "     pgrep -f 'pip install' >/dev/null 2>&1; then "
+                                    "  echo RUNNING; "
+                                    "  echo LOG_LINES=$(wc -l < /tmp/bootstrap.log 2>/dev/null || echo 0); "
+                                    "  echo MMCV_OBJ_FILES=$(find /tmp/pip-install-*/mmcv*/build -name '*.o' 2>/dev/null | wc -l); "
+                                    "  echo BS_PROCS=$(pgrep -fc bootstrap_training_pod); "
+                                    "  echo PIP_PROCS=$(pgrep -fc 'pip install'); "
+                                    "else echo DEAD; tail -30 /tmp/bootstrap.log 2>/dev/null; fi",
                                     timeout=45, pod_id=pod_id, pod_host_id=pod_host_id)
                     out = poll.stdout or ""
                     if "DONE_RC=" in out:
@@ -1216,15 +1233,19 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path, registry_key: str = "batch
                             raise RuntimeError(f"Bootstrap script failed rc={bootstrap_rc}: {(tail.stdout or '')[-800:]}")
                         break
                     elif "DEAD" in out:
-                        raise RuntimeError(f"Bootstrap process died unexpectedly without writing rc: {out[-500:]}")
-                    # Still RUNNING — log occasional progress
-                    obj_match = re.search(r'MMCV_OBJ_FILES=(\d+)', out)
-                    log_size_match = re.search(r'(\d+) /tmp/bootstrap.log', out)
-                    if obj_match or log_size_match:
+                        consecutive_missing += 1
+                        if consecutive_missing >= 3:
+                            raise RuntimeError(f"Bootstrap process gone for 3 consecutive polls without /tmp/bootstrap.done: {out[-500:]}")
+                        _log_runpod(f"gpu-batch: bootstrap procs missing (poll {consecutive_missing}/3 — could be brief gap between pip steps)")
+                    else:
+                        consecutive_missing = 0
+                        # Log progress when log size or .o count changes
+                        log_size_match = re.search(r'LOG_LINES=(\d+)', out)
+                        obj_match = re.search(r'MMCV_OBJ_FILES=(\d+)', out)
                         new_log_size = int(log_size_match.group(1)) if log_size_match else 0
                         if new_log_size != last_log_size:
                             obj_count = obj_match.group(1) if obj_match else "?"
-                            _log_runpod(f"gpu-batch: bootstrap progress (mmcv .o files={obj_count}, log lines={new_log_size})")
+                            _log_runpod(f"gpu-batch: bootstrap progress (log_lines={new_log_size}, mmcv_obj_files={obj_count})")
                             last_log_size = new_log_size
                     _bs_time.sleep(45)
                 else:
