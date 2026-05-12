@@ -14,8 +14,8 @@ from pathlib import Path
 
 PROJECT_ROOT = Path(r"C:\Users\kimto\OneDrive\Desktop\RE-AI\rf-detr-cigarette")
 INPUT_CSV = PROJECT_ROOT / "source_materials" / "12000_batch_final_results.csv"
-OUTPUT_DIR = PROJECT_ROOT / "source material" / "low_confidence_for_annotation"
-SUMMARY_CSV = PROJECT_ROOT / "source material" / "low_confidence_summary.csv"
+OUTPUT_DIR = PROJECT_ROOT / "source_materials" / "low_confidence_for_annotation"
+SUMMARY_CSV = PROJECT_ROOT / "source_materials" / "low_confidence_summary.csv"
 
 URL_COLUMNS = ["Q30_1", "Q30_2", "Q30_3", "Q33_1", "Q33_2", "Q33_3"]
 

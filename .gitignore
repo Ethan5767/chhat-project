@@ -33,10 +33,19 @@ Thumbs.db
 .streamlit/secrets.toml
 
 # Large model weights (download separately)
-rf-detr-medium.pth
+rf-detr-*.pth
+rf-detr-*.pt
 runs/
 co_detr_weights/
 backend/classifier_model/
+
+# Archive backups (kept outside repo)
+*.zip
+tmp_annotated/
+
+# Tmp / debugging scripts
+scripts/tmp/
+*_tmp.py
 
 # Training data (managed separately)
 datasets/
