@@ -202,7 +202,7 @@ def main():
     parser.add_argument("--input", required=True, help="Original pipeline input CSV")
     parser.add_argument("--results", required=True, help="Pipeline results CSV")
     parser.add_argument("--output", required=True, help="Output CSV with annotation URLs")
-    parser.add_argument("--s3-prefix", default="annotations/batch", help="S3 key prefix for uploaded images")
+    parser.add_argument("--s3_prefix", default="annotations/batch", help="S3 key prefix for uploaded images")
     args = parser.parse_args()
 
     from dotenv import load_dotenv
