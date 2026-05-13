@@ -999,6 +999,161 @@ def _scp_from(host: str, port: int, key: str, remote: str, local: str, timeout: 
     )
 
 
+def _clone_and_bootstrap_pod_detached(
+    ssh_host: str,
+    ssh_port: int,
+    ssh_key: str,
+    pod_id: str,
+    pod_host_id: str,
+    sentinel_file: str,
+    log_prefix: str,
+):
+    """Clone repo + run bootstrap script on a fresh pod via detached-and-poll pattern.
+
+    mmcv 2.1.0 compiles from source against torch+cu124 (no prebuilt wheels) for
+    ~20-40 min. During that compile the script emits no stdout, so the
+    ssh.runpod.io proxy silently drops the channel as idle — a synchronous
+    _ssh_cmd then returns rc=255 even though the compile is still progressing
+    on the pod. This helper avoids that by:
+
+      1. Cloning the repo synchronously (fast, no idle risk).
+      2. Launching the bootstrap script via setsid+nohup so it survives the
+         SSH session, writing stdout to /tmp/bootstrap.log and rc to
+         /tmp/bootstrap.done.
+      3. Polling every 45s for /tmp/bootstrap.done. Each poll is a short
+         command that produces output, so the proxy never sees the channel
+         go idle. Polls also surface mmcv .o file count as progress evidence.
+
+    Raises RuntimeError if launch fails, bootstrap exits non-zero, the
+    bootstrap process dies for 3 consecutive polls without writing
+    /tmp/bootstrap.done, or the 45-min deadline elapses. Verifies mmcv +
+    mmdet + mmengine import after bootstrap returns rc=0.
+
+    Args:
+      sentinel_file: filename under /workspace/chhat-project/ used to decide
+        whether the repo is already present (skip clone+bootstrap if so).
+      log_prefix: short tag prepended to log lines, e.g. "dino-gpu".
+    """
+    import time as _bs_time
+
+    chk = _ssh_cmd(
+        ssh_host, ssh_port, ssh_key,
+        f"test -f /workspace/chhat-project/{sentinel_file} && echo OK || echo MISSING",
+        timeout=40, pod_id=pod_id, pod_host_id=pod_host_id,
+    )
+    if "MISSING" not in (chk.stdout or ""):
+        _log_runpod(f"{log_prefix}: repo present on pod (sentinel={sentinel_file})")
+        return
+
+    _log_runpod(f"{log_prefix}: repo missing on pod — clone + bootstrap (detached + poll)")
+
+    # Step 1: clone repo synchronously (fast)
+    rc = _ssh_cmd(
+        ssh_host, ssh_port, ssh_key,
+        f"cd /workspace && rm -rf chhat-project && "
+        f"git clone --depth 1 -b {RUNPOD_REPO_BRANCH} {RUNPOD_REPO} chhat-project",
+        timeout=300, pod_id=pod_id, pod_host_id=pod_host_id,
+    )
+    if rc.returncode != 0:
+        raise RuntimeError(
+            f"Repo clone failed: {(rc.stdout or '')[-500:]} {(rc.stderr or '')[-300:]}"
+        )
+
+    # Step 2: launch bootstrap detached. NOTE: do NOT use && chains around the
+    # nohup line — bash parses `A && B && nohup ... & C` as `(A && B && nohup ...) & C`,
+    # which races + breaks $! capture. Use ;-separated commands.
+    _log_runpod(f"{log_prefix}: launching bootstrap detached; polling every 45s for /tmp/bootstrap.done")
+    launch_script = (
+        "cd /workspace/chhat-project; "
+        "rm -f /tmp/bootstrap.log /tmp/bootstrap.pid /tmp/bootstrap.done; "
+        "setsid nohup bash -c 'bash runpod/bootstrap_training_pod.sh > /tmp/bootstrap.log 2>&1; "
+        "echo $? > /tmp/bootstrap.done' </dev/null >/dev/null 2>&1 & "
+        "BS_PID=$!; "
+        "echo $BS_PID > /tmp/bootstrap.pid; "
+        "sleep 2; "
+        "echo LAUNCHED_PID=$BS_PID; "
+        "echo SCRIPT_PROCS=$(pgrep -fc bootstrap_training_pod)"
+    )
+    launch = _ssh_cmd(
+        ssh_host, ssh_port, ssh_key, launch_script,
+        timeout=30, pod_id=pod_id, pod_host_id=pod_host_id,
+    )
+    if "LAUNCHED_PID=" not in (launch.stdout or "") or "SCRIPT_PROCS=0" in (launch.stdout or ""):
+        raise RuntimeError(
+            f"Failed to launch bootstrap script: {(launch.stdout or '')[-500:]}"
+        )
+
+    # Step 3: poll for completion every 45s, surfacing mmcv .o file count as progress
+    bootstrap_deadline = _bs_time.monotonic() + 2700  # 45 min budget
+    last_log_size = 0
+    consecutive_missing = 0  # tolerate brief gaps between pip subprocesses
+    while _bs_time.monotonic() < bootstrap_deadline:
+        poll = _ssh_cmd(
+            ssh_host, ssh_port, ssh_key,
+            "if [ -f /tmp/bootstrap.done ]; then "
+            "  echo DONE_RC=$(cat /tmp/bootstrap.done); "
+            "elif pgrep -f bootstrap_training_pod >/dev/null 2>&1 || "
+            "     pgrep -f 'pip install' >/dev/null 2>&1; then "
+            "  echo RUNNING; "
+            "  echo LOG_LINES=$(wc -l < /tmp/bootstrap.log 2>/dev/null || echo 0); "
+            "  echo MMCV_OBJ_FILES=$(find /tmp/pip-install-*/mmcv*/build -name '*.o' 2>/dev/null | wc -l); "
+            "  echo BS_PROCS=$(pgrep -fc bootstrap_training_pod); "
+            "  echo PIP_PROCS=$(pgrep -fc 'pip install'); "
+            "else echo DEAD; tail -30 /tmp/bootstrap.log 2>/dev/null; fi",
+            timeout=45, pod_id=pod_id, pod_host_id=pod_host_id,
+        )
+        out = poll.stdout or ""
+        if "DONE_RC=" in out:
+            rc_match = re.search(r"DONE_RC=(\d+)", out)
+            bootstrap_rc = int(rc_match.group(1)) if rc_match else 1
+            if bootstrap_rc != 0:
+                tail = _ssh_cmd(
+                    ssh_host, ssh_port, ssh_key, "tail -50 /tmp/bootstrap.log",
+                    timeout=30, pod_id=pod_id, pod_host_id=pod_host_id,
+                )
+                raise RuntimeError(
+                    f"Bootstrap script failed rc={bootstrap_rc}: {(tail.stdout or '')[-800:]}"
+                )
+            break
+        elif "DEAD" in out:
+            consecutive_missing += 1
+            if consecutive_missing >= 3:
+                raise RuntimeError(
+                    f"Bootstrap process gone for 3 consecutive polls without /tmp/bootstrap.done: {out[-500:]}"
+                )
+            _log_runpod(
+                f"{log_prefix}: bootstrap procs missing (poll {consecutive_missing}/3 — could be brief gap between pip steps)"
+            )
+        else:
+            consecutive_missing = 0
+            log_size_match = re.search(r"LOG_LINES=(\d+)", out)
+            obj_match = re.search(r"MMCV_OBJ_FILES=(\d+)", out)
+            new_log_size = int(log_size_match.group(1)) if log_size_match else 0
+            if new_log_size != last_log_size:
+                obj_count = obj_match.group(1) if obj_match else "?"
+                _log_runpod(
+                    f"{log_prefix}: bootstrap progress (log_lines={new_log_size}, mmcv_obj_files={obj_count})"
+                )
+                last_log_size = new_log_size
+        _bs_time.sleep(45)
+    else:
+        raise RuntimeError("Bootstrap timed out after 45 min waiting for /tmp/bootstrap.done")
+
+    # Step 4: verify mmcv stack importable (defense in depth)
+    v = _ssh_cmd(
+        ssh_host, ssh_port, ssh_key,
+        "cd /workspace/chhat-project && source .venv/bin/activate && "
+        "python -c 'import mmcv,mmdet,mmengine; "
+        "print(\"BOOTSTRAP_OK\", mmcv.__version__, mmdet.__version__, mmengine.__version__)' 2>&1",
+        timeout=60, pod_id=pod_id, pod_host_id=pod_host_id,
+    )
+    if "BOOTSTRAP_OK" not in (v.stdout or ""):
+        raise RuntimeError(
+            f"Bootstrap completed but mmcv/mmdet not importable: {(v.stdout or '')[-500:]}"
+        )
+    _log_runpod(f"{log_prefix}: bootstrap finished ({(v.stdout or '').strip()[-200:]})")
+
+
 def run_pipeline_gpu_job(job_id: str, csv_path: Path, registry_key: str = "batch"):
     """Process a CSV batch on a RunPod GPU pod. Creates pod, uploads, runs, downloads, terminates."""
     import os
@@ -1882,25 +2037,11 @@ def run_dinov2_finetune_gpu_job(
                 raise RuntimeError(f"SSH to pod failed after 20 attempts: {(last_chk.stderr or last_chk.stdout or '')[:300]}")
 
         if not is_resumed:
-            chk = _ssh_cmd(
-                ssh_host, ssh_port, ssh_key,
-                "test -f /workspace/chhat-project/finetune_dinov2.py && echo OK || echo MISSING",
-                timeout=40, pod_id=pod_id, pod_host_id=pod_host_id,
+            _clone_and_bootstrap_pod_detached(
+                ssh_host, ssh_port, ssh_key, pod_id, pod_host_id,
+                sentinel_file="finetune_dinov2.py",
+                log_prefix="dino-gpu",
             )
-            if "MISSING" in (chk.stdout or ""):
-                _log_runpod("dino-gpu: repo missing on pod — clone + bootstrap (long)")
-                # Ephemeral RunPod pod only (not production server):
-                br = _ssh_cmd(
-                    ssh_host, ssh_port, ssh_key,
-                    f"cd /workspace && rm -rf chhat-project && git clone --depth 1 -b {RUNPOD_REPO_BRANCH} {RUNPOD_REPO} chhat-project "
-                    f"&& cd chhat-project && bash runpod/bootstrap_training_pod.sh",
-                    timeout=2400, pod_id=pod_id, pod_host_id=pod_host_id,
-                )
-                if br.returncode != 0:
-                    raise RuntimeError(f"Pod bootstrap failed: {(br.stdout or '')[-800:]}")
-                _log_runpod("dino-gpu: bootstrap complete")
-            else:
-                _log_runpod("dino-gpu: repo present on pod")
         else:
             # Quick git pull on resumed pod
             _ssh_cmd(ssh_host, ssh_port, ssh_key,
@@ -2340,24 +2481,11 @@ def run_classifier_training_runpod_job(
             _training_jobs[job_id]["runpod_pod_id"] = pod_id
 
         if not is_resumed:
-            chk = _ssh_cmd(
-                ssh_host, ssh_port, ssh_key,
-                "test -f /workspace/chhat-project/brand_classifier.py && echo OK || echo MISSING",
-                timeout=40, pod_id=pod_id, pod_host_id=pod_host_id,
+            _clone_and_bootstrap_pod_detached(
+                ssh_host, ssh_port, ssh_key, pod_id, pod_host_id,
+                sentinel_file="brand_classifier.py",
+                log_prefix="classifier-gpu",
             )
-            if "MISSING" in (chk.stdout or ""):
-                _log_runpod("classifier-gpu: repo missing on pod — clone + bootstrap (long)")
-                br = _ssh_cmd(
-                    ssh_host, ssh_port, ssh_key,
-                    f"cd /workspace && rm -rf chhat-project && git clone --depth 1 -b {RUNPOD_REPO_BRANCH} {RUNPOD_REPO} chhat-project "
-                    f"&& cd chhat-project && bash runpod/bootstrap_training_pod.sh",
-                    timeout=2400, pod_id=pod_id, pod_host_id=pod_host_id,
-                )
-                if br.returncode != 0:
-                    raise RuntimeError(f"Pod bootstrap failed: {(br.stdout or '')[-800:]}")
-                _log_runpod("classifier-gpu: bootstrap complete")
-            else:
-                _log_runpod("classifier-gpu: repo present on pod")
         else:
             # Quick git pull on resumed pod
             _ssh_cmd(ssh_host, ssh_port, ssh_key,
@@ -2821,24 +2949,11 @@ def run_rfdetr_training_runpod_job(
 
         # 5. Bootstrap (skip if resumed with warm check)
         if not is_resumed:
-            chk = _ssh_cmd(
-                ssh_host, ssh_port, ssh_key,
-                "test -f /workspace/chhat-project/train.py && echo OK || echo MISSING",
-                timeout=40, pod_id=pod_id, pod_host_id=pod_host_id,
+            _clone_and_bootstrap_pod_detached(
+                ssh_host, ssh_port, ssh_key, pod_id, pod_host_id,
+                sentinel_file="train.py",
+                log_prefix="rfdetr-gpu",
             )
-            if "MISSING" in (chk.stdout or ""):
-                _log_runpod("rfdetr-gpu: repo missing on pod -- clone + bootstrap (long)")
-                br = _ssh_cmd(
-                    ssh_host, ssh_port, ssh_key,
-                    f"cd /workspace && rm -rf chhat-project && git clone --depth 1 -b {RUNPOD_REPO_BRANCH} {RUNPOD_REPO} chhat-project "
-                    f"&& cd chhat-project && bash runpod/bootstrap_training_pod.sh",
-                    timeout=2400, pod_id=pod_id, pod_host_id=pod_host_id,
-                )
-                if br.returncode != 0:
-                    raise RuntimeError(f"Pod bootstrap failed: {(br.stdout or '')[-800:]}")
-                _log_runpod("rfdetr-gpu: bootstrap complete")
-            else:
-                _log_runpod("rfdetr-gpu: repo present on pod")
         else:
             # Quick git pull on resumed pod
             _ssh_cmd(
