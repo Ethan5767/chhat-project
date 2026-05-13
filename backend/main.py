@@ -1159,6 +1159,9 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path, registry_key: str = "batch
     import os
     import time as _time
 
+    with jobs_lock:
+        jobs.setdefault(job_id, {"status": "running_gpu"})
+
     api_key = _get_runpod_api_key()
     if not api_key:
         _log_runpod("gpu-batch: RUNPOD_API_KEY missing — set in .env and restart chhat-backend")
@@ -1666,7 +1669,7 @@ def run_pipeline_gpu_job(job_id: str, csv_path: Path, registry_key: str = "batch
                       timeout=48 * 3600, pod_id=pod_id, pod_host_id=pod_host_id)  # 48h timeout for large batches
 
         if r.returncode != 0:
-            raise RuntimeError(f"Pipeline failed on GPU: {r.stdout[-500:]}")
+            raise RuntimeError(f"Pipeline failed on GPU: {r.stdout[-3000:]}")
         _log_runpod(f"gpu-batch: remote pipeline finished rc=0 tail_stdout_chars={len(r.stdout or '')}")
 
         # Parse actual output path (strip ANSI codes first)
