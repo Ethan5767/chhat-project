@@ -12,8 +12,13 @@ source .venv/bin/activate || { echo "ERROR: venv activation failed"; exit 1; }
 python -c "import torch; assert torch.cuda.is_available()" 2>/dev/null \
   || pip install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 # Install remaining deps (exclude mmcv/mmdet/mmengine -- installed separately below)
+# transformers 5.x added moe.py with a torch.library.custom_op call that the
+# RunPod template's torch 2.4.1+cu124 cannot parse via infer_schema, breaking
+# `import transformers` at module load. We only use AutoImageProcessor +
+# AutoModel which have been stable for many minor versions; cap to 4.x to
+# stay compatible with the template's torch.
 pip install --extra-index-url https://download.pytorch.org/whl/cu124 \
-  transformers>=4.40.0 faiss-cpu>=1.8.0 supervision>=0.21.0 \
+  "transformers>=4.40.0,<5.0.0" faiss-cpu>=1.8.0 supervision>=0.21.0 \
   fastapi>=0.111.0 uvicorn pandas Pillow numpy requests \
   python-multipart paramiko boto3 scikit-learn openpyxl python-dotenv
 # mmcv: no prebuilt wheels for torch 2.4+cu124; --no-build-isolation fixes pkg_resources error
