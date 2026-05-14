@@ -391,6 +391,59 @@ def _log_runpod(msg: str) -> None:
     print(f"[runpod] {msg}", flush=True)
 
 
+def _rotate_classifier_model_backups(keep: int = 3) -> "Path | None":
+    """Snapshot the current live `classifier_model/` weights into
+    `classifier_model/_pre_retrain_<UTC timestamp>/` before they are about to be
+    overwritten by a fresh training run, and prune older backups so at most `keep`
+    snapshots remain on disk. Returns the new backup path, or None when there were
+    no live weights to snapshot.
+
+    Without this, a botched retrain (e.g. v28 today) overwrites the previous
+    weights and the prior version becomes unrecoverable.
+    """
+    base = _DATA_ROOT / "classifier_model"
+    if not base.exists():
+        return None
+
+    top_files = ["dinov2_finetuned_full.pth", "dinov2_finetuned_head.pth", "class_mapping.json"]
+    subdirs = ["pack", "box", "all"]
+    files_present = [f for f in top_files if (base / f).exists()]
+    subdirs_present = [d for d in subdirs if (base / d).is_dir() and any((base / d).iterdir())]
+    if not files_present and not subdirs_present:
+        return None
+
+    ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    backup_dir = base / f"_pre_retrain_{ts}"
+    if backup_dir.exists():
+        return backup_dir
+    backup_dir.mkdir(parents=True, exist_ok=False)
+
+    for fname in files_present:
+        try:
+            shutil.copy2(base / fname, backup_dir / fname)
+        except Exception as exc:
+            _log_runpod(f"backup: WARNING failed to copy {fname}: {exc}")
+    for sub in subdirs_present:
+        try:
+            shutil.copytree(base / sub, backup_dir / sub)
+        except Exception as exc:
+            _log_runpod(f"backup: WARNING failed to copy subdir {sub}: {exc}")
+    _log_runpod(f"backup: snapshotted live weights -> {backup_dir.name}")
+
+    snaps = sorted(
+        [d for d in base.iterdir() if d.is_dir() and d.name.startswith("_pre_retrain_")],
+        key=lambda p: p.name,
+    )
+    while len(snaps) > keep:
+        oldest = snaps.pop(0)
+        try:
+            shutil.rmtree(oldest)
+            _log_runpod(f"backup: pruned old backup {oldest.name} (keep={keep})")
+        except Exception as exc:
+            _log_runpod(f"backup: WARNING failed to prune {oldest.name}: {exc}")
+    return backup_dir
+
+
 def _tar_backend_references_for_runpod(refs_tar: Path) -> subprocess.CompletedProcess:
     """Tar backend/references for upload to a RunPod pod.
 
@@ -2152,6 +2205,13 @@ def run_dinov2_finetune_gpu_job(
             raise RuntimeError(f"DINOv2 fine-tune on pod failed:\n{(r_ft.stdout or '')[-3500:]}")
         _log_runpod("dino-gpu: finetune subprocess on pod finished rc=0")
 
+        # Snapshot the previous live weights into _pre_retrain_<ts>/ before overwrite,
+        # keeping the most recent 3 backups so a bad retrain stays recoverable.
+        try:
+            _rotate_classifier_model_backups(keep=3)
+        except Exception as exc:
+            _log_runpod(f"dino-gpu: WARNING pre-overwrite backup failed (continuing anyway): {exc}")
+
         out_dir = _DATA_ROOT / "classifier_model"
         out_dir.mkdir(parents=True, exist_ok=True)
         for fname in ("dinov2_finetuned_head.pth", "dinov2_finetuned_full.pth", "class_mapping.json"):
@@ -2640,6 +2700,13 @@ def run_classifier_training_runpod_job(
                     return
             _log_runpod(f"classifier-gpu: brand_classifier exited rc={r_bc.returncode}")
             raise RuntimeError(f"Brand classifier on pod failed:\n{(r_bc.stdout or '')[-3500:]}")
+
+        # Snapshot the previous live weights into _pre_retrain_<ts>/ before overwrite,
+        # keeping the most recent 3 backups so a bad retrain stays recoverable.
+        try:
+            _rotate_classifier_model_backups(keep=3)
+        except Exception as exc:
+            _log_runpod(f"classifier-gpu: WARNING pre-overwrite backup failed (continuing anyway): {exc}")
 
         # "all" packaging type saves to "pack" dir (see brand_classifier.py line 153)
         save_dir = "pack" if packaging_type == "all" else packaging_type
